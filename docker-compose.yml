@@ -1,12 +1,8 @@
 services:
   news-notifier:
-    image: python:3.11-slim
+    build: . # 👈 This tells Portainer to look for the Dockerfile in your Git repo
     container_name: daily_news_bot
     restart: unless-stopped
-    # ❌ REMOVED: volumes block is gone
-    working_dir: /app
-    # We copy the cloned Git repository context into the container's working directory
-    command: sh -c "cp -R /data/compose/* /app/ 2>/dev/null || cp -R ./* /app/ 2>/dev/null; pip install --no-cache-dir -r /app/requirements.txt && python /app/news_bot.py"
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
