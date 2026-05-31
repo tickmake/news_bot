@@ -44,6 +44,10 @@ DEFAULT_NORWAY_NEWS_FEEDS = (
 DEFAULT_STOCK_SCREENERS = "day_gainers,most_actives"
 DEFAULT_FUND_SCREENERS = "conservative_foreign_funds,solid_large_growth_funds,high_yield_bond"
 MARKET_DATA_USER_AGENT = "Mozilla/5.0 (compatible; news-bot/1.0)"
+YAHOO_SCREENER_ENDPOINTS = (
+    "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+    "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved",
+)
 
 MORNING_GREETINGS = [
     "🌞 Good morning! Wishing you a focused and positive day ahead.",
@@ -105,6 +109,9 @@ class AppSettings(BaseSettings):
     stock_screeners: str = DEFAULT_STOCK_SCREENERS
     fund_screeners: str = DEFAULT_FUND_SCREENERS
     screener_quote_limit: int = 50
+    screener_request_timeout_seconds: int = 6
+    screener_cache_ttl_seconds: int = 90
+    screener_failure_cooldown_seconds: int = 300
     usa_stock_universe: Optional[str] = None
     india_stock_universe: Optional[str] = None
     norway_stock_universe: Optional[str] = None
@@ -120,6 +127,8 @@ class AppSettings(BaseSettings):
 
 
 SETTINGS = AppSettings()
+LIVE_QUOTES_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+YAHOO_SCREENER_BACKOFF_UNTIL = 0.0
 
 
 def _parse_instrument_env(raw_value: Optional[str], fallback: Dict[str, str]) -> Dict[str, str]:
@@ -543,27 +552,51 @@ def _as_float(value: Any) -> Optional[float]:
 
 
 def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str, Any]]:
+    global YAHOO_SCREENER_BACKOFF_UNTIL
+    now_ts = time.time()
+    if now_ts < YAHOO_SCREENER_BACKOFF_UNTIL:
+        LOGGER.info("screener_temporarily_skipped scr_id=%s backoff_until=%s", scr_id, int(YAHOO_SCREENER_BACKOFF_UNTIL))
+        return []
+
+    timeout_seconds = max(2, min(SETTINGS.request_timeout_seconds, SETTINGS.screener_request_timeout_seconds))
+    last_error: Optional[Exception] = None
     try:
-        response = _with_retry(
-            lambda: requests.get(
-                "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
-                params={"scrIds": scr_id, "count": count, "start": 0},
-                headers={"User-Agent": MARKET_DATA_USER_AGENT},
-                timeout=SETTINGS.request_timeout_seconds,
-            ),
-            f"screener_{scr_id}",
-            retries=2,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        result = payload.get("finance", {}).get("result") or []
-        if not result:
-            return []
-        quotes = result[0].get("quotes") or []
-        if isinstance(quotes, list):
-            return [quote for quote in quotes if isinstance(quote, dict)]
+        for endpoint in YAHOO_SCREENER_ENDPOINTS:
+            try:
+                response = _with_retry(
+                    lambda: requests.get(
+                        endpoint,
+                        params={"scrIds": scr_id, "count": count, "start": 0},
+                        headers={"User-Agent": MARKET_DATA_USER_AGENT},
+                        timeout=timeout_seconds,
+                    ),
+                    f"screener_{scr_id}",
+                    retries=1,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                result = payload.get("finance", {}).get("result") or []
+                if not result:
+                    return []
+                quotes = result[0].get("quotes") or []
+                if isinstance(quotes, list):
+                    return [quote for quote in quotes if isinstance(quote, dict)]
+            except Exception as endpoint_exc:
+                last_error = endpoint_exc
+                continue
     except Exception as exc:
-        LOGGER.warning("screener_fetch_failed scr_id=%s detail=%s", scr_id, exc)
+        last_error = exc
+
+    if last_error:
+        error_text = str(last_error)
+        if isinstance(last_error, requests.exceptions.SSLError) or "UNEXPECTED_EOF_WHILE_READING" in error_text:
+            YAHOO_SCREENER_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.screener_failure_cooldown_seconds)
+            LOGGER.warning(
+                "screener_ssl_backoff_active until=%s detail=%s",
+                int(YAHOO_SCREENER_BACKOFF_UNTIL),
+                error_text,
+            )
+        LOGGER.warning("screener_fetch_failed scr_id=%s detail=%s", scr_id, error_text)
     return []
 
 
@@ -585,6 +618,14 @@ def _is_stock_quote(quote: Dict[str, Any]) -> bool:
 
 
 def _collect_live_quotes(scr_ids: List[str], count_per_screener: int) -> List[Dict[str, Any]]:
+    cache_key = f"{','.join(scr_ids)}|{count_per_screener}"
+    now_ts = time.time()
+    cached = LIVE_QUOTES_CACHE.get(cache_key)
+    if cached:
+        cached_at, cached_quotes = cached
+        if now_ts - cached_at <= max(5, SETTINGS.screener_cache_ttl_seconds):
+            return list(cached_quotes)
+
     deduped: Dict[str, Dict[str, Any]] = {}
     for scr_id in scr_ids:
         for quote in _fetch_predefined_screener_quotes(scr_id, count=count_per_screener):
@@ -593,7 +634,9 @@ def _collect_live_quotes(scr_ids: List[str], count_per_screener: int) -> List[Di
                 continue
             if symbol not in deduped:
                 deduped[symbol] = quote
-    return list(deduped.values())
+    quotes = list(deduped.values())
+    LIVE_QUOTES_CACHE[cache_key] = (now_ts, quotes)
+    return quotes
 
 
 def _format_live_rows(

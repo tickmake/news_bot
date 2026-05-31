@@ -104,6 +104,9 @@ python news_bot.py
 - `STOCK_SCREENERS` - comma-separated Yahoo predefined screener IDs for equities
 - `FUND_SCREENERS` - comma-separated Yahoo predefined screener IDs for funds/ETFs
 - `SCREENER_QUOTE_LIMIT` - number of quotes to fetch per screener
+- `SCREENER_REQUEST_TIMEOUT_SECONDS` - timeout for screener API calls (default `6`)
+- `SCREENER_CACHE_TTL_SECONDS` - in-memory screener cache duration (default `90`)
+- `SCREENER_FAILURE_COOLDOWN_SECONDS` - cooldown after screener SSL/network failures (default `300`)
 
 ### Optional Universe Configuration
 
@@ -213,6 +216,7 @@ Each briefing includes:
   - Validate RSS feed URLs and domain allow/block filters.
 - **No finance rows**
   - Some screener IDs may be rate-limited or empty; adjust `STOCK_SCREENERS` / `FUND_SCREENERS`.
+  - If Yahoo TLS is unstable in your host network, reduce `SCREENER_REQUEST_TIMEOUT_SECONDS` and rely on cooldown to keep `/now` responsive.
 - **Network/proxy failures**
   - Check outbound connectivity to `api.telegram.org`, configured RSS sources, and Yahoo endpoints.
 
