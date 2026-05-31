@@ -8,3 +8,4 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - NEWS_API_KEY=${NEWS_API_KEY}
       - TZ=${TZ}
+      - YF_NO_CURL_CFFI=1 # 👈 FORCE DEACTIVATION HERE
