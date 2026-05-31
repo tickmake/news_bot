@@ -27,14 +27,14 @@ logging.basicConfig(
 )
 
 DEFAULT_GLOBAL_NEWS_FEEDS = (
-    "https://feeds.reuters.com/reuters/worldNews,"
     "https://feeds.bbci.co.uk/news/world/rss.xml,"
-    "https://www.cnbc.com/id/100727362/device/rss/rss.html"
+    "https://www.cnbc.com/id/100727362/device/rss/rss.html,"
+    "https://feeds.apnews.com/apf-topnews"
 )
 DEFAULT_BUSINESS_NEWS_FEEDS = (
-    "https://feeds.reuters.com/reuters/businessNews,"
     "https://www.cnbc.com/id/10001147/device/rss/rss.html,"
-    "https://finance.yahoo.com/news/rssindex"
+    "https://finance.yahoo.com/news/rssindex,"
+    "https://feeds.marketwatch.com/marketwatch/topstories/"
 )
 DEFAULT_NORWAY_NEWS_FEEDS = (
     "https://www.nrk.no/toppsaker.rss,"
@@ -87,9 +87,10 @@ class AppSettings(BaseSettings):
     command_poll_interval_minutes: int = 2
     health_ping_enabled: bool = True
     health_ping_chat_id: Optional[str] = None
+    send_startup_briefing: bool = False
     trusted_news_domains: str = (
         "reuters.com,bloomberg.com,cnbc.com,finance.yahoo.com,yahoo.com,ft.com,"
-        "bbc.com,theguardian.com,nrk.no,aftenposten.no,apnews.com"
+        "bbc.com,theguardian.com,nrk.no,aftenposten.no,e24.no,apnews.com,marketwatch.com"
     )
     blocked_news_domains: str = "news.google.com,pinterest.com,tiktok.com"
     trade_min_score: int = 3
@@ -943,6 +944,36 @@ def poll_telegram_commands() -> bool:
         return False
 
 
+def _prepare_telegram_long_polling() -> None:
+    if not SETTINGS.telegram_token:
+        return
+    try:
+        webhook_info = _with_retry(
+            lambda: requests.get(
+                f"https://api.telegram.org/bot{SETTINGS.telegram_token}/getWebhookInfo",
+                timeout=SETTINGS.request_timeout_seconds,
+            ),
+            "telegram_get_webhook_info",
+            retries=2,
+        )
+        webhook_info.raise_for_status()
+        payload = webhook_info.json()
+        webhook_url = ((payload.get("result") or {}).get("url") or "").strip()
+        if webhook_url:
+            LOGGER.warning("telegram_webhook_detected removing_for_long_polling")
+            _with_retry(
+                lambda: requests.post(
+                    f"https://api.telegram.org/bot{SETTINGS.telegram_token}/deleteWebhook",
+                    json={"drop_pending_updates": False},
+                    timeout=SETTINGS.request_timeout_seconds,
+                ),
+                "telegram_delete_webhook",
+                retries=2,
+            )
+    except Exception as exc:
+        LOGGER.warning("telegram_webhook_check_failed detail=%s", exc)
+
+
 def get_missing_required_config() -> Iterable[str]:
     return SETTINGS.missing_required()
 
@@ -953,16 +984,21 @@ if __name__ == "__main__":
         print("Missing required environment variables: " + ", ".join(missing_values) + ".")
         raise SystemExit(1)
 
+    _prepare_telegram_long_polling()
+
     scheduler = BlockingScheduler(timezone=SETTINGS.tz)
     scheduler.add_job(job_daily_briefing, "cron", hour="7,19", minute=0)
     scheduler.add_job(job_health_ping, "cron", hour=12, minute=0)
     if SETTINGS.command_poll_enabled:
         scheduler.add_job(poll_telegram_commands, "interval", minutes=SETTINGS.command_poll_interval_minutes)
 
-    print("--------------------------------------------------")
-    print("RUNNING AN INSTANT TEST BRIEFING NOW...")
-    print("--------------------------------------------------")
-    job_daily_briefing()
+    if SETTINGS.send_startup_briefing:
+        print("--------------------------------------------------")
+        print("RUNNING AN INSTANT TEST BRIEFING NOW...")
+        print("--------------------------------------------------")
+        job_daily_briefing()
+    else:
+        print("Startup briefing skipped (SEND_STARTUP_BRIEFING=false).")
 
     print("\nInitialization finished. Bot is waiting for schedule and commands.")
     try:

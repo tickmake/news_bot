@@ -95,6 +95,7 @@ python news_bot.py
 - `STATE_FILE` - local JSON state file path (default `.news_bot_state.json`)
 - `COMMAND_POLL_ENABLED` - enable Telegram command polling (default `true`)
 - `COMMAND_POLL_INTERVAL_MINUTES` - command polling cadence (default `2`)
+- `SEND_STARTUP_BRIEFING` - run one immediate briefing on container start (default `false`)
 - `HEALTH_PING_ENABLED` - enable daily health ping (default `true`)
 - `HEALTH_PING_CHAT_ID` - optional separate chat for health pings
 - `GLOBAL_NEWS_FEEDS` - comma-separated RSS feed URLs for global news
