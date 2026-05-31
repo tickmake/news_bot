@@ -7,9 +7,9 @@ from datetime import datetime
 from html import escape
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
 
 from apscheduler.schedulers.blocking import BlockingScheduler
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import requests
 import requests.exceptions
@@ -26,57 +26,24 @@ logging.basicConfig(
     format="%(asctime)s level=%(levelname)s event=%(message)s",
 )
 
-USA_STOCK_UNIVERSE_DEFAULT = {
-    "Apple": "AAPL",
-    "Microsoft": "MSFT",
-    "NVIDIA": "NVDA",
-    "Amazon": "AMZN",
-    "Alphabet": "GOOGL",
-    "Meta": "META",
-    "Tesla": "TSLA",
-    "JPMorgan": "JPM",
-    "Exxon Mobil": "XOM",
-    "Visa": "V",
-}
-
-INDIA_STOCK_UNIVERSE_DEFAULT = {
-    "Reliance": "RELIANCE.NS",
-    "TCS": "TCS.NS",
-    "HDFC Bank": "HDFCBANK.NS",
-    "ICICI Bank": "ICICIBANK.NS",
-    "Infosys": "INFY.NS",
-    "SBI": "SBIN.NS",
-    "Bharti Airtel": "BHARTIARTL.NS",
-    "L&T": "LT.NS",
-    "ITC": "ITC.NS",
-    "Hindustan Unilever": "HINDUNILVR.NS",
-}
-
-NORWAY_STOCK_UNIVERSE_DEFAULT = {
-    "Equinor": "EQNR.OL",
-    "DNB Bank": "DNB.OL",
-    "Yara": "YAR.OL",
-    "Mowi": "MOWI.OL",
-    "Aker BP": "AKRBP.OL",
-    "Orkla": "ORK.OL",
-    "Norsk Hydro": "NHY.OL",
-    "SalMar": "SALM.OL",
-    "Gjensidige": "GJF.OL",
-    "Telenor": "TEL.OL",
-}
-
-INDIA_MUTUAL_FUNDS_DEFAULT = {
-    "Nippon Nifty BeES": "NIFTYBEES.NS",
-    "Nippon Junior BeES": "JUNIORBEES.NS",
-    "Nippon Bank BeES": "BANKBEES.NS",
-    "Nippon Gold BeES": "GOLDBEES.NS",
-    "SBI Nifty 50 ETF": "SETFNIF50.NS",
-}
-
-NORWAY_MUTUAL_FUNDS_DEFAULT = {
-    "iShares MSCI Norway ETF": "ENOR",
-    "Global X Norway ETF": "NORW",
-}
+DEFAULT_GLOBAL_NEWS_FEEDS = (
+    "https://feeds.reuters.com/reuters/worldNews,"
+    "https://feeds.bbci.co.uk/news/world/rss.xml,"
+    "https://www.cnbc.com/id/100727362/device/rss/rss.html"
+)
+DEFAULT_BUSINESS_NEWS_FEEDS = (
+    "https://feeds.reuters.com/reuters/businessNews,"
+    "https://www.cnbc.com/id/10001147/device/rss/rss.html,"
+    "https://finance.yahoo.com/news/rssindex"
+)
+DEFAULT_NORWAY_NEWS_FEEDS = (
+    "https://www.nrk.no/toppsaker.rss,"
+    "https://e24.no/rss,"
+    "https://www.aftenposten.no/rss"
+)
+DEFAULT_STOCK_SCREENERS = "day_gainers,most_actives"
+DEFAULT_FUND_SCREENERS = "conservative_foreign_funds,solid_large_growth_funds,high_yield_bond"
+MARKET_DATA_USER_AGENT = "Mozilla/5.0 (compatible; news-bot/1.0)"
 
 MORNING_GREETINGS = [
     "🌞 Good morning! Wishing you a focused and positive day ahead.",
@@ -111,9 +78,7 @@ class AppSettings(BaseSettings):
 
     telegram_token: str = ""
     telegram_chat_id: str = ""
-    news_api_key: str = ""
     recipient_name: str = "Sunil"
-    norway_news_query: str = "Norway OR Norge"
     tz: str = "Europe/Oslo"
     request_timeout_seconds: int = 15
     telegram_message_max_chars: int = 3900
@@ -133,6 +98,12 @@ class AppSettings(BaseSettings):
     trade_min_volume_ratio: float = 1.2
     trade_max_drawdown_pct: float = 8.0
     trade_max_atr_pct: float = 4.5
+    global_news_feeds: str = DEFAULT_GLOBAL_NEWS_FEEDS
+    business_news_feeds: str = DEFAULT_BUSINESS_NEWS_FEEDS
+    norway_news_feeds: str = DEFAULT_NORWAY_NEWS_FEEDS
+    stock_screeners: str = DEFAULT_STOCK_SCREENERS
+    fund_screeners: str = DEFAULT_FUND_SCREENERS
+    screener_quote_limit: int = 50
     usa_stock_universe: Optional[str] = None
     india_stock_universe: Optional[str] = None
     norway_stock_universe: Optional[str] = None
@@ -143,7 +114,6 @@ class AppSettings(BaseSettings):
         required = {
             "TELEGRAM_TOKEN": self.telegram_token,
             "TELEGRAM_CHAT_ID": self.telegram_chat_id,
-            "NEWS_API_KEY": self.news_api_key,
         }
         return [name for name, value in required.items() if not value]
 
@@ -170,11 +140,11 @@ def _parse_instrument_env(raw_value: Optional[str], fallback: Dict[str, str]) ->
     return parsed or dict(fallback)
 
 
-USA_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.usa_stock_universe, USA_STOCK_UNIVERSE_DEFAULT)
-INDIA_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.india_stock_universe, INDIA_STOCK_UNIVERSE_DEFAULT)
-NORWAY_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.norway_stock_universe, NORWAY_STOCK_UNIVERSE_DEFAULT)
-INDIA_MUTUAL_FUNDS = _parse_instrument_env(SETTINGS.india_mutual_funds, INDIA_MUTUAL_FUNDS_DEFAULT)
-NORWAY_MUTUAL_FUNDS = _parse_instrument_env(SETTINGS.norway_mutual_funds, NORWAY_MUTUAL_FUNDS_DEFAULT)
+USA_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.usa_stock_universe, {})
+INDIA_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.india_stock_universe, {})
+NORWAY_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.norway_stock_universe, {})
+INDIA_MUTUAL_FUNDS = _parse_instrument_env(SETTINGS.india_mutual_funds, {})
+NORWAY_MUTUAL_FUNDS = _parse_instrument_env(SETTINGS.norway_mutual_funds, {})
 
 
 class AppState:
@@ -238,8 +208,17 @@ def _split_csv(value: str) -> List[str]:
     return [item.strip().lower() for item in value.split(",") if item.strip()]
 
 
+def _split_csv_values(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 TRUSTED_DOMAINS = _split_csv(SETTINGS.trusted_news_domains)
 BLOCKED_DOMAINS = _split_csv(SETTINGS.blocked_news_domains)
+GLOBAL_NEWS_FEEDS = _split_csv_values(SETTINGS.global_news_feeds)
+BUSINESS_NEWS_FEEDS = _split_csv_values(SETTINGS.business_news_feeds)
+NORWAY_NEWS_FEEDS = _split_csv_values(SETTINGS.norway_news_feeds)
+STOCK_SCREENERS = _split_csv_values(SETTINGS.stock_screeners)
+FUND_SCREENERS = _split_csv_values(SETTINGS.fund_screeners)
 
 
 def _with_retry(action: Callable[[], Any], label: str, retries: int = 3, backoff_seconds: float = 1.0) -> Any:
@@ -418,96 +397,104 @@ def build_daily_intro(now: Optional[datetime] = None) -> str:
     return f"{escape(greeting)}\nHello, {recipient}!\n📅 {date_key}\n"
 
 
-def _story_title_and_link(story: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    title = story.get("title")
-    link = story.get("link")
-    content = story.get("content")
-    if isinstance(content, dict):
-        title = title or content.get("title")
-        canonical_url = content.get("canonicalUrl")
-        if isinstance(canonical_url, dict):
-            link = link or canonical_url.get("url")
-        click_url = content.get("clickThroughUrl")
-        if isinstance(click_url, dict):
-            link = link or click_url.get("url")
-    return title, link
+def _parse_rss_items(xml_text: str, max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
+    items: List[Tuple[str, Optional[str]]] = []
+    root = ET.fromstring(xml_text)
+
+    for node in root.findall(".//item"):
+        title = (node.findtext("title") or "").strip()
+        link = (node.findtext("link") or "").strip() or None
+        if not link:
+            guid = (node.findtext("guid") or "").strip()
+            if guid.startswith("http"):
+                link = guid
+        if title:
+            items.append((title, link))
+        if len(items) >= max_items:
+            return items
+
+    atom_ns = "{http://www.w3.org/2005/Atom}"
+    for node in root.findall(f".//{atom_ns}entry"):
+        title = (node.findtext(f"{atom_ns}title") or "").strip()
+        link: Optional[str] = None
+        for link_node in node.findall(f"{atom_ns}link"):
+            href = (link_node.attrib.get("href") or "").strip()
+            rel = (link_node.attrib.get("rel") or "alternate").strip()
+            if href and rel in ("alternate", ""):
+                link = href
+                break
+            if href and not link:
+                link = href
+        if title:
+            items.append((title, link))
+        if len(items) >= max_items:
+            return items
+    return items
+
+
+def _fetch_rss_items(feed_url: str, max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
+    try:
+        response = _with_retry(
+            lambda: requests.get(
+                feed_url,
+                headers={"User-Agent": MARKET_DATA_USER_AGENT},
+                timeout=SETTINGS.request_timeout_seconds,
+            ),
+            f"rss_{hashlib.sha1(feed_url.encode('utf-8')).hexdigest()[:8]}",
+            retries=2,
+        )
+        response.raise_for_status()
+        return _parse_rss_items(response.text, max_items=max_items)
+    except Exception as exc:
+        LOGGER.warning("rss_fetch_failed feed=%s detail=%s", feed_url, exc)
+        return []
+
+
+def _build_news_section(
+    section_key: str,
+    title: str,
+    feed_urls: List[str],
+    empty_message: str,
+    max_headlines: int = 5,
+) -> str:
+    date_key = datetime.today().strftime("%Y-%m-%d")
+    lines = [title]
+    count = 0
+
+    for feed_url in feed_urls:
+        for headline, url in _fetch_rss_items(feed_url, max_items=15):
+            if not _source_allowed(url):
+                continue
+            if _is_duplicate_headline(section_key, headline, url, date_key):
+                continue
+            count += 1
+            lines.append(_format_headline_line(count, headline, url))
+            if count >= max_headlines:
+                break
+        if count >= max_headlines:
+            break
+
+    if count == 0:
+        lines.append(empty_message)
+    return "\n".join(lines) + "\n\n"
 
 
 def get_global_news() -> str:
-    if not SETTINGS.news_api_key:
-        return "🌍 Top Global News:\nNews API key is not configured.\n\n"
-    date_key = datetime.today().strftime("%Y-%m-%d")
-    try:
-        def _fetch() -> requests.Response:
-            return requests.get(
-                "https://newsapi.org/v2/top-headlines",
-                params={"language": "en", "pageSize": 10, "apiKey": SETTINGS.news_api_key},
-                timeout=SETTINGS.request_timeout_seconds,
-            )
-
-        response = _with_retry(_fetch, "newsapi_global")
-        response.raise_for_status()
-        payload = response.json()
-        articles = payload.get("articles", [])
-        lines = ["🌍 Top Global News:"]
-        count = 0
-        for article in articles:
-            title = article.get("title", "Untitled")
-            url = article.get("url")
-            if not _source_allowed(url):
-                continue
-            if _is_duplicate_headline("global_news", title, url, date_key):
-                continue
-            count += 1
-            lines.append(_format_headline_line(count, title, url))
-            if count >= 5:
-                break
-        if count == 0:
-            lines.append("No fresh headlines available right now.")
-        return "\n".join(lines) + "\n\n"
-    except Exception as exc:
-        return f"🌍 Top Global News:\nFailed to fetch ({exc}).\n\n"
+    return _build_news_section(
+        section_key="global_news",
+        title="🌍 Top Global News:",
+        feed_urls=GLOBAL_NEWS_FEEDS,
+        empty_message="No fresh global headlines available right now.",
+    )
 
 
 def get_norwegian_morning_news() -> str:
-    if not SETTINGS.news_api_key:
-        return "🇳🇴 Early Morning Norway News:\nNews API key is not configured.\n\n"
-    date_key = datetime.today().strftime("%Y-%m-%d")
-    try:
-        def _fetch() -> requests.Response:
-            return requests.get(
-                "https://newsapi.org/v2/top-headlines",
-                params={
-                    "country": "no",
-                    "q": SETTINGS.norway_news_query,
-                    "pageSize": 10,
-                    "apiKey": SETTINGS.news_api_key,
-                },
-                timeout=SETTINGS.request_timeout_seconds,
-            )
-
-        response = _with_retry(_fetch, "newsapi_norway")
-        response.raise_for_status()
-        payload = response.json()
-        articles = payload.get("articles", [])
-        lines = ["🇳🇴 Early Morning Norway News:"]
-        count = 0
-        for article in articles:
-            title = article.get("title", "Untitled")
-            url = article.get("url")
-            if not _source_allowed(url):
-                continue
-            if _is_duplicate_headline("norway_news", title, url, date_key):
-                continue
-            count += 1
-            lines.append(_format_headline_line(count, title, url))
-            if count >= 5:
-                break
-        if count == 0:
-            lines.append("No fresh Norwegian headlines available right now.")
-        return "\n".join(lines) + "\n\n"
-    except Exception as exc:
-        return f"🇳🇴 Early Morning Norway News:\nFailed to fetch ({exc}).\n\n"
+    return _build_news_section(
+        section_key="norway_news",
+        title="🇳🇴 Early Morning Norway News:",
+        feed_urls=NORWAY_NEWS_FEEDS,
+        empty_message="No fresh Norwegian headlines available right now.",
+    )
 
 
 def _compute_weekly_change(symbol: str) -> Optional[Tuple[float, float]]:
@@ -541,54 +528,142 @@ def _top_weekly_performers_data(instruments: Dict[str, str], top_n: int = 3) -> 
     return [(name, symbol, close_price, pct_change) for pct_change, name, symbol, close_price in scored[:top_n]]
 
 
-def get_business_and_stocks() -> str:
-    date_key = datetime.today().strftime("%Y-%m-%d")
+def _as_float(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        raw = value.get("raw")
+        if isinstance(raw, (int, float)):
+            return float(raw)
     try:
-        market = _with_retry(lambda: yf.Ticker("SPY"), "yf_spy_ticker", retries=2)
-        raw_news = (market.news or [])[:15]
-        biz_lines = ["💼 Top 10 Business Stories:"]
-        count = 0
-        for story in raw_news:
-            title, link = _story_title_and_link(story)
-            if not title:
-                continue
-            if not _source_allowed(link):
-                continue
-            if _is_duplicate_headline("business_news", title, link, date_key):
-                continue
-            count += 1
-            biz_lines.append(_format_headline_line(count, title, link))
-            if count >= 10:
-                break
-        if count == 0:
-            biz_lines.append("No fresh business headlines available right now.")
-        biz_str = "\n".join(biz_lines)
-    except Exception as exc:
-        biz_str = f"💼 Top 10 Business Stories:\nFailed to fetch ({exc})."
+        return float(value)
+    except Exception:
+        return None
 
-    stock_rows: List[List[str]] = []
-    stock_markets = {"India": INDIA_STOCK_UNIVERSE, "USA": USA_STOCK_UNIVERSE, "Norway": NORWAY_STOCK_UNIVERSE}
-    for market_name, universe in stock_markets.items():
-        for name, symbol, close_price, pct_change in _top_weekly_performers_data(universe, top_n=3):
-            stock_rows.append([market_name, _truncate(name, 20), symbol, f"{close_price:.2f}", f"{pct_change:+.2f}%"])
-    stock_section = ["📈 Market Watch - Top Weekly Gainers:"]
-    if stock_rows:
-        stock_section.append(
-            _render_pre_table("Top 3 gainers per market (7D)", ["Market", "Name", "Symbol", "Close", "7D"], stock_rows)
+
+def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str, Any]]:
+    try:
+        response = _with_retry(
+            lambda: requests.get(
+                "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+                params={"scrIds": scr_id, "count": count, "start": 0},
+                headers={"User-Agent": MARKET_DATA_USER_AGENT},
+                timeout=SETTINGS.request_timeout_seconds,
+            ),
+            f"screener_{scr_id}",
+            retries=2,
         )
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("finance", {}).get("result") or []
+        if not result:
+            return []
+        quotes = result[0].get("quotes") or []
+        if isinstance(quotes, list):
+            return [quote for quote in quotes if isinstance(quote, dict)]
+    except Exception as exc:
+        LOGGER.warning("screener_fetch_failed scr_id=%s detail=%s", scr_id, exc)
+    return []
+
+
+def _quote_name(quote: Dict[str, Any]) -> str:
+    for key in ("shortName", "longName", "displayName", "symbol"):
+        value = quote.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "Unknown"
+
+
+def _is_fund_quote(quote: Dict[str, Any]) -> bool:
+    quote_type = (quote.get("quoteType") or "").upper()
+    return quote_type in {"MUTUALFUND", "ETF"}
+
+
+def _is_stock_quote(quote: Dict[str, Any]) -> bool:
+    return (quote.get("quoteType") or "").upper() == "EQUITY"
+
+
+def _collect_live_quotes(scr_ids: List[str], count_per_screener: int) -> List[Dict[str, Any]]:
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for scr_id in scr_ids:
+        for quote in _fetch_predefined_screener_quotes(scr_id, count=count_per_screener):
+            symbol = (quote.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            if symbol not in deduped:
+                deduped[symbol] = quote
+    return list(deduped.values())
+
+
+def _format_live_rows(
+    quotes: List[Dict[str, Any]],
+    top_n: int,
+    max_name_len: int,
+) -> List[List[str]]:
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for quote in quotes:
+        pct_change = _as_float(quote.get("regularMarketChangePercent"))
+        if pct_change is None:
+            continue
+        scored.append((pct_change, quote))
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    rows: List[List[str]] = []
+    for pct_change, quote in scored[:top_n]:
+        symbol = str(quote.get("symbol") or "-")
+        close_price = _as_float(quote.get("regularMarketPrice"))
+        rows.append(
+            [
+                _truncate(_quote_name(quote), max_name_len),
+                symbol,
+                f"{close_price:.2f}" if close_price is not None else "N/A",
+                f"{pct_change:+.2f}%",
+            ]
+        )
+    return rows
+
+
+def _build_live_universe(limit: int = 40) -> Dict[str, str]:
+    dynamic_quotes = _collect_live_quotes(STOCK_SCREENERS + FUND_SCREENERS, count_per_screener=SETTINGS.screener_quote_limit)
+    stocks = [quote for quote in dynamic_quotes if _is_stock_quote(quote)]
+    funds = [quote for quote in dynamic_quotes if _is_fund_quote(quote)]
+    rows = _format_live_rows(stocks, top_n=limit, max_name_len=28) + _format_live_rows(
+        funds,
+        top_n=max(10, limit // 2),
+        max_name_len=28,
+    )
+    universe: Dict[str, str] = {}
+    for row in rows:
+        name, symbol = row[0], row[1]
+        if symbol != "-" and symbol not in universe.values():
+            universe[name] = symbol
+    return universe
+
+
+def get_business_and_stocks() -> str:
+    biz_str = _build_news_section(
+        section_key="business_news",
+        title="💼 Top Business Stories:",
+        feed_urls=BUSINESS_NEWS_FEEDS,
+        empty_message="No fresh business headlines available right now.",
+        max_headlines=8,
+    ).strip()
+
+    quotes = _collect_live_quotes(STOCK_SCREENERS + FUND_SCREENERS, count_per_screener=SETTINGS.screener_quote_limit)
+    stock_quotes = [quote for quote in quotes if _is_stock_quote(quote)]
+    fund_quotes = [quote for quote in quotes if _is_fund_quote(quote)]
+
+    stock_rows = _format_live_rows(stock_quotes, top_n=8, max_name_len=24)
+    stock_section = ["📈 Live Stock Movers (Public Market Data):"]
+    if stock_rows:
+        stock_section.append(_render_pre_table("Top stocks by 1D change", ["Name", "Symbol", "Price", "1D"], stock_rows))
     else:
         stock_section.append("Data temporarily unavailable")
 
-    fund_rows: List[List[str]] = []
-    fund_markets = {"India": INDIA_MUTUAL_FUNDS, "Norway": NORWAY_MUTUAL_FUNDS}
-    for market_name, universe in fund_markets.items():
-        for name, symbol, close_price, pct_change in _top_weekly_performers_data(universe, top_n=3):
-            fund_rows.append([market_name, _truncate(name, 24), symbol, f"{close_price:.2f}", f"{pct_change:+.2f}%"])
-    fund_section = ["🏦 Most Attractive Mutual Funds - Weekly:"]
+    fund_rows = _format_live_rows(fund_quotes, top_n=8, max_name_len=26)
+    fund_section = ["🏦 Live Funds & ETFs (Public Market Data):"]
     if fund_rows:
-        fund_section.append(
-            _render_pre_table("Top weekly performers", ["Market", "Fund", "Symbol", "Close", "7D"], fund_rows)
-        )
+        fund_section.append(_render_pre_table("Top funds/ETFs by 1D change", ["Fund", "Symbol", "Price", "1D"], fund_rows))
     else:
         fund_section.append("Data temporarily unavailable")
 
@@ -691,13 +766,17 @@ def _analyze_short_term_candidate(symbol: str) -> Optional[Dict[str, float]]:
 
 def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int = 5) -> str:
     if universe is None:
-        universe = {
-            **{f"{name} [India Stock]": sym for name, sym in INDIA_STOCK_UNIVERSE.items()},
+        universe = _build_live_universe(limit=45)
+        configured_universe = {
             **{f"{name} [USA Stock]": sym for name, sym in USA_STOCK_UNIVERSE.items()},
+            **{f"{name} [India Stock]": sym for name, sym in INDIA_STOCK_UNIVERSE.items()},
             **{f"{name} [Norway Stock]": sym for name, sym in NORWAY_STOCK_UNIVERSE.items()},
             **{f"{name} [India Fund]": sym for name, sym in INDIA_MUTUAL_FUNDS.items()},
             **{f"{name} [Norway Fund]": sym for name, sym in NORWAY_MUTUAL_FUNDS.items()},
         }
+        for label, symbol in configured_universe.items():
+            if symbol not in universe.values():
+                universe[label] = symbol
 
     scored: List[Tuple[float, float, float, str, str, Dict[str, float]]] = []
     for name, symbol in universe.items():

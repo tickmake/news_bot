@@ -5,34 +5,6 @@ from unittest.mock import MagicMock, patch
 import news_bot
 
 
-class FakeCloseSeries:
-    def __init__(self, values):
-        self._values = values
-        self.iloc = self
-
-    def __getitem__(self, index):
-        return self._values[index]
-
-    def __len__(self):
-        return len(self._values)
-
-    def dropna(self):
-        return self
-
-
-class FakeHistory:
-    def __init__(self, close_values):
-        self._close = FakeCloseSeries(close_values)
-
-    def __len__(self):
-        return len(self._close._values)
-
-    def __getitem__(self, key):
-        if key == "Close":
-            return self._close
-        raise KeyError(key)
-
-
 class NewsBotTests(unittest.TestCase):
     def test_daily_pick_is_deterministic_for_context_and_day(self):
         picked_1 = news_bot._daily_pick(["a", "b", "c"], "ctx", "2026-06-01")
@@ -129,18 +101,16 @@ class NewsBotTests(unittest.TestCase):
     def test_get_global_news_success(self, mock_get):
         news_bot.STATE.data["sent_headline_keys"] = {}
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "articles": [
-                {"title": "Title 1", "url": "https://example.com/1"},
-                {"title": "Title 2", "url": "https://example.com/2"},
-            ]
-        }
+        mock_response.text = (
+            "<rss><channel>"
+            "<item><title>Title 1</title><link>https://example.com/1</link></item>"
+            "<item><title>Title 2</title><link>https://example.com/2</link></item>"
+            "</channel></rss>"
+        )
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot.SETTINGS, "news_api_key", "test-key"), patch.object(
-            news_bot, "_source_allowed", return_value=True
-        ):
+        with patch.object(news_bot, "_source_allowed", return_value=True):
             result = news_bot.get_global_news()
 
         self.assertIn("Top Global News", result)
@@ -148,61 +118,67 @@ class NewsBotTests(unittest.TestCase):
         self.assertIn("https://example.com/2", result)
 
     @patch("news_bot.requests.get")
-    def test_get_global_news_missing_api_key(self, _mock_get):
-        with patch.object(news_bot.SETTINGS, "news_api_key", ""):
+    def test_get_global_news_without_news_api_key_still_works(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.text = (
+            "<rss><channel>"
+            "<item><title>Public headline</title><link>https://example.com/1</link></item>"
+            "</channel></rss>"
+        )
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        with patch.object(news_bot, "_source_allowed", return_value=True):
             result = news_bot.get_global_news()
-
-        self.assertIn("not configured", result)
+        self.assertIn("Public headline", result)
 
     @patch("news_bot.requests.get")
     def test_get_norwegian_morning_news_success(self, mock_get):
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "articles": [
-                {"title": "NRK headline", "url": "https://example.no/1"},
-            ]
-        }
+        mock_response.text = (
+            "<rss><channel>"
+            "<item><title>NRK headline</title><link>https://example.no/1</link></item>"
+            "</channel></rss>"
+        )
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot.SETTINGS, "news_api_key", "test-key"), patch.object(
-            news_bot, "_source_allowed", return_value=True
-        ):
+        with patch.object(news_bot, "_source_allowed", return_value=True):
             result = news_bot.get_norwegian_morning_news()
 
         self.assertIn("Early Morning Norway News", result)
         self.assertIn("NRK headline", result)
         self.assertIn("https://example.no/1", result)
 
-    @patch("news_bot.yf.Ticker")
-    def test_get_business_and_stocks_handles_yfinance_shapes(self, mock_ticker):
+    @patch("news_bot._collect_live_quotes")
+    @patch("news_bot._build_news_section")
+    def test_get_business_and_stocks_uses_live_feeds(self, mock_news_section, mock_collect_live):
         news_bot.STATE.data["sent_headline_keys"] = {}
-        spy_ticker = MagicMock()
-        spy_ticker.news = [
+        mock_news_section.return_value = (
+            "💼 Top Business Stories:\n"
+            '1. Market headline (<a href="https://example.com/market">more</a>)\n'
+        )
+        mock_collect_live.return_value = [
             {
-                "content": {
-                    "title": "Market headline",
-                    "canonicalUrl": {"url": "https://example.com/market"},
-                }
-            }
+                "quoteType": "EQUITY",
+                "shortName": "Acme Corp",
+                "symbol": "ACME",
+                "regularMarketPrice": 120.5,
+                "regularMarketChangePercent": 4.2,
+            },
+            {
+                "quoteType": "MUTUALFUND",
+                "shortName": "Growth Fund",
+                "symbol": "GFNDX",
+                "regularMarketPrice": 24.1,
+                "regularMarketChangePercent": 1.5,
+            },
         ]
 
-        index_ticker = MagicMock()
-        index_ticker.history.return_value = FakeHistory([100.0, 102.0])
-
-        def ticker_side_effect(symbol):
-            if symbol == "SPY":
-                return spy_ticker
-            return index_ticker
-
-        mock_ticker.side_effect = ticker_side_effect
-
-        with patch.object(news_bot, "_source_allowed", return_value=True):
-            result = news_bot.get_business_and_stocks()
-        self.assertIn("Top 10 Business Stories", result)
+        result = news_bot.get_business_and_stocks()
+        self.assertIn("Top Business Stories", result)
         self.assertIn("Market headline", result)
-        self.assertIn("Top Weekly Gainers", result)
-        self.assertIn("Most Attractive Mutual Funds", result)
+        self.assertIn("Live Stock Movers", result)
+        self.assertIn("Live Funds & ETFs", result)
 
     @patch("news_bot.requests.post")
     def test_send_telegram_message_success(self, mock_post):
@@ -243,10 +219,10 @@ class NewsBotTests(unittest.TestCase):
     def test_get_missing_required_config_reads_settings(self):
         with patch.object(news_bot.SETTINGS, "telegram_token", ""), patch.object(
             news_bot.SETTINGS, "telegram_chat_id", "1"
-        ), patch.object(news_bot.SETTINGS, "news_api_key", ""):
+        ):
             missing = list(news_bot.get_missing_required_config())
         self.assertIn("TELEGRAM_TOKEN", missing)
-        self.assertIn("NEWS_API_KEY", missing)
+        self.assertNotIn("NEWS_API_KEY", missing)
 
 
 if __name__ == "__main__":

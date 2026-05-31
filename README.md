@@ -5,8 +5,8 @@ Automated Telegram briefing bot that sends curated daily updates with:
 - Norwegian morning headlines
 - Global top news
 - Business stories
-- Market watch (top weekly gainers in India, USA, Norway)
-- Weekly mutual fund performers (India and Norway-focused instruments)
+- Live stock movers from public market screeners
+- Live mutual fund / ETF movers from public market screeners
 - Short-term trade candidates (informational screener)
 - Daily greeting and rotating quote (morning) / evening greeting
 
@@ -19,7 +19,7 @@ The bot is built in Python and scheduled with APScheduler.
 - **Tabular finance sections** rendered via `<pre>` for clarity in Telegram.
 - **Twice-daily schedule** at `07:00` and `19:00` (local timezone).
 - **Deterministic daily rotation** for greetings/quote (stable within a day).
-- **Configurable stock/fund universes** via environment variables.
+- **Live public data feeds** for news, stocks, and funds (no hardcoded default symbols).
 - **Typed settings validation** via `pydantic-settings`.
 - **Fallback-safe behavior** when API data is missing or incomplete.
 - **Automatic retries/backoff** for external API calls.
@@ -41,7 +41,6 @@ The bot is built in Python and scheduled with APScheduler.
 - Python `3.11+` recommended
 - Telegram bot token
 - Telegram chat ID
-- NewsAPI key
 
 ## Quick Start (Local)
 
@@ -63,7 +62,6 @@ pip install -r requirements.txt
 ```bash
 TELEGRAM_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
-NEWS_API_KEY=your_newsapi_key
 ```
 
 Tip: you can copy from `.env.example` and fill in your secrets.
@@ -88,23 +86,27 @@ python news_bot.py
 
 - `TELEGRAM_TOKEN` - Telegram bot token
 - `TELEGRAM_CHAT_ID` - target chat/channel/group ID
-- `NEWS_API_KEY` - key for [NewsAPI](https://newsapi.org/)
 
 ### Optional
 
 - `TZ` - timezone for scheduler (default `Europe/Oslo`)
 - `RECIPIENT_NAME` - name shown in greeting (default `Sunil`)
-- `NORWAY_NEWS_QUERY` - query terms for Norway news (default `Norway OR Norge`)
 - `TELEGRAM_MESSAGE_MAX_CHARS` - chunk size per Telegram message (default `3900`)
 - `STATE_FILE` - local JSON state file path (default `.news_bot_state.json`)
 - `COMMAND_POLL_ENABLED` - enable Telegram command polling (default `true`)
 - `COMMAND_POLL_INTERVAL_MINUTES` - command polling cadence (default `2`)
 - `HEALTH_PING_ENABLED` - enable daily health ping (default `true`)
 - `HEALTH_PING_CHAT_ID` - optional separate chat for health pings
+- `GLOBAL_NEWS_FEEDS` - comma-separated RSS feed URLs for global news
+- `BUSINESS_NEWS_FEEDS` - comma-separated RSS feed URLs for business news
+- `NORWAY_NEWS_FEEDS` - comma-separated RSS feed URLs for Norway-focused news
+- `STOCK_SCREENERS` - comma-separated Yahoo predefined screener IDs for equities
+- `FUND_SCREENERS` - comma-separated Yahoo predefined screener IDs for funds/ETFs
+- `SCREENER_QUOTE_LIMIT` - number of quotes to fetch per screener
 
 ### Optional Universe Configuration
 
-You can override default universes with comma-separated `Label:SYMBOL` entries.
+You can optionally inject your own symbols with comma-separated `Label:SYMBOL` entries.
 
 Supported variables:
 
@@ -122,7 +124,7 @@ INDIA_STOCK_UNIVERSE="Reliance:RELIANCE.NS,TCS:TCS.NS"
 INDIA_MUTUAL_FUNDS="Nifty BeES:NIFTYBEES.NS,Gold BeES:GOLDBEES.NS"
 ```
 
-If parsing fails or values are empty, built-in defaults are used.
+If these are empty, the bot relies fully on live screener data.
 
 ### Trade Risk Controls
 
@@ -191,14 +193,14 @@ Each briefing includes:
 3. Early Morning Norway News
 4. Global News
 5. Top Business Stories
-6. Market Watch (weekly gainers table)
-7. Mutual Funds (weekly performers table)
+6. Market Watch (live stock movers table)
+7. Mutual Funds/ETFs (live movers table)
 8. Short-Term Trade Candidates (informational table)
 
 ## Important Notes
 
 - **No financial guarantees:** The screener is informational only and does not guarantee profits.
-- **Market data coverage varies:** Yahoo Finance symbol availability can differ by region/instrument.
+- **Market data coverage varies:** screener and RSS availability can differ by region/time.
 - **Mutual fund availability:** Norway mutual fund coverage on Yahoo is limited; ETFs are used where needed.
 - **Message splitting:** long messages are automatically split into multiple Telegram parts.
 
@@ -207,11 +209,11 @@ Each briefing includes:
 - **`chat not found`**
   - Send `/start` to the bot first (or add it to the target group/channel with permissions).
 - **No news returned**
-  - Validate `NEWS_API_KEY` and quota.
+  - Validate RSS feed URLs and domain allow/block filters.
 - **No finance rows**
-  - Some symbols may be unavailable temporarily; adjust universe variables.
+  - Some screener IDs may be rate-limited or empty; adjust `STOCK_SCREENERS` / `FUND_SCREENERS`.
 - **Network/proxy failures**
-  - Check outbound connectivity to `api.telegram.org`, NewsAPI, and Yahoo endpoints.
+  - Check outbound connectivity to `api.telegram.org`, configured RSS sources, and Yahoo endpoints.
 
 ## Security
 
