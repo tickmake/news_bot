@@ -40,14 +40,14 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(picked_1, picked_2)
 
     def test_build_daily_intro_morning_contains_quote(self):
-        with patch.object(news_bot, "RECIPIENT_NAME", "Sunil"):
+        with patch.object(news_bot.SETTINGS, "recipient_name", "Sunil"):
             intro = news_bot.build_daily_intro(datetime(2026, 6, 1, 7, 0))
         self.assertIn("Quote of the day", intro)
         self.assertIn("2026-06-01", intro)
         self.assertIn("Hello, Sunil!", intro)
 
     def test_build_daily_intro_evening_contains_evening_message(self):
-        with patch.object(news_bot, "RECIPIENT_NAME", "Sunil"):
+        with patch.object(news_bot.SETTINGS, "recipient_name", "Sunil"):
             intro = news_bot.build_daily_intro(datetime(2026, 6, 1, 19, 0))
         self.assertNotIn("Quote of the day", intro)
         self.assertIn("2026-06-01", intro)
@@ -69,25 +69,14 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(parsed_empty, fallback)
         self.assertEqual(parsed_invalid, fallback)
 
-    def test_top_weekly_performers_selects_best_three(self):
+    def test_top_weekly_performers_data_selects_best_three(self):
         with patch("news_bot._compute_weekly_change") as mock_change:
-            mock_change.side_effect = [
-                (101.0, 1.0),
-                (110.0, 10.0),
-                (106.0, 6.0),
-                (95.0, -5.0),
-            ]
-            instruments = {
-                "A": "A",
-                "B": "B",
-                "C": "C",
-                "D": "D",
-            }
-            lines = news_bot._top_weekly_performers(instruments, top_n=3)
+            mock_change.side_effect = [(101.0, 1.0), (110.0, 10.0), (106.0, 6.0), (95.0, -5.0)]
+            lines = news_bot._top_weekly_performers_data({"A": "A", "B": "B", "C": "C", "D": "D"}, top_n=3)
 
         self.assertEqual(len(lines), 3)
-        self.assertIn("B", lines[0])
-        self.assertIn("+10.00%", lines[0])
+        self.assertEqual(lines[0][0], "B")
+        self.assertAlmostEqual(lines[0][3], 10.0)
 
     @patch("news_bot._analyze_short_term_candidate")
     def test_get_trade_candidates_formats_ranked_output(self, mock_analyze):
@@ -99,6 +88,8 @@ class NewsBotTests(unittest.TestCase):
                     "day_change_pct": 1.2,
                     "week_momentum_pct": 3.5,
                     "volume_ratio": 1.6,
+                    "drawdown_pct": 2.1,
+                    "atr_pct": 1.4,
                 },
                 "BBB": {
                     "score": 3.0,
@@ -106,6 +97,8 @@ class NewsBotTests(unittest.TestCase):
                     "day_change_pct": 0.4,
                     "week_momentum_pct": 2.1,
                     "volume_ratio": 1.3,
+                    "drawdown_pct": 3.0,
+                    "atr_pct": 2.0,
                 },
                 "CCC": None,
             }
@@ -134,6 +127,7 @@ class NewsBotTests(unittest.TestCase):
 
     @patch("news_bot.requests.get")
     def test_get_global_news_success(self, mock_get):
+        news_bot.STATE.data["sent_headline_keys"] = {}
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "articles": [
@@ -144,7 +138,9 @@ class NewsBotTests(unittest.TestCase):
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot, "NEWS_API_KEY", "test-key"):
+        with patch.object(news_bot.SETTINGS, "news_api_key", "test-key"), patch.object(
+            news_bot, "_source_allowed", return_value=True
+        ):
             result = news_bot.get_global_news()
 
         self.assertIn("Top Global News", result)
@@ -153,7 +149,7 @@ class NewsBotTests(unittest.TestCase):
 
     @patch("news_bot.requests.get")
     def test_get_global_news_missing_api_key(self, _mock_get):
-        with patch.object(news_bot, "NEWS_API_KEY", None):
+        with patch.object(news_bot.SETTINGS, "news_api_key", ""):
             result = news_bot.get_global_news()
 
         self.assertIn("not configured", result)
@@ -169,7 +165,9 @@ class NewsBotTests(unittest.TestCase):
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot, "NEWS_API_KEY", "test-key"):
+        with patch.object(news_bot.SETTINGS, "news_api_key", "test-key"), patch.object(
+            news_bot, "_source_allowed", return_value=True
+        ):
             result = news_bot.get_norwegian_morning_news()
 
         self.assertIn("Early Morning Norway News", result)
@@ -178,6 +176,7 @@ class NewsBotTests(unittest.TestCase):
 
     @patch("news_bot.yf.Ticker")
     def test_get_business_and_stocks_handles_yfinance_shapes(self, mock_ticker):
+        news_bot.STATE.data["sent_headline_keys"] = {}
         spy_ticker = MagicMock()
         spy_ticker.news = [
             {
@@ -198,7 +197,8 @@ class NewsBotTests(unittest.TestCase):
 
         mock_ticker.side_effect = ticker_side_effect
 
-        result = news_bot.get_business_and_stocks()
+        with patch.object(news_bot, "_source_allowed", return_value=True):
+            result = news_bot.get_business_and_stocks()
         self.assertIn("Top 10 Business Stories", result)
         self.assertIn("Market headline", result)
         self.assertIn("Top Weekly Gainers", result)
@@ -210,8 +210,8 @@ class NewsBotTests(unittest.TestCase):
         mock_response.raise_for_status.return_value = None
         mock_post.return_value = mock_response
 
-        with patch.object(news_bot, "TELEGRAM_TOKEN", "token"), patch.object(
-            news_bot, "TELEGRAM_CHAT_ID", "chat"
+        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), patch.object(
+            news_bot.SETTINGS, "telegram_chat_id", "chat"
         ):
             ok = news_bot.send_telegram_message("hello")
 
@@ -221,11 +221,32 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(sent_payload["parse_mode"], "HTML")
 
     def test_send_telegram_message_missing_config(self):
-        with patch.object(news_bot, "TELEGRAM_TOKEN", None), patch.object(
-            news_bot, "TELEGRAM_CHAT_ID", None
+        with patch.object(news_bot.SETTINGS, "telegram_token", ""), patch.object(
+            news_bot.SETTINGS, "telegram_chat_id", ""
         ):
             ok = news_bot.send_telegram_message("hello")
         self.assertFalse(ok)
+
+    def test_split_message_html_chunks_long_payload(self):
+        text = ("section\n\n" * 2000).strip()
+        chunks = news_bot._split_message_html(text, 200)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 200 for chunk in chunks))
+
+    def test_source_allowed_blocks_explicit_blocklist(self):
+        with patch.object(news_bot, "BLOCKED_DOMAINS", ["bad.com"]), patch.object(
+            news_bot, "TRUSTED_DOMAINS", []
+        ):
+            self.assertFalse(news_bot._source_allowed("https://bad.com/x"))
+            self.assertTrue(news_bot._source_allowed("https://good.com/x"))
+
+    def test_get_missing_required_config_reads_settings(self):
+        with patch.object(news_bot.SETTINGS, "telegram_token", ""), patch.object(
+            news_bot.SETTINGS, "telegram_chat_id", "1"
+        ), patch.object(news_bot.SETTINGS, "news_api_key", ""):
+            missing = list(news_bot.get_missing_required_config())
+        self.assertIn("TELEGRAM_TOKEN", missing)
+        self.assertIn("NEWS_API_KEY", missing)
 
 
 if __name__ == "__main__":

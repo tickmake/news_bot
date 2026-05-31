@@ -20,7 +20,13 @@ The bot is built in Python and scheduled with APScheduler.
 - **Twice-daily schedule** at `07:00` and `19:00` (local timezone).
 - **Deterministic daily rotation** for greetings/quote (stable within a day).
 - **Configurable stock/fund universes** via environment variables.
+- **Typed settings validation** via `pydantic-settings`.
 - **Fallback-safe behavior** when API data is missing or incomplete.
+- **Automatic retries/backoff** for external API calls.
+- **Duplicate headline suppression** across same-day sends.
+- **Telegram command support** (`/now`, `/morning`, `/evening`, `/watchlist`, `/health`).
+- **Health ping** support for runtime monitoring.
+- **CI test workflow** via GitHub Actions.
 
 ## Project Structure
 
@@ -60,6 +66,8 @@ TELEGRAM_CHAT_ID=your_chat_id
 NEWS_API_KEY=your_newsapi_key
 ```
 
+Tip: you can copy from `.env.example` and fill in your secrets.
+
 4. Run a one-off briefing:
 
 ```bash
@@ -87,6 +95,12 @@ python news_bot.py
 - `TZ` - timezone for scheduler (default `Europe/Oslo`)
 - `RECIPIENT_NAME` - name shown in greeting (default `Sunil`)
 - `NORWAY_NEWS_QUERY` - query terms for Norway news (default `Norway OR Norge`)
+- `TELEGRAM_MESSAGE_MAX_CHARS` - chunk size per Telegram message (default `3900`)
+- `STATE_FILE` - local JSON state file path (default `.news_bot_state.json`)
+- `COMMAND_POLL_ENABLED` - enable Telegram command polling (default `true`)
+- `COMMAND_POLL_INTERVAL_MINUTES` - command polling cadence (default `2`)
+- `HEALTH_PING_ENABLED` - enable daily health ping (default `true`)
+- `HEALTH_PING_CHAT_ID` - optional separate chat for health pings
 
 ### Optional Universe Configuration
 
@@ -110,6 +124,15 @@ INDIA_MUTUAL_FUNDS="Nifty BeES:NIFTYBEES.NS,Gold BeES:GOLDBEES.NS"
 
 If parsing fails or values are empty, built-in defaults are used.
 
+### Trade Risk Controls
+
+- `TRADE_MIN_SCORE`
+- `TRADE_MIN_WEEK_MOMENTUM_PCT`
+- `TRADE_MIN_DAY_CHANGE_PCT`
+- `TRADE_MIN_VOLUME_RATIO`
+- `TRADE_MAX_DRAWDOWN_PCT`
+- `TRADE_MAX_ATR_PCT`
+
 ## Scheduling
 
 The bot schedules:
@@ -123,6 +146,21 @@ Configured in:
 scheduler.add_job(job_daily_briefing, "cron", hour="7,19", minute=0)
 ```
 
+Additional jobs:
+
+- daily health ping (`12:00`)
+- Telegram command polling (`interval`, default every 2 minutes)
+
+## Telegram Commands
+
+After sending `/start` to the bot, you can use:
+
+- `/now` - send full briefing immediately
+- `/morning` - send morning-style briefing
+- `/evening` - send evening-style briefing
+- `/watchlist` - send market + screener sections only
+- `/health` - send runtime health report
+
 ## Testing
 
 Run unit tests:
@@ -131,6 +169,8 @@ Run unit tests:
 source .venv/bin/activate
 python -m unittest -v
 ```
+
+CI runs this same test suite on push/PR via `.github/workflows/ci.yml`.
 
 ## Docker
 
@@ -160,6 +200,7 @@ Each briefing includes:
 - **No financial guarantees:** The screener is informational only and does not guarantee profits.
 - **Market data coverage varies:** Yahoo Finance symbol availability can differ by region/instrument.
 - **Mutual fund availability:** Norway mutual fund coverage on Yahoo is limited; ETFs are used where needed.
+- **Message splitting:** long messages are automatically split into multiple Telegram parts.
 
 ## Troubleshooting
 
