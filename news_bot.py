@@ -18,6 +18,7 @@ if not hasattr(requests.exceptions, "DNSError"):
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+RECIPIENT_NAME = os.getenv("RECIPIENT_NAME", "Sunil").strip() or "Sunil"
 NORWAY_NEWS_QUERY = os.getenv("NORWAY_NEWS_QUERY", "Norway OR Norge")
 
 REQUEST_TIMEOUT_SECONDS = 15
@@ -161,18 +162,20 @@ def _daily_pick(options: List[str], context: str, date_key: Optional[str] = None
 def build_daily_intro(now: Optional[datetime] = None) -> str:
     now = now or datetime.now()
     date_key = now.strftime("%Y-%m-%d")
+    recipient = escape(RECIPIENT_NAME)
 
     if now.hour < 12:
         greeting = _daily_pick(MORNING_GREETINGS, "morning", date_key)
         quote = _daily_pick(INSPIRATIONAL_QUOTES, "quote", date_key)
         return (
             f"{escape(greeting)}\n"
+            f"Hello, {recipient}!\n"
             f"📅 {date_key}\n"
             f"💡 Quote of the day: <i>{escape(quote)}</i>\n"
         )
 
     greeting = _daily_pick(EVENING_GREETINGS, "evening", date_key)
-    return f"{escape(greeting)}\n📅 {date_key}\n"
+    return f"{escape(greeting)}\nHello, {recipient}!\n📅 {date_key}\n"
 
 
 def _format_performance_line(name: str, symbol: str, close_price: float, pct_change: float) -> str:

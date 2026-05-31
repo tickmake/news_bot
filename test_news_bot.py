@@ -40,14 +40,18 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(picked_1, picked_2)
 
     def test_build_daily_intro_morning_contains_quote(self):
-        intro = news_bot.build_daily_intro(datetime(2026, 6, 1, 7, 0))
+        with patch.object(news_bot, "RECIPIENT_NAME", "Sunil"):
+            intro = news_bot.build_daily_intro(datetime(2026, 6, 1, 7, 0))
         self.assertIn("Quote of the day", intro)
         self.assertIn("2026-06-01", intro)
+        self.assertIn("Hello, Sunil!", intro)
 
     def test_build_daily_intro_evening_contains_evening_message(self):
-        intro = news_bot.build_daily_intro(datetime(2026, 6, 1, 19, 0))
+        with patch.object(news_bot, "RECIPIENT_NAME", "Sunil"):
+            intro = news_bot.build_daily_intro(datetime(2026, 6, 1, 19, 0))
         self.assertNotIn("Quote of the day", intro)
         self.assertIn("2026-06-01", intro)
+        self.assertIn("Hello, Sunil!", intro)
 
     def test_parse_instrument_env_parses_label_symbol_pairs(self):
         parsed = news_bot._parse_instrument_env(
