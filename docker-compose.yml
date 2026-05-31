@@ -1,0 +1,14 @@
+services:
+  news-notifier:
+    image: python:3.11-slim
+    container_name: daily_news_bot
+    restart: unless-stopped
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python news_bot.py"
+    environment:
+      - TELEGRAM_CHAT_ID=5760646847
+      - TELEGRAM_TOKEN=8367698386:AAFOqCaYMjoYlpectyWZNU1I7TxVSD0gOz0
+      - NEWS_API_KEY=7f94246fa785405eb748fc337dc01bb5
+      - TZ=Europe/Oslo # Change to your local timezone
