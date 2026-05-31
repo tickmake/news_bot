@@ -592,7 +592,9 @@ def get_business_and_stocks() -> str:
     else:
         fund_section.append("Data temporarily unavailable")
 
-    return f"{biz_str}\n\n{'\n'.join(stock_section)}\n\n{'\n'.join(fund_section)}"
+    stock_str = "\n".join(stock_section)
+    fund_str = "\n".join(fund_section)
+    return f"{biz_str}\n\n{stock_str}\n\n{fund_str}"
 
 
 def _compute_atr_percent(history: Any) -> Optional[float]:
