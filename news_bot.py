@@ -1,8 +1,17 @@
 import os
-os.environ["YF_NO_CURL_CFFI"] = "1"  # Fixes the TLS / curl_cffi bug
+os.environ["YF_NO_CURL_CFFI"] = "1"  # Force deactivation of curl_cffi
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="yfinance")
+
+# 👇 THE FIX: Inject the missing DNSError attribute into the requests library
 import requests
-import yfinance as yf
+import requests.exceptions
+if not hasattr(requests.exceptions, "DNSError"):
+    # Dynamically map DNSError to the standard ConnectionError class
+    requests.exceptions.DNSError = requests.exceptions.ConnectionError
+
+import yfinance as yf # 👈 Now yfinance will import perfectly without crashing!
 from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -10,6 +19,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
+# ... the rest of your script functions (get_global_news, get_business_and_stocks, etc.) remain exactly the same ...
 def get_global_news():
     url = f"https://newsapi.org/v2/top-headlines?source=google-news&language=en&apiKey={NEWS_API_KEY}"
     try:
