@@ -714,6 +714,7 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
             f"DD<={SETTINGS.trade_max_drawdown_pct:.1f}%, ATR<={SETTINGS.trade_max_atr_pct:.1f}%"
         ),
     ]
+    lines[2] = lines[2].replace("<=", "≤").replace(">=", "≥").replace(">", "›")
     if not scored:
         lines.append("No candidates met the momentum criteria today.")
         return "\n".join(lines) + "\n\n"
