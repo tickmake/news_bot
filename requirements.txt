@@ -1,10 +1,13 @@
-# Pinned for reproducible builds. yfinance is version-sensitive (see the
-# DNSError shim in news_bot.py); upgrade deliberately.
+# Pinned for reproducible builds. yfinance is version-sensitive; upgrade
+# deliberately.
+#
+# yfinance 0.2.54 is the last release that fetches over the standard `requests`
+# library and does NOT depend on curl_cffi. curl_cffi (mandatory from 0.2.55+)
+# ships a bundled TLS stack that fails on this ARM/Raspberry Pi host
+# ("curl: (35) TLS connect error: invalid library"), so it is intentionally
+# avoided here. Do not bump to >=0.2.55 without confirming TLS works on target.
 requests==2.31.0
-yfinance==0.2.66
-# yfinance now imports curl_cffi unconditionally, so it must be installed
-# (the old YF_NO_CURL_CFFI / uninstall workaround no longer applies).
-curl_cffi==0.13.0
+yfinance==0.2.54
 apscheduler==3.10.4
 pydantic==2.13.4
 pydantic-settings==2.11.0

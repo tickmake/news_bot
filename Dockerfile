@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 COPY news_bot.py .
 
-# curl_cffi is a hard dependency of modern yfinance and must remain installed.
+# yfinance is pinned to a requests-only release (no curl_cffi); see requirements.txt.
 RUN pip install --no-cache-dir -r requirements.txt
 
 CMD ["python", "news_bot.py"]

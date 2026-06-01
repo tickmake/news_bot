@@ -24,6 +24,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s level=%(levelname)s event=%(message)s",
 )
+# yfinance emits noisy INFO logs (e.g. repeated TzCache messages when worker
+# threads initialise it concurrently); keep only its warnings and errors.
+logging.getLogger("yfinance").setLevel(logging.WARNING)
 
 DEFAULT_GLOBAL_NEWS_FEEDS = (
     "https://feeds.bbci.co.uk/news/world/rss.xml,"
@@ -810,12 +813,23 @@ def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str,
 
     if last_error:
         error_text = str(last_error)
-        if isinstance(last_error, requests.exceptions.SSLError) or "UNEXPECTED_EOF_WHILE_READING" in error_text:
+        # Back off on any transport-level failure (SSL, read timeout, connection
+        # error) so a flaky/blocked Yahoo endpoint does not cost a full retry
+        # sweep on every briefing and keeps /now responsive.
+        transient = isinstance(
+            last_error,
+            (
+                requests.exceptions.SSLError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ),
+        ) or "UNEXPECTED_EOF_WHILE_READING" in error_text
+        if transient:
             with CACHE_LOCK:
                 YAHOO_SCREENER_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.screener_failure_cooldown_seconds)
                 backoff_until = YAHOO_SCREENER_BACKOFF_UNTIL
             LOGGER.warning(
-                "screener_ssl_backoff_active until=%s detail=%s",
+                "screener_backoff_active until=%s detail=%s",
                 int(backoff_until),
                 error_text,
             )
@@ -1274,6 +1288,18 @@ def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
         if updates:
             STATE.save()
         return True
+    except requests.exceptions.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 409:
+            # Telegram allows only one getUpdates consumer per token. A 409 means
+            # another instance (old/duplicate container or a webhook) is polling.
+            LOGGER.error(
+                "command_poll_conflict another_getupdates_consumer_active "
+                "(check for a duplicate bot instance or an active webhook)"
+            )
+        else:
+            LOGGER.error("command_poll_failed status=%s detail=%s", status_code, exc)
+        return False
     except Exception as exc:
         LOGGER.error("command_poll_failed detail=%s", exc)
         return False
