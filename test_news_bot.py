@@ -110,7 +110,11 @@ class NewsBotTests(unittest.TestCase):
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot, "_source_allowed", return_value=True):
+        with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
+            news_bot.SETTINGS, "freenews_api_key", ""
+        ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot, "_source_allowed", return_value=True
+        ):
             result = news_bot.get_global_news()
 
         self.assertIn("Top Global News", result)
@@ -127,7 +131,11 @@ class NewsBotTests(unittest.TestCase):
         )
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        with patch.object(news_bot, "_source_allowed", return_value=True):
+        with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
+            news_bot.SETTINGS, "freenews_api_key", ""
+        ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot, "_source_allowed", return_value=True
+        ):
             result = news_bot.get_global_news()
         self.assertIn("Public headline", result)
 
@@ -142,12 +150,43 @@ class NewsBotTests(unittest.TestCase):
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot, "_source_allowed", return_value=True):
+        with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
+            news_bot.SETTINGS, "freenews_api_key", ""
+        ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot, "_source_allowed", return_value=True
+        ):
             result = news_bot.get_norwegian_morning_news()
 
         self.assertIn("Early Morning Norway News", result)
         self.assertIn("NRK headline", result)
         self.assertIn("https://example.no/1", result)
+
+    @patch("news_bot.requests.get")
+    def test_get_global_news_prefers_newsapi_when_key_present(self, mock_get):
+        news_bot.STATE.data["sent_headline_keys"] = {}
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            "articles": [
+                {"title": "API headline", "url": "https://example.com/api"},
+            ]
+        }
+        mock_get.return_value = mock_response
+
+        with patch.object(news_bot.SETTINGS, "news_api_key", "abc"), patch.object(
+            news_bot.SETTINGS, "freenews_api_key", ""
+        ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot.SETTINGS, "news_fetch_priority", "newsapi,rss"
+        ), patch.object(news_bot, "_source_allowed", return_value=True):
+            result = news_bot.get_global_news()
+
+        self.assertIn("API headline", result)
+
+    def test_active_finnhub_key_supports_legacy_env_name(self):
+        with patch.object(news_bot.SETTINGS, "finnhub_api_key", ""), patch.object(
+            news_bot.SETTINGS, "finhub_api_key", "legacy-key"
+        ):
+            self.assertEqual(news_bot._active_finnhub_key(), "legacy-key")
 
     @patch("news_bot._collect_live_quotes")
     @patch("news_bot._build_news_section")
@@ -174,7 +213,10 @@ class NewsBotTests(unittest.TestCase):
             },
         ]
 
-        result = news_bot.get_business_and_stocks()
+        with patch.object(news_bot.SETTINGS, "finnhub_api_key", ""), patch.object(
+            news_bot.SETTINGS, "finhub_api_key", ""
+        ):
+            result = news_bot.get_business_and_stocks()
         self.assertIn("Top Business Stories", result)
         self.assertIn("Market headline", result)
         self.assertIn("Live Stock Movers", result)

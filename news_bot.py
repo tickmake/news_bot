@@ -48,6 +48,7 @@ YAHOO_SCREENER_ENDPOINTS = (
     "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
     "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved",
 )
+DEFAULT_FINNHUB_API_URL = "https://finnhub.io/api/v1"
 
 MORNING_GREETINGS = [
     "🌞 Good morning! Wishing you a focused and positive day ahead.",
@@ -82,6 +83,16 @@ class AppSettings(BaseSettings):
 
     telegram_token: str = ""
     telegram_chat_id: str = ""
+    news_api_key: str = ""
+    freenews_api_key: str = ""
+    # Backward-compatible env support for older typo'd variable name.
+    freen_ews_api_key: str = ""
+    # Support both FINNHUB_API_KEY and FINHUB_API_KEY env variable names.
+    finnhub_api_key: str = ""
+    finhub_api_key: str = ""
+    finnhub_api_url: str = DEFAULT_FINNHUB_API_URL
+    freenews_api_url: str = "https://freenewsapi.com/api/v1/news"
+    news_fetch_priority: str = "newsapi,freenews,rss"
     recipient_name: str = "Sunil"
     tz: str = "Europe/Oslo"
     request_timeout_seconds: int = 15
@@ -112,6 +123,10 @@ class AppSettings(BaseSettings):
     screener_request_timeout_seconds: int = 6
     screener_cache_ttl_seconds: int = 90
     screener_failure_cooldown_seconds: int = 300
+    finnhub_request_timeout_seconds: int = 4
+    finnhub_cache_ttl_seconds: int = 120
+    finnhub_failure_cooldown_seconds: int = 180
+    finnhub_max_symbols_per_refresh: int = 16
     usa_stock_universe: Optional[str] = None
     india_stock_universe: Optional[str] = None
     norway_stock_universe: Optional[str] = None
@@ -129,6 +144,8 @@ class AppSettings(BaseSettings):
 SETTINGS = AppSettings()
 LIVE_QUOTES_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 YAHOO_SCREENER_BACKOFF_UNTIL = 0.0
+FINNHUB_QUOTE_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}
+FINNHUB_BACKOFF_UNTIL = 0.0
 
 
 def _parse_instrument_env(raw_value: Optional[str], fallback: Dict[str, str]) -> Dict[str, str]:
@@ -460,8 +477,113 @@ def _fetch_rss_items(feed_url: str, max_items: int = 20) -> List[Tuple[str, Opti
         return []
 
 
+def _extract_articles_from_payload(payload: Any) -> List[Tuple[str, Optional[str]]]:
+    containers: List[Any] = []
+    if isinstance(payload, dict):
+        for key in ("articles", "data", "results", "news"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                containers.append(value)
+    elif isinstance(payload, list):
+        containers.append(payload)
+
+    items: List[Tuple[str, Optional[str]]] = []
+    for container in containers:
+        for article in container:
+            if not isinstance(article, dict):
+                continue
+            title = article.get("title") or article.get("headline") or article.get("name")
+            url = article.get("url") or article.get("link") or article.get("source_url")
+            if isinstance(title, str) and title.strip():
+                normalized_url = url.strip() if isinstance(url, str) and url.strip() else None
+                items.append((title.strip(), normalized_url))
+    return items
+
+
+def _fetch_newsapi_items(scope: str, max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
+    api_key = (SETTINGS.news_api_key or "").strip()
+    if not api_key:
+        return []
+    params: Dict[str, Any] = {"pageSize": max_items, "apiKey": api_key}
+    if scope == "norway":
+        params["country"] = "no"
+    else:
+        params["language"] = "en"
+    if scope == "business":
+        params["category"] = "business"
+
+    try:
+        response = _with_retry(
+            lambda: requests.get(
+                "https://newsapi.org/v2/top-headlines",
+                params=params,
+                timeout=SETTINGS.request_timeout_seconds,
+            ),
+            f"newsapi_{scope}",
+            retries=2,
+        )
+        response.raise_for_status()
+        return _extract_articles_from_payload(response.json())
+    except Exception as exc:
+        LOGGER.warning("newsapi_fetch_failed scope=%s detail=%s", scope, exc)
+        return []
+
+
+def _active_freenews_key() -> str:
+    for key in (SETTINGS.freenews_api_key, SETTINGS.freen_ews_api_key):
+        if key and key.strip():
+            return key.strip()
+    return ""
+
+
+def _fetch_freenews_items(scope: str, max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
+    api_key = _active_freenews_key()
+    if not api_key:
+        return []
+    params: Dict[str, Any] = {"apikey": api_key, "limit": max_items}
+    if scope == "business":
+        params["category"] = "business"
+    if scope == "norway":
+        params["country"] = "no"
+    else:
+        params["language"] = "en"
+
+    try:
+        response = _with_retry(
+            lambda: requests.get(
+                SETTINGS.freenews_api_url,
+                params=params,
+                timeout=SETTINGS.request_timeout_seconds,
+            ),
+            f"freenews_{scope}",
+            retries=2,
+        )
+        response.raise_for_status()
+        return _extract_articles_from_payload(response.json())
+    except Exception as exc:
+        LOGGER.warning("freenews_fetch_failed scope=%s detail=%s", scope, exc)
+        return []
+
+
+def _fetch_rss_from_feeds(feed_urls: List[str], max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
+    items: List[Tuple[str, Optional[str]]] = []
+    for feed_url in feed_urls:
+        for item in _fetch_rss_items(feed_url, max_items=max_items):
+            items.append(item)
+            if len(items) >= max_items:
+                return items
+    return items
+
+
+def _news_provider_priority() -> List[str]:
+    providers = _split_csv(SETTINGS.news_fetch_priority or "")
+    sanitized = [provider for provider in providers if provider in {"newsapi", "freenews", "rss"}]
+    return sanitized or ["rss"]
+
+
 def _build_news_section(
     section_key: str,
+    scope: str,
     title: str,
     feed_urls: List[str],
     empty_message: str,
@@ -471,8 +593,17 @@ def _build_news_section(
     lines = [title]
     count = 0
 
-    for feed_url in feed_urls:
-        for headline, url in _fetch_rss_items(feed_url, max_items=15):
+    source_candidates: List[Tuple[str, List[Tuple[str, Optional[str]]]]] = []
+    for provider in _news_provider_priority():
+        if provider == "newsapi":
+            source_candidates.append(("newsapi", _fetch_newsapi_items(scope, max_items=20)))
+        elif provider == "freenews":
+            source_candidates.append(("freenews", _fetch_freenews_items(scope, max_items=20)))
+        elif provider == "rss":
+            source_candidates.append(("rss", _fetch_rss_from_feeds(feed_urls, max_items=30)))
+
+    for _provider, headlines in source_candidates:
+        for headline, url in headlines:
             if not _source_allowed(url):
                 continue
             if _is_duplicate_headline(section_key, headline, url, date_key):
@@ -492,6 +623,7 @@ def _build_news_section(
 def get_global_news() -> str:
     return _build_news_section(
         section_key="global_news",
+        scope="global",
         title="🌍 Top Global News:",
         feed_urls=GLOBAL_NEWS_FEEDS,
         empty_message="No fresh global headlines available right now.",
@@ -501,6 +633,7 @@ def get_global_news() -> str:
 def get_norwegian_morning_news() -> str:
     return _build_news_section(
         section_key="norway_news",
+        scope="norway",
         title="🇳🇴 Early Morning Norway News:",
         feed_urls=NORWAY_NEWS_FEEDS,
         empty_message="No fresh Norwegian headlines available right now.",
@@ -549,6 +682,90 @@ def _as_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _active_finnhub_key() -> str:
+    for key in (SETTINGS.finnhub_api_key, SETTINGS.finhub_api_key):
+        if key and key.strip():
+            return key.strip()
+    return ""
+
+
+def _fetch_finnhub_quote(symbol: str) -> Optional[Dict[str, float]]:
+    global FINNHUB_BACKOFF_UNTIL
+    api_key = _active_finnhub_key()
+    if not api_key or not symbol:
+        return None
+
+    now_ts = time.time()
+    if now_ts < FINNHUB_BACKOFF_UNTIL:
+        return None
+
+    cached = FINNHUB_QUOTE_CACHE.get(symbol)
+    if cached:
+        cached_at, payload = cached
+        if now_ts - cached_at <= max(10, SETTINGS.finnhub_cache_ttl_seconds):
+            return dict(payload)
+
+    timeout_seconds = max(2, min(SETTINGS.request_timeout_seconds, SETTINGS.finnhub_request_timeout_seconds))
+    try:
+        response = _with_retry(
+            lambda: requests.get(
+                f"{SETTINGS.finnhub_api_url.rstrip('/')}/quote",
+                params={"symbol": symbol, "token": api_key},
+                timeout=timeout_seconds,
+            ),
+            f"finnhub_quote_{symbol}",
+            retries=1,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("error"):
+            raise RuntimeError(str(payload.get("error")))
+        price = _as_float(payload.get("c"))
+        pct_change = _as_float(payload.get("dp"))
+        prev_close = _as_float(payload.get("pc"))
+        if price is None or price <= 0:
+            return None
+        if pct_change is None and prev_close and prev_close != 0:
+            pct_change = ((price - prev_close) / prev_close) * 100
+        if pct_change is None:
+            return None
+        normalized = {"price": price, "pct_change": pct_change}
+        FINNHUB_QUOTE_CACHE[symbol] = (now_ts, normalized)
+        return dict(normalized)
+    except requests.exceptions.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code in (401, 403, 429):
+            FINNHUB_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.finnhub_failure_cooldown_seconds)
+        LOGGER.warning("finnhub_quote_failed symbol=%s status=%s detail=%s", symbol, status_code, exc)
+    except Exception as exc:
+        error_text = str(exc)
+        if isinstance(exc, requests.exceptions.SSLError) or "UNEXPECTED_EOF_WHILE_READING" in error_text:
+            FINNHUB_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.finnhub_failure_cooldown_seconds)
+        LOGGER.warning("finnhub_quote_failed symbol=%s detail=%s", symbol, error_text)
+    return None
+
+
+def _refresh_quotes_with_finnhub(quotes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not _active_finnhub_key():
+        return [dict(quote) for quote in quotes]
+
+    max_refresh = max(0, SETTINGS.finnhub_max_symbols_per_refresh)
+    refreshed: List[Dict[str, Any]] = []
+    for index, quote in enumerate(quotes):
+        normalized = dict(quote)
+        if index < max_refresh:
+            quote_type = (normalized.get("quoteType") or "").upper()
+            symbol = str(normalized.get("symbol") or "").strip()
+            if quote_type in {"EQUITY", "ETF"} and symbol:
+                finnhub_quote = _fetch_finnhub_quote(symbol)
+                if finnhub_quote:
+                    normalized["regularMarketPrice"] = finnhub_quote["price"]
+                    normalized["regularMarketChangePercent"] = finnhub_quote["pct_change"]
+                    normalized["marketDataProvider"] = "finnhub"
+        refreshed.append(normalized)
+    return refreshed
 
 
 def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str, Any]]:
@@ -644,8 +861,19 @@ def _format_live_rows(
     top_n: int,
     max_name_len: int,
 ) -> List[List[str]]:
-    scored: List[Tuple[float, Dict[str, Any]]] = []
+    initial_ranked: List[Tuple[float, Dict[str, Any]]] = []
     for quote in quotes:
+        pct_change = _as_float(quote.get("regularMarketChangePercent"))
+        if pct_change is None:
+            continue
+        initial_ranked.append((pct_change, quote))
+    initial_ranked.sort(key=lambda item: item[0], reverse=True)
+
+    ranked_quotes = [quote for _, quote in initial_ranked]
+    enriched_quotes = _refresh_quotes_with_finnhub(ranked_quotes)
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for quote in enriched_quotes:
         pct_change = _as_float(quote.get("regularMarketChangePercent"))
         if pct_change is None:
             continue
@@ -687,6 +915,7 @@ def _build_live_universe(limit: int = 40) -> Dict[str, str]:
 def get_business_and_stocks() -> str:
     biz_str = _build_news_section(
         section_key="business_news",
+        scope="business",
         title="💼 Top Business Stories:",
         feed_urls=BUSINESS_NEWS_FEEDS,
         empty_message="No fresh business headlines available right now.",

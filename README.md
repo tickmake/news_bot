@@ -98,6 +98,14 @@ python news_bot.py
 - `SEND_STARTUP_BRIEFING` - run one immediate briefing on container start (default `false`)
 - `HEALTH_PING_ENABLED` - enable daily health ping (default `true`)
 - `HEALTH_PING_CHAT_ID` - optional separate chat for health pings
+- `NEWS_API_KEY` - optional NewsAPI key for structured news fetch
+- `FREENEWS_API_KEY` - optional FreeNews API key
+- `FREEN_EWS_API_KEY` - backward-compatible alias for existing envs
+- `FINNHUB_API_KEY` - Finnhub API key (recommended primary quote source)
+- `FINHUB_API_KEY` - backward-compatible alias for existing envs
+- `NEWS_FETCH_PRIORITY` - provider order, e.g. `newsapi,freenews,rss`
+- `FREENEWS_API_URL` - FreeNews endpoint URL (default `https://freenewsapi.com/api/v1/news`)
+- `FINNHUB_API_URL` - Finnhub base URL (default `https://finnhub.io/api/v1`)
 - `GLOBAL_NEWS_FEEDS` - comma-separated RSS feed URLs for global news
 - `BUSINESS_NEWS_FEEDS` - comma-separated RSS feed URLs for business news
 - `NORWAY_NEWS_FEEDS` - comma-separated RSS feed URLs for Norway-focused news
@@ -107,6 +115,10 @@ python news_bot.py
 - `SCREENER_REQUEST_TIMEOUT_SECONDS` - timeout for screener API calls (default `6`)
 - `SCREENER_CACHE_TTL_SECONDS` - in-memory screener cache duration (default `90`)
 - `SCREENER_FAILURE_COOLDOWN_SECONDS` - cooldown after screener SSL/network failures (default `300`)
+- `FINNHUB_REQUEST_TIMEOUT_SECONDS` - timeout for Finnhub quote calls (default `4`)
+- `FINNHUB_CACHE_TTL_SECONDS` - Finnhub quote cache duration (default `120`)
+- `FINNHUB_FAILURE_COOLDOWN_SECONDS` - cooldown on Finnhub failures/rate limits (default `180`)
+- `FINNHUB_MAX_SYMBOLS_PER_REFRESH` - max symbols per section refreshed via Finnhub (default `16`)
 
 ### Optional Universe Configuration
 
@@ -217,6 +229,7 @@ Each briefing includes:
 - **No finance rows**
   - Some screener IDs may be rate-limited or empty; adjust `STOCK_SCREENERS` / `FUND_SCREENERS`.
   - If Yahoo TLS is unstable in your host network, reduce `SCREENER_REQUEST_TIMEOUT_SECONDS` and rely on cooldown to keep `/now` responsive.
+  - Set `FINNHUB_API_KEY` to improve quote freshness and resilience for stock/ETF rows.
 - **Network/proxy failures**
   - Check outbound connectivity to `api.telegram.org`, configured RSS sources, and Yahoo endpoints.
 
