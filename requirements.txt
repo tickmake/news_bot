@@ -1,5 +1,7 @@
+# Pinned for reproducible builds. yfinance in particular is version-sensitive
+# (see the YF_NO_CURL_CFFI / DNSError shims in news_bot.py); upgrade deliberately.
 requests==2.31.0
-yfinance
+yfinance==1.2.0
 apscheduler==3.10.4
-pydantic
-pydantic-settings
+pydantic==2.13.4
+pydantic-settings==2.11.0

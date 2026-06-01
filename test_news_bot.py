@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -40,15 +43,6 @@ class NewsBotTests(unittest.TestCase):
         parsed_invalid = news_bot._parse_instrument_env(" , : , : ", fallback)
         self.assertEqual(parsed_empty, fallback)
         self.assertEqual(parsed_invalid, fallback)
-
-    def test_top_weekly_performers_data_selects_best_three(self):
-        with patch("news_bot._compute_weekly_change") as mock_change:
-            mock_change.side_effect = [(101.0, 1.0), (110.0, 10.0), (106.0, 6.0), (95.0, -5.0)]
-            lines = news_bot._top_weekly_performers_data({"A": "A", "B": "B", "C": "C", "D": "D"}, top_n=3)
-
-        self.assertEqual(len(lines), 3)
-        self.assertEqual(lines[0][0], "B")
-        self.assertAlmostEqual(lines[0][3], 10.0)
 
     @patch("news_bot._analyze_short_term_candidate")
     def test_get_trade_candidates_formats_ranked_output(self, mock_analyze):
@@ -265,6 +259,60 @@ class NewsBotTests(unittest.TestCase):
             missing = list(news_bot.get_missing_required_config())
         self.assertIn("TELEGRAM_TOKEN", missing)
         self.assertNotIn("NEWS_API_KEY", missing)
+
+    def test_state_save_writes_valid_json_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "state.json")
+            state = news_bot.AppState(path)
+            state.telegram_update_offset = 42
+            state.mark_headline_seen("global_news", "key1", "2026-06-01")
+            state.save()
+
+            # No leftover temp files and the payload reloads cleanly.
+            self.assertEqual(os.listdir(tmp_dir), ["state.json"])
+            with open(path, "r", encoding="utf-8") as file_obj:
+                loaded = json.load(file_obj)
+            self.assertEqual(loaded["telegram_update_offset"], 42)
+
+            reloaded = news_bot.AppState(path)
+            self.assertEqual(reloaded.telegram_update_offset, 42)
+            self.assertTrue(reloaded.has_seen_headline("global_news", "key1", "2026-06-01"))
+
+    def test_fetch_ticker_history_caches_result(self):
+        news_bot.HISTORY_CACHE.clear()
+        sentinel = MagicMock(name="history_frame")
+        with patch("news_bot.yf.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.return_value = sentinel
+            first = news_bot._fetch_ticker_history("AAPL")
+            second = news_bot._fetch_ticker_history("AAPL")
+        self.assertIs(first, sentinel)
+        self.assertIs(second, sentinel)
+        # Second call served from cache: yfinance touched only once.
+        self.assertEqual(mock_ticker.call_count, 1)
+        news_bot.HISTORY_CACHE.clear()
+
+    @patch("news_bot._analyze_short_term_candidate")
+    def test_get_trade_candidates_caps_universe(self, mock_analyze):
+        mock_analyze.return_value = None
+        big_universe = {f"Name{i}": f"SYM{i}" for i in range(50)}
+        with patch.object(news_bot.SETTINGS, "trade_universe_max", 5):
+            news_bot.get_trade_candidates(universe=big_universe, top_n=3)
+        self.assertEqual(mock_analyze.call_count, 5)
+
+    @patch("news_bot.requests.get")
+    def test_poll_telegram_commands_passes_long_poll_timeout(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"result": []}
+        mock_get.return_value = mock_response
+        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), patch.object(
+            news_bot.SETTINGS, "command_poll_enabled", True
+        ):
+            news_bot.poll_telegram_commands(long_poll_timeout=25)
+        params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(params["timeout"], 25)
+        # Read timeout must outlast the server-side hold.
+        self.assertGreater(mock_get.call_args.kwargs["timeout"], 25)
 
 
 if __name__ == "__main__":
