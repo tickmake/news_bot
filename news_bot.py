@@ -19,11 +19,6 @@ import requests
 import requests.exceptions
 import yfinance as yf
 
-os.environ["YF_NO_CURL_CFFI"] = "1"
-
-if not hasattr(requests.exceptions, "DNSError"):
-    requests.exceptions.DNSError = requests.exceptions.ConnectionError
-
 LOGGER = logging.getLogger("news_bot")
 logging.basicConfig(
     level=logging.INFO,
