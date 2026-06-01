@@ -5,8 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 COPY news_bot.py .
 
-# Install dependencies, then forcefully remove the problematic curl_cffi library
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip uninstall -y curl_cffi
+# curl_cffi is a hard dependency of modern yfinance and must remain installed.
+RUN pip install --no-cache-dir -r requirements.txt
 
 CMD ["python", "news_bot.py"]
