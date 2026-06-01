@@ -2,13 +2,17 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from html import escape
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 
+from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
 from apscheduler.schedulers.blocking import BlockingScheduler
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import requests
@@ -114,6 +118,11 @@ class AppSettings(BaseSettings):
     trade_min_volume_ratio: float = 1.2
     trade_max_drawdown_pct: float = 8.0
     trade_max_atr_pct: float = 4.5
+    trade_universe_max: int = 30
+    trade_fetch_workers: int = 6
+    trade_history_cache_ttl_seconds: int = 600
+    trade_total_deadline_seconds: int = 45
+    command_long_poll_timeout_seconds: int = 25
     global_news_feeds: str = DEFAULT_GLOBAL_NEWS_FEEDS
     business_news_feeds: str = DEFAULT_BUSINESS_NEWS_FEEDS
     norway_news_feeds: str = DEFAULT_NORWAY_NEWS_FEEDS
@@ -146,6 +155,11 @@ LIVE_QUOTES_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 YAHOO_SCREENER_BACKOFF_UNTIL = 0.0
 FINNHUB_QUOTE_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}
 FINNHUB_BACKOFF_UNTIL = 0.0
+HISTORY_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+# Guards shared mutable state against overlapping scheduler/poller threads.
+STATE_LOCK = threading.RLock()
+CACHE_LOCK = threading.RLock()
 
 
 def _parse_instrument_env(raw_value: Optional[str], fallback: Dict[str, str]) -> Dict[str, str]:
@@ -197,35 +211,55 @@ class AppState:
             LOGGER.warning("state_load_failed detail=%s", exc)
 
     def save(self) -> None:
-        try:
-            with open(self.path, "w", encoding="utf-8") as file_obj:
-                json.dump(self.data, file_obj, indent=2, sort_keys=True)
-        except Exception as exc:
-            LOGGER.warning("state_save_failed detail=%s", exc)
+        # Serialise under the lock and write atomically so overlapping
+        # scheduler/poller threads cannot interleave or corrupt the file.
+        with STATE_LOCK:
+            try:
+                payload = json.dumps(self.data, indent=2, sort_keys=True)
+            except Exception as exc:
+                LOGGER.warning("state_serialize_failed detail=%s", exc)
+                return
+            directory = os.path.dirname(os.path.abspath(self.path)) or "."
+            try:
+                fd, tmp_path = tempfile.mkstemp(prefix=".news_bot_state.", dir=directory)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as file_obj:
+                        file_obj.write(payload)
+                    os.replace(tmp_path, self.path)
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
+            except Exception as exc:
+                LOGGER.warning("state_save_failed detail=%s", exc)
 
     def mark_headline_seen(self, section: str, key: str, date_key: str) -> None:
-        sent = self.data.setdefault("sent_headline_keys", {})
-        section_bucket = sent.setdefault(section, {})
-        keys = section_bucket.setdefault(date_key, [])
-        if key not in keys:
-            keys.append(key)
-        # keep state bounded
-        if len(section_bucket.keys()) > 7:
-            old_dates = sorted(section_bucket.keys())[:-7]
-            for old_date in old_dates:
-                section_bucket.pop(old_date, None)
+        with STATE_LOCK:
+            sent = self.data.setdefault("sent_headline_keys", {})
+            section_bucket = sent.setdefault(section, {})
+            keys = section_bucket.setdefault(date_key, [])
+            if key not in keys:
+                keys.append(key)
+            # keep state bounded
+            if len(section_bucket.keys()) > 7:
+                old_dates = sorted(section_bucket.keys())[:-7]
+                for old_date in old_dates:
+                    section_bucket.pop(old_date, None)
 
     def has_seen_headline(self, section: str, key: str, date_key: str) -> bool:
-        sent = self.data.get("sent_headline_keys", {})
-        return key in sent.get(section, {}).get(date_key, [])
+        with STATE_LOCK:
+            sent = self.data.get("sent_headline_keys", {})
+            return key in sent.get(section, {}).get(date_key, [])
 
     @property
     def telegram_update_offset(self) -> int:
-        return int(self.data.get("telegram_update_offset", 0))
+        with STATE_LOCK:
+            return int(self.data.get("telegram_update_offset", 0))
 
     @telegram_update_offset.setter
     def telegram_update_offset(self, value: int) -> None:
-        self.data["telegram_update_offset"] = value
+        with STATE_LOCK:
+            self.data["telegram_update_offset"] = value
 
 
 STATE = AppState(SETTINGS.state_file)
@@ -301,7 +335,8 @@ def _safe_domain(url: Optional[str]) -> str:
         if domain.startswith("www."):
             domain = domain[4:]
         return domain
-    except Exception:
+    except Exception as exc:
+        LOGGER.debug("domain_parse_failed url=%s detail=%s", url, exc)
         return ""
 
 
@@ -640,37 +675,6 @@ def get_norwegian_morning_news() -> str:
     )
 
 
-def _compute_weekly_change(symbol: str) -> Optional[Tuple[float, float]]:
-    try:
-        history = _with_retry(
-            lambda: yf.Ticker(symbol).history(period="7d", interval="1d"),
-            f"yf_weekly_{symbol}",
-            retries=2,
-        )
-        close_series = history["Close"].dropna()
-        if len(close_series) < 2:
-            return None
-        first_close = float(close_series.iloc[0])
-        last_close = float(close_series.iloc[-1])
-        if first_close == 0:
-            return None
-        return last_close, ((last_close - first_close) / first_close) * 100
-    except Exception:
-        return None
-
-
-def _top_weekly_performers_data(instruments: Dict[str, str], top_n: int = 3) -> List[Tuple[str, str, float, float]]:
-    scored: List[Tuple[float, str, str, float]] = []
-    for name, symbol in instruments.items():
-        result = _compute_weekly_change(symbol)
-        if not result:
-            continue
-        close_price, pct_change = result
-        scored.append((pct_change, name, symbol, close_price))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [(name, symbol, close_price, pct_change) for pct_change, name, symbol, close_price in scored[:top_n]]
-
-
 def _as_float(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
@@ -698,14 +702,14 @@ def _fetch_finnhub_quote(symbol: str) -> Optional[Dict[str, float]]:
         return None
 
     now_ts = time.time()
-    if now_ts < FINNHUB_BACKOFF_UNTIL:
-        return None
-
-    cached = FINNHUB_QUOTE_CACHE.get(symbol)
-    if cached:
-        cached_at, payload = cached
-        if now_ts - cached_at <= max(10, SETTINGS.finnhub_cache_ttl_seconds):
-            return dict(payload)
+    with CACHE_LOCK:
+        if now_ts < FINNHUB_BACKOFF_UNTIL:
+            return None
+        cached = FINNHUB_QUOTE_CACHE.get(symbol)
+        if cached:
+            cached_at, payload = cached
+            if now_ts - cached_at <= max(10, SETTINGS.finnhub_cache_ttl_seconds):
+                return dict(payload)
 
     timeout_seconds = max(2, min(SETTINGS.request_timeout_seconds, SETTINGS.finnhub_request_timeout_seconds))
     try:
@@ -732,17 +736,20 @@ def _fetch_finnhub_quote(symbol: str) -> Optional[Dict[str, float]]:
         if pct_change is None:
             return None
         normalized = {"price": price, "pct_change": pct_change}
-        FINNHUB_QUOTE_CACHE[symbol] = (now_ts, normalized)
+        with CACHE_LOCK:
+            FINNHUB_QUOTE_CACHE[symbol] = (now_ts, normalized)
         return dict(normalized)
     except requests.exceptions.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else None
         if status_code in (401, 403, 429):
-            FINNHUB_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.finnhub_failure_cooldown_seconds)
+            with CACHE_LOCK:
+                FINNHUB_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.finnhub_failure_cooldown_seconds)
         LOGGER.warning("finnhub_quote_failed symbol=%s status=%s detail=%s", symbol, status_code, exc)
     except Exception as exc:
         error_text = str(exc)
         if isinstance(exc, requests.exceptions.SSLError) or "UNEXPECTED_EOF_WHILE_READING" in error_text:
-            FINNHUB_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.finnhub_failure_cooldown_seconds)
+            with CACHE_LOCK:
+                FINNHUB_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.finnhub_failure_cooldown_seconds)
         LOGGER.warning("finnhub_quote_failed symbol=%s detail=%s", symbol, error_text)
     return None
 
@@ -771,8 +778,10 @@ def _refresh_quotes_with_finnhub(quotes: List[Dict[str, Any]]) -> List[Dict[str,
 def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str, Any]]:
     global YAHOO_SCREENER_BACKOFF_UNTIL
     now_ts = time.time()
-    if now_ts < YAHOO_SCREENER_BACKOFF_UNTIL:
-        LOGGER.info("screener_temporarily_skipped scr_id=%s backoff_until=%s", scr_id, int(YAHOO_SCREENER_BACKOFF_UNTIL))
+    with CACHE_LOCK:
+        backoff_until = YAHOO_SCREENER_BACKOFF_UNTIL
+    if now_ts < backoff_until:
+        LOGGER.info("screener_temporarily_skipped scr_id=%s backoff_until=%s", scr_id, int(backoff_until))
         return []
 
     timeout_seconds = max(2, min(SETTINGS.request_timeout_seconds, SETTINGS.screener_request_timeout_seconds))
@@ -807,10 +816,12 @@ def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str,
     if last_error:
         error_text = str(last_error)
         if isinstance(last_error, requests.exceptions.SSLError) or "UNEXPECTED_EOF_WHILE_READING" in error_text:
-            YAHOO_SCREENER_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.screener_failure_cooldown_seconds)
+            with CACHE_LOCK:
+                YAHOO_SCREENER_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.screener_failure_cooldown_seconds)
+                backoff_until = YAHOO_SCREENER_BACKOFF_UNTIL
             LOGGER.warning(
                 "screener_ssl_backoff_active until=%s detail=%s",
-                int(YAHOO_SCREENER_BACKOFF_UNTIL),
+                int(backoff_until),
                 error_text,
             )
         LOGGER.warning("screener_fetch_failed scr_id=%s detail=%s", scr_id, error_text)
@@ -837,11 +848,12 @@ def _is_stock_quote(quote: Dict[str, Any]) -> bool:
 def _collect_live_quotes(scr_ids: List[str], count_per_screener: int) -> List[Dict[str, Any]]:
     cache_key = f"{','.join(scr_ids)}|{count_per_screener}"
     now_ts = time.time()
-    cached = LIVE_QUOTES_CACHE.get(cache_key)
-    if cached:
-        cached_at, cached_quotes = cached
-        if now_ts - cached_at <= max(5, SETTINGS.screener_cache_ttl_seconds):
-            return list(cached_quotes)
+    with CACHE_LOCK:
+        cached = LIVE_QUOTES_CACHE.get(cache_key)
+        if cached:
+            cached_at, cached_quotes = cached
+            if now_ts - cached_at <= max(5, SETTINGS.screener_cache_ttl_seconds):
+                return list(cached_quotes)
 
     deduped: Dict[str, Dict[str, Any]] = {}
     for scr_id in scr_ids:
@@ -852,7 +864,8 @@ def _collect_live_quotes(scr_ids: List[str], count_per_screener: int) -> List[Di
             if symbol not in deduped:
                 deduped[symbol] = quote
     quotes = list(deduped.values())
-    LIVE_QUOTES_CACHE[cache_key] = (now_ts, quotes)
+    with CACHE_LOCK:
+        LIVE_QUOTES_CACHE[cache_key] = (now_ts, quotes)
     return quotes
 
 
@@ -895,19 +908,29 @@ def _format_live_rows(
     return rows
 
 
+def _rank_quotes_by_change(quotes: List[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
+    ranked: List[Tuple[float, Dict[str, Any]]] = []
+    for quote in quotes:
+        pct_change = _as_float(quote.get("regularMarketChangePercent"))
+        if pct_change is None:
+            continue
+        ranked.append((pct_change, quote))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [quote for _, quote in ranked[:top_n]]
+
+
 def _build_live_universe(limit: int = 40) -> Dict[str, str]:
+    # Only names/symbols are needed here, so rank on the screener-reported
+    # change and skip Finnhub enrichment (those refreshed prices are discarded).
     dynamic_quotes = _collect_live_quotes(STOCK_SCREENERS + FUND_SCREENERS, count_per_screener=SETTINGS.screener_quote_limit)
     stocks = [quote for quote in dynamic_quotes if _is_stock_quote(quote)]
     funds = [quote for quote in dynamic_quotes if _is_fund_quote(quote)]
-    rows = _format_live_rows(stocks, top_n=limit, max_name_len=28) + _format_live_rows(
-        funds,
-        top_n=max(10, limit // 2),
-        max_name_len=28,
-    )
+    selected = _rank_quotes_by_change(stocks, limit) + _rank_quotes_by_change(funds, max(10, limit // 2))
     universe: Dict[str, str] = {}
-    for row in rows:
-        name, symbol = row[0], row[1]
-        if symbol != "-" and symbol not in universe.values():
+    for quote in selected:
+        symbol = str(quote.get("symbol") or "").strip()
+        name = _truncate(_quote_name(quote), 28)
+        if symbol and symbol not in universe.values():
             universe[name] = symbol
     return universe
 
@@ -967,17 +990,35 @@ def _compute_atr_percent(history: Any) -> Optional[float]:
         if last_close == 0:
             return None
         return (atr / last_close) * 100
-    except Exception:
+    except Exception as exc:
+        LOGGER.debug("atr_compute_failed detail=%s", exc)
         return None
+
+
+def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d") -> Any:
+    """Fetch and cache yfinance OHLCV history to avoid repeated slow calls."""
+    cache_key = f"{symbol}|{period}|{interval}"
+    now_ts = time.time()
+    ttl = max(60, SETTINGS.trade_history_cache_ttl_seconds)
+    with CACHE_LOCK:
+        cached = HISTORY_CACHE.get(cache_key)
+        if cached:
+            cached_at, history = cached
+            if now_ts - cached_at <= ttl:
+                return history
+    history = _with_retry(
+        lambda: yf.Ticker(symbol).history(period=period, interval=interval),
+        f"yf_history_{symbol}",
+        retries=2,
+    )
+    with CACHE_LOCK:
+        HISTORY_CACHE[cache_key] = (time.time(), history)
+    return history
 
 
 def _analyze_short_term_candidate(symbol: str) -> Optional[Dict[str, float]]:
     try:
-        history = _with_retry(
-            lambda: yf.Ticker(symbol).history(period="3mo", interval="1d"),
-            f"yf_candidate_{symbol}",
-            retries=2,
-        )
+        history = _fetch_ticker_history(symbol)
         close_series = history["Close"].dropna()
         if len(close_series) < 30:
             return None
@@ -1033,7 +1074,8 @@ def _analyze_short_term_candidate(symbol: str) -> Optional[Dict[str, float]]:
             "drawdown_pct": drawdown_pct,
             "atr_pct": atr_pct,
         }
-    except Exception:
+    except Exception as exc:
+        LOGGER.debug("candidate_analysis_failed symbol=%s detail=%s", symbol, exc)
         return None
 
 
@@ -1051,11 +1093,33 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
             if symbol not in universe.values():
                 universe[label] = symbol
 
+    # Cap the universe so a cold cache cannot trigger an unbounded number of
+    # slow yfinance calls and stall the briefing / a `/now` command.
+    universe_max = max(1, SETTINGS.trade_universe_max)
+    candidate_items = list(universe.items())[:universe_max]
+
     scored: List[Tuple[float, float, float, str, str, Dict[str, float]]] = []
-    for name, symbol in universe.items():
-        metrics = _analyze_short_term_candidate(symbol)
-        if metrics:
-            scored.append((metrics["score"], metrics["week_momentum_pct"], metrics["day_change_pct"], name, symbol, metrics))
+    workers = max(1, min(SETTINGS.trade_fetch_workers, len(candidate_items) or 1))
+    deadline = time.time() + max(5, SETTINGS.trade_total_deadline_seconds)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_meta = {
+            pool.submit(_analyze_short_term_candidate, symbol): (name, symbol)
+            for name, symbol in candidate_items
+        }
+        for future in as_completed(future_to_meta):
+            name, symbol = future_to_meta[future]
+            if time.time() >= deadline:
+                LOGGER.warning("trade_candidates_deadline_reached analysed=%s", len(scored))
+                for pending in future_to_meta:
+                    pending.cancel()
+                break
+            try:
+                metrics = future.result()
+            except Exception as exc:
+                LOGGER.debug("candidate_future_failed symbol=%s detail=%s", symbol, exc)
+                continue
+            if metrics:
+                scored.append((metrics["score"], metrics["week_momentum_pct"], metrics["day_change_pct"], name, symbol, metrics))
 
     lines = [
         "⚠️ Short-Term Trade Candidates (Informational Only):",
@@ -1178,19 +1242,23 @@ def _handle_command(command: str, chat_id: str) -> None:
         send_telegram_message(_command_help_text(), chat_id=chat_id)
 
 
-def poll_telegram_commands() -> bool:
+def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
     if not SETTINGS.command_poll_enabled or not SETTINGS.telegram_token:
         return True
     try:
-        params = {"timeout": 0, "limit": 20}
+        long_poll_timeout = max(0, long_poll_timeout)
+        params = {"timeout": long_poll_timeout, "limit": 20}
         if STATE.telegram_update_offset > 0:
             params["offset"] = STATE.telegram_update_offset + 1
+
+        # The HTTP read timeout must outlast the server-side long-poll hold.
+        request_timeout = SETTINGS.request_timeout_seconds + long_poll_timeout
 
         def _fetch() -> requests.Response:
             return requests.get(
                 f"https://api.telegram.org/bot{SETTINGS.telegram_token}/getUpdates",
                 params=params,
-                timeout=SETTINGS.request_timeout_seconds,
+                timeout=request_timeout,
             )
 
         response = _with_retry(_fetch, "telegram_get_updates")
@@ -1214,6 +1282,23 @@ def poll_telegram_commands() -> bool:
     except Exception as exc:
         LOGGER.error("command_poll_failed detail=%s", exc)
         return False
+
+
+def run_command_long_polling_loop(stop_event: Optional[threading.Event] = None) -> None:
+    """Continuously long-poll Telegram for commands until stopped.
+
+    Long-polling responds to commands near-instantly (instead of waiting for a
+    fixed interval) and issues far fewer requests when idle.
+    """
+    timeout = max(1, SETTINGS.command_long_poll_timeout_seconds)
+    while stop_event is None or not stop_event.is_set():
+        ok = poll_telegram_commands(long_poll_timeout=timeout)
+        if not ok:
+            # Back off briefly on failure so we do not hammer the API.
+            if stop_event is not None:
+                stop_event.wait(5)
+            else:
+                time.sleep(5)
 
 
 def _prepare_telegram_long_polling() -> None:
@@ -1258,11 +1343,26 @@ if __name__ == "__main__":
 
     _prepare_telegram_long_polling()
 
-    scheduler = BlockingScheduler(timezone=SETTINGS.tz)
+    # A small thread pool with single-instance jobs prevents overlapping runs
+    # from racing on shared state, caches, and the state file.
+    scheduler = BlockingScheduler(
+        timezone=SETTINGS.tz,
+        executors={"default": APSThreadPoolExecutor(max_workers=2)},
+        job_defaults={"max_instances": 1, "coalesce": True},
+    )
     scheduler.add_job(job_daily_briefing, "cron", hour="7,19", minute=0)
     scheduler.add_job(job_health_ping, "cron", hour=12, minute=0)
+
+    command_stop_event = threading.Event()
+    command_thread: Optional[threading.Thread] = None
     if SETTINGS.command_poll_enabled:
-        scheduler.add_job(poll_telegram_commands, "interval", minutes=SETTINGS.command_poll_interval_minutes)
+        command_thread = threading.Thread(
+            target=run_command_long_polling_loop,
+            args=(command_stop_event,),
+            name="telegram-command-poller",
+            daemon=True,
+        )
+        command_thread.start()
 
     if SETTINGS.send_startup_briefing:
         print("--------------------------------------------------")
@@ -1277,3 +1377,5 @@ if __name__ == "__main__":
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         pass
+    finally:
+        command_stop_event.set()

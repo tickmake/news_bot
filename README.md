@@ -93,8 +93,9 @@ python news_bot.py
 - `RECIPIENT_NAME` - name shown in greeting (default `Sunil`)
 - `TELEGRAM_MESSAGE_MAX_CHARS` - chunk size per Telegram message (default `3900`)
 - `STATE_FILE` - local JSON state file path (default `.news_bot_state.json`)
-- `COMMAND_POLL_ENABLED` - enable Telegram command polling (default `true`)
-- `COMMAND_POLL_INTERVAL_MINUTES` - command polling cadence (default `2`)
+- `COMMAND_POLL_ENABLED` - enable Telegram command handling (default `true`)
+- `COMMAND_LONG_POLL_TIMEOUT_SECONDS` - Telegram long-poll hold time; commands respond near-instantly (default `25`)
+- `COMMAND_POLL_INTERVAL_MINUTES` - **deprecated**, retained for compatibility but unused (long-polling replaced interval polling)
 - `SEND_STARTUP_BRIEFING` - run one immediate briefing on container start (default `false`)
 - `HEALTH_PING_ENABLED` - enable daily health ping (default `true`)
 - `HEALTH_PING_CHAT_ID` - optional separate chat for health pings
@@ -151,6 +152,15 @@ If these are empty, the bot relies fully on live screener data.
 - `TRADE_MAX_DRAWDOWN_PCT`
 - `TRADE_MAX_ATR_PCT`
 
+### Trade Candidate Performance
+
+Candidate analysis fetches per-symbol history from yfinance. These controls keep a briefing (and `/now`) responsive on a cold cache:
+
+- `TRADE_UNIVERSE_MAX` - max symbols analysed per run (default `30`)
+- `TRADE_FETCH_WORKERS` - parallel history fetch workers (default `6`)
+- `TRADE_HISTORY_CACHE_TTL_SECONDS` - per-symbol history cache duration (default `600`)
+- `TRADE_TOTAL_DEADLINE_SECONDS` - overall deadline for candidate analysis; partial results returned if exceeded (default `45`)
+
 ## Scheduling
 
 The bot schedules:
@@ -167,7 +177,7 @@ scheduler.add_job(job_daily_briefing, "cron", hour="7,19", minute=0)
 Additional jobs:
 
 - daily health ping (`12:00`)
-- Telegram command polling (`interval`, default every 2 minutes)
+- Telegram command handling runs in a background long-polling thread (near-instant response)
 
 ## Telegram Commands
 
