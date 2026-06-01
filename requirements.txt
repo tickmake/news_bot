@@ -1,7 +1,10 @@
-# Pinned for reproducible builds. yfinance in particular is version-sensitive
-# (see the YF_NO_CURL_CFFI / DNSError shims in news_bot.py); upgrade deliberately.
+# Pinned for reproducible builds. yfinance is version-sensitive (see the
+# DNSError shim in news_bot.py); upgrade deliberately.
 requests==2.31.0
-yfinance==1.2.0
+yfinance==0.2.66
+# yfinance now imports curl_cffi unconditionally, so it must be installed
+# (the old YF_NO_CURL_CFFI / uninstall workaround no longer applies).
+curl_cffi==0.13.0
 apscheduler==3.10.4
 pydantic==2.13.4
 pydantic-settings==2.11.0
