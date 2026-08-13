@@ -105,8 +105,12 @@ class AppSettings(BaseSettings):
     health_ping_chat_id: Optional[str] = None
     send_startup_briefing: bool = False
     trusted_news_domains: str = (
+        # bbc.co.uk is listed alongside bbc.com because the BBC RSS feeds link
+        # to bbc.co.uk; with only bbc.com the allowlist silently dropped every
+        # BBC item.
         "reuters.com,bloomberg.com,cnbc.com,finance.yahoo.com,yahoo.com,ft.com,"
-        "bbc.com,theguardian.com,nrk.no,aftenposten.no,e24.no,apnews.com,marketwatch.com"
+        "bbc.com,bbc.co.uk,theguardian.com,nrk.no,aftenposten.no,e24.no,"
+        "apnews.com,marketwatch.com"
     )
     blocked_news_domains: str = "news.google.com,pinterest.com,tiktok.com"
     news_max_age_hours: int = 30
@@ -795,12 +799,30 @@ def _fetch_freenews_items(
 def _fetch_rss_from_feeds(
     feed_urls: List[str], max_items: int = 20
 ) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
+    """Fetch every feed and interleave the results.
+
+    Reading feeds in order and stopping at max_items lets one prolific feed
+    consume the whole quota, so later feeds are never fetched at all. That
+    defeats cross-outlet deduplication, which needs items from more than one
+    outlet in the same pool. Take a fair share from each feed instead, then
+    round-robin so the head of the pool is balanced across outlets.
+    """
+    if not feed_urls:
+        return []
+
+    per_feed = max(1, -(-max_items // len(feed_urls)))  # ceiling division
+    # Over-fetch per feed so short feeds can be topped up from longer ones.
+    fetched = [
+        _fetch_rss_items(feed_url, max_items=max(per_feed, max_items)) for feed_url in feed_urls
+    ]
+
     items: List[Tuple[str, Optional[str], Optional[datetime]]] = []
-    for feed_url in feed_urls:
-        for item in _fetch_rss_items(feed_url, max_items=max_items):
-            items.append(item)
-            if len(items) >= max_items:
-                return items
+    for position in range(max(len(batch) for batch in fetched) if fetched else 0):
+        for batch in fetched:
+            if position < len(batch):
+                items.append(batch[position])
+                if len(items) >= max_items:
+                    return items
     return items
 
 

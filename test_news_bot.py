@@ -1129,6 +1129,73 @@ class MarkOnSendTests(unittest.TestCase):
         self.assertTrue(self._seen())
 
 
+class FeedFairShareTests(unittest.TestCase):
+    """One prolific feed must not starve the others.
+
+    Cross-outlet deduplication only works if the pool actually contains items
+    from more than one outlet.
+    """
+
+    @staticmethod
+    def _feed_items(prefix, count):
+        return [(f"{prefix} story {i}", f"https://{prefix}.example/{i}", None) for i in range(count)]
+
+    def test_prolific_first_feed_does_not_starve_later_feeds(self):
+        def fake_fetch(feed_url, max_items=20):
+            counts = {"a": 100, "b": 100, "c": 100}
+            name = feed_url.split("//")[1].split(".")[0]
+            return self._feed_items(name, counts[name])[:max_items]
+
+        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
+            items = news_bot._fetch_rss_from_feeds(
+                ["https://a.example/f", "https://b.example/f", "https://c.example/f"],
+                max_items=30,
+            )
+        domains = {url.split("//")[1].split(".")[0] for _t, url, _p in items}
+        self.assertEqual(domains, {"a", "b", "c"})
+        self.assertLessEqual(len(items), 30)
+
+    def test_short_feeds_do_not_waste_the_quota(self):
+        def fake_fetch(feed_url, max_items=20):
+            name = feed_url.split("//")[1].split(".")[0]
+            count = 1 if name == "a" else 100
+            return self._feed_items(name, count)[:max_items]
+
+        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
+            items = news_bot._fetch_rss_from_feeds(
+                ["https://a.example/f", "https://b.example/f"], max_items=30
+            )
+        self.assertEqual(len(items), 30)
+
+    def test_failing_feed_does_not_break_the_others(self):
+        def fake_fetch(feed_url, max_items=20):
+            if "broken" in feed_url:
+                return []
+            return self._feed_items("ok", 10)[:max_items]
+
+        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
+            items = news_bot._fetch_rss_from_feeds(
+                ["https://broken.example/f", "https://ok.example/f"], max_items=20
+            )
+        self.assertEqual(len(items), 10)
+
+    def test_empty_feed_list_returns_empty(self):
+        self.assertEqual(news_bot._fetch_rss_from_feeds([], max_items=10), [])
+
+
+class TrustedDomainTests(unittest.TestCase):
+    def test_bbc_co_uk_links_are_allowed(self):
+        """BBC RSS links point at bbc.co.uk; an allowlist with only bbc.com
+        silently dropped every BBC item."""
+        self.assertTrue(news_bot._source_allowed("https://www.bbc.co.uk/news/articles/abc"))
+
+    def test_bbc_com_links_are_still_allowed(self):
+        self.assertTrue(news_bot._source_allowed("https://www.bbc.com/news/articles/abc"))
+
+    def test_untrusted_domain_is_still_rejected(self):
+        self.assertFalse(news_bot._source_allowed("https://not-a-real-outlet.example/x"))
+
+
 class HealthReportTests(unittest.TestCase):
     def tearDown(self):
         news_bot.RANKER_STATUS.update(
