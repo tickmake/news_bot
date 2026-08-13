@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import news_bot
@@ -97,8 +97,10 @@ class NewsBotTests(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.text = (
             "<rss><channel>"
-            "<item><title>Title 1</title><link>https://example.com/1</link></item>"
-            "<item><title>Title 2</title><link>https://example.com/2</link></item>"
+            "<item><title>Fed holds interest rates steady</title>"
+            "<link>https://example.com/1</link></item>"
+            "<item><title>Norway raises fuel duty next year</title>"
+            "<link>https://example.com/2</link></item>"
             "</channel></rss>"
         )
         mock_response.raise_for_status.return_value = None
@@ -107,12 +109,14 @@ class NewsBotTests(unittest.TestCase):
         with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
             news_bot.SETTINGS, "freenews_api_key", ""
         ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot.SETTINGS, "news_ranker_enabled", False
+        ), patch.object(
             news_bot, "_source_allowed", return_value=True
         ):
-            result = news_bot.get_global_news()
+            result, _ = news_bot.get_global_news()
 
         self.assertIn("Top Global News", result)
-        self.assertIn("Title 1", result)
+        self.assertIn("Fed holds interest rates steady", result)
         self.assertIn("https://example.com/2", result)
 
     @patch("news_bot.requests.get")
@@ -128,9 +132,11 @@ class NewsBotTests(unittest.TestCase):
         with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
             news_bot.SETTINGS, "freenews_api_key", ""
         ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot.SETTINGS, "news_ranker_enabled", False
+        ), patch.object(
             news_bot, "_source_allowed", return_value=True
         ):
-            result = news_bot.get_global_news()
+            result, _ = news_bot.get_global_news()
         self.assertIn("Public headline", result)
 
     @patch("news_bot.requests.get")
@@ -147,34 +153,44 @@ class NewsBotTests(unittest.TestCase):
         with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
             news_bot.SETTINGS, "freenews_api_key", ""
         ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot.SETTINGS, "news_ranker_enabled", False
+        ), patch.object(
             news_bot, "_source_allowed", return_value=True
         ):
-            result = news_bot.get_norwegian_morning_news()
+            result, _ = news_bot.get_norwegian_morning_news()
 
         self.assertIn("Early Morning Norway News", result)
         self.assertIn("NRK headline", result)
         self.assertIn("https://example.no/1", result)
 
     @patch("news_bot.requests.get")
-    def test_get_global_news_prefers_newsapi_when_key_present(self, mock_get):
+    def test_get_global_news_pools_api_and_rss_providers(self, mock_get):
         news_bot.STATE.data["sent_headline_keys"] = {}
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = {
-            "articles": [
-                {"title": "API headline", "url": "https://example.com/api"},
-            ]
+            "articles": [{"title": "API headline", "url": "https://example.com/api"}]
         }
+        mock_response.text = (
+            "<rss><channel>"
+            "<item><title>RSS headline</title><link>https://example.com/rss</link></item>"
+            "</channel></rss>"
+        )
         mock_get.return_value = mock_response
 
         with patch.object(news_bot.SETTINGS, "news_api_key", "abc"), patch.object(
             news_bot.SETTINGS, "freenews_api_key", ""
         ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
             news_bot.SETTINGS, "news_fetch_priority", "newsapi,rss"
+        ), patch.object(
+            news_bot.SETTINGS, "news_ranker_enabled", False
         ), patch.object(news_bot, "_source_allowed", return_value=True):
-            result = news_bot.get_global_news()
+            result, _selections = news_bot.get_global_news()
 
+        # Both providers now contribute to one pool rather than the first
+        # provider short-circuiting the rest.
         self.assertIn("API headline", result)
+        self.assertIn("RSS headline", result)
 
     def test_active_finnhub_key_supports_legacy_env_name(self):
         with patch.object(news_bot.SETTINGS, "finnhub_api_key", ""), patch.object(
@@ -188,7 +204,8 @@ class NewsBotTests(unittest.TestCase):
         news_bot.STATE.data["sent_headline_keys"] = {}
         mock_news_section.return_value = (
             "💼 Top Business Stories:\n"
-            '1. Market headline (<a href="https://example.com/market">more</a>)\n'
+            '1. Market headline (<a href="https://example.com/market">more</a>)\n',
+            [],
         )
         mock_collect_live.return_value = [
             {
@@ -210,7 +227,7 @@ class NewsBotTests(unittest.TestCase):
         with patch.object(news_bot.SETTINGS, "finnhub_api_key", ""), patch.object(
             news_bot.SETTINGS, "finhub_api_key", ""
         ):
-            result = news_bot.get_business_and_stocks()
+            result, _selections = news_bot.get_business_and_stocks()
         self.assertIn("Top Business Stories", result)
         self.assertIn("Market headline", result)
         self.assertIn("Live Stock Movers", result)
@@ -276,7 +293,11 @@ class NewsBotTests(unittest.TestCase):
 
             reloaded = news_bot.AppState(path)
             self.assertEqual(reloaded.telegram_update_offset, 42)
-            self.assertTrue(reloaded.has_seen_headline("global_news", "key1", "2026-06-01"))
+            self.assertTrue(
+                reloaded.has_seen_headline(
+                    "global_news", "key1", window_days=7, today="2026-06-01"
+                )
+            )
 
     def test_fetch_ticker_history_caches_result(self):
         news_bot.HISTORY_CACHE.clear()
@@ -313,6 +334,980 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(params["timeout"], 25)
         # Read timeout must outlast the server-side hold.
         self.assertGreater(mock_get.call_args.kwargs["timeout"], 25)
+
+
+class FeedDateParsingTests(unittest.TestCase):
+    def test_parses_rfc2822_pubdate(self):
+        parsed = news_bot._parse_feed_datetime("Thu, 13 Aug 2026 04:55:58 GMT")
+        self.assertEqual(parsed, datetime(2026, 8, 13, 4, 55, 58, tzinfo=timezone.utc))
+
+    def test_parses_iso8601_with_trailing_z(self):
+        parsed = news_bot._parse_feed_datetime("2026-08-13T10:00:47Z")
+        self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 47, tzinfo=timezone.utc))
+
+    def test_parses_iso8601_with_offset_and_normalises_to_utc(self):
+        parsed = news_bot._parse_feed_datetime("2026-08-13T12:00:00+02:00")
+        self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 0, tzinfo=timezone.utc))
+
+    def test_naive_timestamp_is_treated_as_utc(self):
+        parsed = news_bot._parse_feed_datetime("2026-08-13T10:00:00")
+        self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 0, tzinfo=timezone.utc))
+
+    def test_returns_none_for_malformed_input(self):
+        self.assertIsNone(news_bot._parse_feed_datetime("not a date"))
+
+    def test_returns_none_for_empty_and_missing_input(self):
+        self.assertIsNone(news_bot._parse_feed_datetime(""))
+        self.assertIsNone(news_bot._parse_feed_datetime(None))
+
+
+class RssDateExtractionTests(unittest.TestCase):
+    def test_extracts_pubdate_from_rss_item(self):
+        xml_text = (
+            "<rss><channel>"
+            "<item><title>T1</title><link>https://example.com/1</link>"
+            "<pubDate>Thu, 13 Aug 2026 04:55:58 GMT</pubDate></item>"
+            "</channel></rss>"
+        )
+        items = news_bot._parse_rss_items(xml_text)
+        self.assertEqual(len(items), 1)
+        title, url, published = items[0]
+        self.assertEqual(title, "T1")
+        self.assertEqual(url, "https://example.com/1")
+        self.assertEqual(published, datetime(2026, 8, 13, 4, 55, 58, tzinfo=timezone.utc))
+
+    def test_prefers_pubdate_over_dc_date(self):
+        xml_text = (
+            '<rss xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>'
+            "<item><title>T1</title><link>https://example.com/1</link>"
+            "<pubDate>Thu, 13 Aug 2026 04:00:00 GMT</pubDate>"
+            "<dc:date>2026-08-13T09:00:00Z</dc:date></item>"
+            "</channel></rss>"
+        )
+        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        self.assertEqual(published.hour, 4)
+
+    def test_falls_back_to_dc_date_when_pubdate_absent(self):
+        xml_text = (
+            '<rss xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>'
+            "<item><title>T1</title><link>https://example.com/1</link>"
+            "<dc:date>2026-08-13T09:48:44Z</dc:date></item>"
+            "</channel></rss>"
+        )
+        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        self.assertEqual(published, datetime(2026, 8, 13, 9, 48, 44, tzinfo=timezone.utc))
+
+    def test_item_without_any_date_yields_none(self):
+        xml_text = (
+            "<rss><channel>"
+            "<item><title>T1</title><link>https://example.com/1</link></item>"
+            "</channel></rss>"
+        )
+        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        self.assertIsNone(published)
+
+    def test_atom_entry_published_is_parsed(self):
+        xml_text = (
+            '<feed xmlns="http://www.w3.org/2005/Atom">'
+            "<entry><title>A1</title>"
+            '<link href="https://example.com/a1" rel="alternate"/>'
+            "<published>2026-08-13T06:30:00Z</published></entry>"
+            "</feed>"
+        )
+        title, url, published = news_bot._parse_rss_items(xml_text)[0]
+        self.assertEqual(title, "A1")
+        self.assertEqual(url, "https://example.com/a1")
+        self.assertEqual(published, datetime(2026, 8, 13, 6, 30, 0, tzinfo=timezone.utc))
+
+
+class XmlHardeningTests(unittest.TestCase):
+    def test_entity_expansion_bomb_is_rejected(self):
+        bomb = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE lolz [<!ENTITY lol "lol">'
+            '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">'
+            '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">]>'
+            "<rss><channel><item><title>&lol3;</title></item></channel></rss>"
+        )
+        with self.assertRaises(Exception):
+            news_bot._parse_rss_items(bomb)
+
+    def test_ordinary_feeds_still_parse(self):
+        xml_text = (
+            "<rss><channel>"
+            "<item><title>Normal</title><link>https://example.com/1</link></item>"
+            "</channel></rss>"
+        )
+        self.assertEqual(len(news_bot._parse_rss_items(xml_text)), 1)
+
+
+class CandidateModelTests(unittest.TestCase):
+    def test_trusted_domain_is_flagged(self):
+        candidate = news_bot._make_candidate(
+            "Headline", "https://www.reuters.com/x", None, "rss"
+        )
+        self.assertEqual(candidate.domain, "reuters.com")
+        self.assertTrue(candidate.trusted)
+
+    def test_unknown_domain_is_not_trusted(self):
+        candidate = news_bot._make_candidate(
+            "Headline", "https://random-blog.example/x", None, "rss"
+        )
+        self.assertFalse(candidate.trusted)
+
+    def test_age_hours_is_none_without_a_date(self):
+        candidate = news_bot._make_candidate("Headline", None, None, "rss")
+        self.assertIsNone(news_bot._age_hours(candidate))
+
+    def test_age_hours_computed_from_published_at(self):
+        now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+        candidate = news_bot._make_candidate(
+            "Headline", None, now - timedelta(hours=5), "rss"
+        )
+        self.assertAlmostEqual(news_bot._age_hours(candidate, now), 5.0, places=3)
+
+    def test_future_timestamps_clamp_to_zero(self):
+        now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+        candidate = news_bot._make_candidate(
+            "Headline", None, now + timedelta(hours=2), "rss"
+        )
+        self.assertEqual(news_bot._age_hours(candidate, now), 0.0)
+
+
+class ClusterKeyTests(unittest.TestCase):
+    def test_identical_titles_share_a_cluster_key(self):
+        self.assertEqual(
+            news_bot._cluster_key("Fed holds rates steady"),
+            news_bot._cluster_key("Fed holds rates steady"),
+        )
+
+    def test_cluster_key_ignores_case_and_punctuation(self):
+        self.assertEqual(
+            news_bot._cluster_key("Fed holds rates steady!"),
+            news_bot._cluster_key("fed holds rates, steady"),
+        )
+
+    def test_cluster_key_ignores_word_order(self):
+        self.assertEqual(
+            news_bot._cluster_key("Fed holds rates steady"),
+            news_bot._cluster_key("Rates steady, Fed holds"),
+        )
+
+    def test_cluster_key_ignores_stopwords(self):
+        self.assertEqual(
+            news_bot._cluster_key("The Fed holds the rates steady"),
+            news_bot._cluster_key("Fed holds rates steady"),
+        )
+
+    def test_different_stories_have_different_cluster_keys(self):
+        self.assertNotEqual(
+            news_bot._cluster_key("Fed holds rates steady"),
+            news_bot._cluster_key("Norway raises fuel duty"),
+        )
+
+
+class DedupWindowTests(unittest.TestCase):
+    def setUp(self):
+        self.state = news_bot.AppState(path=os.path.join(tempfile.mkdtemp(), "state.json"))
+
+    def test_headline_seen_yesterday_is_suppressed_today(self):
+        self.state.mark_headline_seen("global", ["k1"], "2026-08-12")
+        self.assertTrue(
+            self.state.has_seen_headline("global", "k1", window_days=7, today="2026-08-13")
+        )
+
+    def test_headline_outside_the_window_is_not_suppressed(self):
+        self.state.mark_headline_seen("global", ["k1"], "2026-08-01")
+        self.assertFalse(
+            self.state.has_seen_headline("global", "k1", window_days=3, today="2026-08-13")
+        )
+
+    def test_window_is_measured_in_calendar_days_not_buckets_present(self):
+        """A gap in sends must not drag a stale bucket back into the window."""
+        self.state.mark_headline_seen("global", ["old"], "2026-08-01")
+        self.state.mark_headline_seen("global", ["new"], "2026-08-13")
+        self.assertFalse(
+            self.state.has_seen_headline("global", "old", window_days=7, today="2026-08-13")
+        )
+        self.assertTrue(
+            self.state.has_seen_headline("global", "new", window_days=7, today="2026-08-13")
+        )
+
+    def test_window_boundary_is_inclusive_of_today_and_six_days_back(self):
+        """window_days=7 means today plus the six days before it."""
+        self.state.mark_headline_seen("global", ["inside"], "2026-08-07")
+        self.state.mark_headline_seen("global", ["outside"], "2026-08-06")
+        self.assertTrue(
+            self.state.has_seen_headline("global", "inside", window_days=7, today="2026-08-13")
+        )
+        self.assertFalse(
+            self.state.has_seen_headline("global", "outside", window_days=7, today="2026-08-13")
+        )
+
+    def test_bare_string_key_is_treated_as_one_key_not_characters(self):
+        self.state.mark_headline_seen("global", "key1", "2026-08-13")
+        self.assertTrue(
+            self.state.has_seen_headline("global", "key1", window_days=7, today="2026-08-13")
+        )
+        self.assertFalse(
+            self.state.has_seen_headline("global", "k", window_days=7, today="2026-08-13")
+        )
+
+    def test_sections_do_not_leak_into_each_other(self):
+        self.state.mark_headline_seen("global", ["k1"], "2026-08-12")
+        self.assertFalse(
+            self.state.has_seen_headline("norway", "k1", window_days=7, today="2026-08-13")
+        )
+
+    def test_multiple_keys_are_marked_together(self):
+        self.state.mark_headline_seen("global", ["exact", "cluster"], "2026-08-13")
+        self.assertTrue(
+            self.state.has_seen_headline("global", "exact", window_days=7, today="2026-08-13")
+        )
+        self.assertTrue(
+            self.state.has_seen_headline("global", "cluster", window_days=7, today="2026-08-13")
+        )
+
+    def test_bucket_retention_is_bounded(self):
+        for day in range(1, 15):
+            self.state.mark_headline_seen("global", [f"k{day}"], f"2026-08-{day:02d}")
+        buckets = self.state.data["sent_headline_keys"]["global"]
+        self.assertLessEqual(len(buckets), 7)
+
+
+class RecentTitleTests(unittest.TestCase):
+    def setUp(self):
+        self.state = news_bot.AppState(path=os.path.join(tempfile.mkdtemp(), "state.json"))
+
+    def test_recent_titles_are_returned_within_the_window(self):
+        self.state.record_recent_title("Fed holds rates steady", "2026-08-12")
+        self.assertIn(
+            "Fed holds rates steady",
+            self.state.recent_titles(window_days=7, today="2026-08-13"),
+        )
+
+    def test_recent_titles_outside_the_window_are_excluded(self):
+        self.state.record_recent_title("Old story", "2026-08-01")
+        self.assertNotIn(
+            "Old story", self.state.recent_titles(window_days=3, today="2026-08-13")
+        )
+
+    def test_recent_titles_are_capped(self):
+        for index in range(50):
+            self.state.record_recent_title(f"Story {index}", "2026-08-13")
+        self.assertLessEqual(
+            len(self.state.recent_titles(window_days=7, limit=30, today="2026-08-13")), 30
+        )
+
+    def test_duplicate_titles_are_not_stored_twice(self):
+        self.state.record_recent_title("Same story", "2026-08-13")
+        self.state.record_recent_title("Same story", "2026-08-13")
+        titles = self.state.recent_titles(window_days=7, today="2026-08-13")
+        self.assertEqual(titles.count("Same story"), 1)
+
+
+FIXED_NOW = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _cand(title, url=None, hours_old=1.0, trusted=True, provider="rss"):
+    """Test helper: build a Candidate with an age relative to FIXED_NOW."""
+    published = None if hours_old is None else FIXED_NOW - timedelta(hours=hours_old)
+    base = news_bot._make_candidate(title, url, published, provider)
+    return news_bot.Candidate(
+        title=base.title,
+        url=base.url,
+        domain=base.domain,
+        published_at=base.published_at,
+        provider=base.provider,
+        trusted=trusted,
+    )
+
+
+class TopicWeightTests(unittest.TestCase):
+    def test_defaults_are_used_when_override_is_empty(self):
+        with patch.object(news_bot.SETTINGS, "news_topic_weights", ""):
+            weights = news_bot._resolve_topic_weights()
+        self.assertEqual(weights["markets"], news_bot.TOPIC_CATEGORIES["markets"]["weight"])
+
+    def test_override_replaces_a_single_category(self):
+        with patch.object(news_bot.SETTINGS, "news_topic_weights", "markets:5.0"):
+            weights = news_bot._resolve_topic_weights()
+        self.assertEqual(weights["markets"], 5.0)
+        self.assertEqual(weights["sports"], news_bot.TOPIC_CATEGORIES["sports"]["weight"])
+
+    def test_unknown_categories_in_the_override_are_ignored(self):
+        with patch.object(news_bot.SETTINGS, "news_topic_weights", "nonsense:9.0"):
+            weights = news_bot._resolve_topic_weights()
+        self.assertNotIn("nonsense", weights)
+
+    def test_malformed_override_entries_are_skipped(self):
+        with patch.object(news_bot.SETTINGS, "news_topic_weights", "markets:abc,tech:1.0"):
+            weights = news_bot._resolve_topic_weights()
+        self.assertEqual(weights["markets"], news_bot.TOPIC_CATEGORIES["markets"]["weight"])
+        self.assertEqual(weights["tech"], 1.0)
+
+
+DISTINCT_HEADLINES = [
+    "Fed holds interest rates steady after inflation data",
+    "Norway raises fuel duty in autumn budget proposal",
+    "India central bank signals caution on rupee volatility",
+    "Semiconductor makers warn of oversupply next quarter",
+    "Storm warning issued across the western coastline",
+    "Housing starts fall for a third consecutive month",
+    "Oil majors report weaker refining margins",
+    "Regulators open inquiry into cloud outage",
+    "Wheat prices climb on export restrictions",
+    "Transit strike disrupts commuter services",
+]
+
+
+class HeuristicSelectorTests(unittest.TestCase):
+    def setUp(self):
+        self.selector = news_bot.HeuristicSelector(now=FIXED_NOW)
+
+    def test_returns_at_most_the_limit(self):
+        pool = [
+            _cand(title, f"https://a.example/{i}")
+            for i, title in enumerate(DISTINCT_HEADLINES)
+        ]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 5)
+
+    def test_headlines_differing_by_one_token_are_treated_as_duplicates(self):
+        """Documents a real limitation: short titles are noisy under shingle
+        similarity, so near-identical phrasings collapse. Acceptable, because
+        real headlines that differ by one token usually are the same story."""
+        pool = [_cand(f"Story number {i}", f"https://a.example/{i}") for i in range(5)]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
+
+    def test_empty_pool_returns_empty_list(self):
+        self.assertEqual(self.selector.select([], "global", 5), [])
+
+    def test_fresher_story_outranks_older_one_all_else_equal(self):
+        pool = [
+            _cand("Fed holds rates steady in August", "https://a.example/old", hours_old=20),
+            _cand("Fed lifts rates sharply in August", "https://a.example/new", hours_old=1),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/new")
+
+    def test_upweighted_topic_outranks_downweighted_topic(self):
+        pool = [
+            _cand("Celebrity wedding photos revealed", "https://a.example/celeb"),
+            _cand("Fed signals inflation rate decision", "https://a.example/fed"),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/fed")
+
+    def test_downweight_survives_a_colliding_upweight_keyword(self):
+        """A celebrity story mentioning Oslo must not inherit Norway's boost.
+
+        Taking max() of matched weights made down-weights inert whenever any
+        up-weight keyword also matched.
+        """
+        pool = [
+            _cand("Actor spotted at film premiere in Oslo", "https://a.example/celeb"),
+            _cand("Bond yields rise ahead of Treasury auction", "https://a.example/bonds"),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/bonds")
+
+    def test_pure_upweight_still_outranks_a_collision(self):
+        pool = [
+            _cand("Actor spotted at film premiere in Oslo", "https://a.example/celeb"),
+            _cand("Norges Bank signals rate decision for Norway", "https://a.example/nb"),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/nb")
+
+    def test_downweighted_story_still_appears_when_nothing_better_exists(self):
+        pool = [_cand("Football match ends in a draw", "https://a.example/sport")]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
+
+    def test_trusted_source_breaks_a_tie(self):
+        pool = [
+            _cand("Fed rate decision today", "https://untrusted.example/x", trusted=False),
+            _cand("Fed rate verdict today", "https://www.reuters.com/x", trusted=True),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.domain, "reuters.com")
+
+    def test_reworded_duplicates_collapse_into_one_selection(self):
+        pool = [
+            _cand("Fed holds interest rates steady", "https://a.example/1"),
+            _cand("Fed holds steady interest rates", "https://b.example/2"),
+        ]
+        result = self.selector.select(pool, "global", 5)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0].duplicates), 1)
+
+    def test_identical_urls_collapse_even_with_different_titles(self):
+        pool = [
+            _cand("Version one of the headline", "https://a.example/same"),
+            _cand("A completely different phrasing entirely", "https://a.example/same"),
+        ]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
+
+    def test_distinct_stories_are_not_collapsed(self):
+        pool = [
+            _cand("Fed holds interest rates steady", "https://a.example/1"),
+            _cand("Norway raises fuel duty next year", "https://b.example/2"),
+        ]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 2)
+
+    def test_undated_candidate_is_eligible_and_scores_neutrally(self):
+        pool = [_cand("Some undated headline", "https://a.example/1", hours_old=None)]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
+
+    def test_selection_is_deterministic(self):
+        pool = [
+            _cand(title, f"https://a.example/{i}")
+            for i, title in enumerate(DISTINCT_HEADLINES)
+        ]
+        first = [s.candidate.url for s in self.selector.select(pool, "global", 5)]
+        second = [s.candidate.url for s in self.selector.select(pool, "global", 5)]
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 5)
+
+    def test_duplicates_beyond_the_limit_are_still_collected(self):
+        """Duplicates must be marked seen even when the limit is already full."""
+        pool = [
+            _cand("Fed holds interest rates steady", "https://a.example/1"),
+            _cand("Norway raises fuel duty next year", "https://b.example/2"),
+            _cand("Fed holds steady interest rates", "https://c.example/3"),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(len(result), 1)
+        total = sum(1 + len(s.duplicates) for s in result)
+        self.assertGreaterEqual(total, 2)
+
+
+def _ollama_response(payload_text, status=200):
+    """Stub of an Ollama /api/chat response."""
+    response = MagicMock()
+    response.status_code = status
+    response.json.return_value = {"message": {"role": "assistant", "content": payload_text}}
+    response.raise_for_status.return_value = None
+    return response
+
+
+class _StubTransport:
+    """Records calls and returns a canned Ollama response."""
+
+    def __init__(self, payload=None, exception=None, raw_text=None, response=None):
+        self.payload = payload
+        self.exception = exception
+        self.raw_text = raw_text
+        self.response = response
+        self.calls = []
+
+    def __call__(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        if self.exception is not None:
+            raise self.exception
+        if self.response is not None:
+            return self.response
+        text = self.raw_text if self.raw_text is not None else json.dumps(self.payload)
+        return _ollama_response(text)
+
+    @property
+    def body(self):
+        return self.calls[0]["json"]
+
+
+class LlmSelectorTests(unittest.TestCase):
+    def setUp(self):
+        self.pool = [
+            _cand("Fed holds interest rates steady", "https://a.example/1"),
+            _cand("Federal Reserve keeps rates unchanged", "https://b.example/2"),
+            _cand("Norway raises fuel duty", "https://c.example/3"),
+        ]
+
+    def _select(self, transport, limit=2):
+        selector = news_bot.LlmSelector(transport=transport, now=FIXED_NOW, recent_titles=[])
+        return selector.select(self.pool, "global", limit)
+
+    def test_selects_by_returned_index(self):
+        t = _StubTransport({"selections": [{"id": 2, "duplicate_ids": [], "reason": "big"}]})
+        self.assertEqual(self._select(t)[0].candidate.url, "https://c.example/3")
+
+    def test_duplicate_ids_are_attached_to_the_selection(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [1], "reason": "dupe"}]})
+        result = self._select(t)
+        self.assertEqual(len(result[0].duplicates), 1)
+        self.assertEqual(result[0].duplicates[0].url, "https://b.example/2")
+
+    def test_out_of_range_ids_are_dropped(self):
+        t = _StubTransport(
+            {
+                "selections": [
+                    {"id": 99, "duplicate_ids": [], "reason": "bad"},
+                    {"id": 0, "duplicate_ids": [], "reason": "ok"},
+                ]
+            }
+        )
+        result = self._select(t)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/1")
+
+    def test_out_of_range_duplicate_ids_are_dropped(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [99], "reason": "x"}]})
+        self.assertEqual(self._select(t)[0].duplicates, [])
+
+    def test_non_integer_ids_are_dropped(self):
+        t = _StubTransport(
+            {
+                "selections": [
+                    {"id": "zero", "duplicate_ids": [], "reason": "x"},
+                    {"id": 1, "duplicate_ids": [], "reason": "y"},
+                ]
+            }
+        )
+        result = self._select(t)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].candidate.url, "https://b.example/2")
+
+    def test_repeated_ids_are_deduplicated(self):
+        t = _StubTransport(
+            {
+                "selections": [
+                    {"id": 0, "duplicate_ids": [], "reason": "a"},
+                    {"id": 0, "duplicate_ids": [], "reason": "b"},
+                ]
+            }
+        )
+        self.assertEqual(len(self._select(t)), 1)
+
+    def test_result_is_truncated_to_the_limit(self):
+        t = _StubTransport(
+            {"selections": [{"id": i, "duplicate_ids": [], "reason": "x"} for i in range(3)]}
+        )
+        self.assertEqual(len(self._select(t, limit=2)), 2)
+
+    def test_empty_pool_does_not_call_the_model(self):
+        t = _StubTransport({"selections": []})
+        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        self.assertEqual(selector.select([], "global", 5), [])
+        self.assertEqual(t.calls, [])
+
+    def test_recent_titles_are_included_in_the_prompt(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        selector = news_bot.LlmSelector(
+            transport=t, now=FIXED_NOW, recent_titles=["Previously shown story"]
+        )
+        selector.select(self.pool, "global", 2)
+        self.assertIn("Previously shown story", json.dumps(t.body))
+
+    def test_candidate_titles_are_included_in_the_prompt(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t)
+        self.assertIn("Norway raises fuel duty", json.dumps(t.body))
+
+    def test_prompt_frames_candidates_as_untrusted_data(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t)
+        self.assertIn("UNTRUSTED", json.dumps(t.body))
+
+    def test_request_targets_the_configured_ollama_endpoint(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        with patch.object(news_bot.SETTINGS, "news_ranker_url", "http://ollama:11434"):
+            self._select(t)
+        self.assertEqual(t.calls[0]["url"], "http://ollama:11434/api/chat")
+
+    def test_request_pins_the_json_schema_and_model(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t)
+        self.assertEqual(t.body["format"], news_bot.RANKER_RESPONSE_SCHEMA)
+        self.assertEqual(t.body["model"], news_bot.SETTINGS.news_ranker_model)
+        self.assertFalse(t.body["stream"])
+
+    def test_pool_is_shortlisted_before_the_call(self):
+        """Local inference times out on a full pool, so only the heuristic's
+        best N are sent."""
+        pool = [
+            _cand(title, f"https://a.example/{i}")
+            for i, title in enumerate(DISTINCT_HEADLINES)
+        ]
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 3):
+            selector.select(pool, "global", 2)
+        sent = t.body["messages"][1]["content"]
+        self.assertEqual(sent.count("\n["), 3)
+
+    def test_shortlist_keeps_ids_aligned_with_what_was_sent(self):
+        """Returned ids index the shortlist, not the original pool."""
+        pool = [
+            _cand("Celebrity wedding photos revealed", "https://a.example/celeb"),
+            _cand("Fed signals inflation rate decision", "https://a.example/fed"),
+        ]
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 1):
+            result = selector.select(pool, "global", 1)
+        # The heuristic ranks the markets story first, so id 0 is that one.
+        self.assertEqual(result[0].candidate.url, "https://a.example/fed")
+
+    def test_small_pool_is_sent_untouched(self):
+        pool = [_cand("Only story", "https://a.example/1")]
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 20):
+            self.assertEqual(len(selector.select(pool, "global", 5)), 1)
+
+    def test_request_is_deterministic(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t)
+        self.assertEqual(t.body["options"]["temperature"], 0)
+
+
+class LlmSelectorFallthroughTests(unittest.TestCase):
+    """Every failure mode must fall through, never raise."""
+
+    def setUp(self):
+        self.pool = [_cand("Fed holds interest rates steady", "https://a.example/1")]
+
+    def _select_with(self, transport):
+        selector = news_bot.LlmSelector(transport=transport, now=FIXED_NOW, recent_titles=[])
+        return selector.select(self.pool, "global", 5)
+
+    def test_missing_transport_returns_empty(self):
+        selector = news_bot.LlmSelector(transport=None, now=FIXED_NOW, recent_titles=[])
+        self.assertEqual(selector.select(self.pool, "global", 5), [])
+
+    def test_connection_error_returns_empty(self):
+        """The common case: Ollama is not running."""
+        exc = news_bot.requests.exceptions.ConnectionError("refused")
+        self.assertEqual(self._select_with(_StubTransport(exception=exc)), [])
+
+    def test_timeout_returns_empty(self):
+        exc = news_bot.requests.exceptions.Timeout("too slow")
+        self.assertEqual(self._select_with(_StubTransport(exception=exc)), [])
+
+    def test_http_error_returns_empty(self):
+        response = MagicMock()
+        response.status_code = 404
+        response.raise_for_status.side_effect = news_bot.requests.exceptions.HTTPError(
+            "model not found"
+        )
+        self.assertEqual(self._select_with(_StubTransport(response=response)), [])
+
+    def test_malformed_json_returns_empty(self):
+        self.assertEqual(self._select_with(_StubTransport(raw_text="not json at all")), [])
+
+    def test_missing_selections_key_returns_empty(self):
+        self.assertEqual(self._select_with(_StubTransport({"wrong": []})), [])
+
+    def test_unexpected_envelope_returns_empty(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"unexpected": "shape"}
+        self.assertEqual(self._select_with(_StubTransport(response=response)), [])
+
+    def test_all_ids_invalid_returns_empty(self):
+        t = _StubTransport({"selections": [{"id": 99, "duplicate_ids": [], "reason": "x"}]})
+        self.assertEqual(self._select_with(t), [])
+
+    def test_failure_is_recorded_for_health(self):
+        news_bot.RANKER_STATUS["error"] = None
+        self._select_with(_StubTransport(exception=RuntimeError("boom")))
+        self.assertIsNotNone(news_bot.RANKER_STATUS["error"])
+
+    def test_success_clears_a_previous_error(self):
+        news_bot.RANKER_STATUS["error"] = "stale"
+        self._select_with(
+            _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        )
+        self.assertIsNone(news_bot.RANKER_STATUS["error"])
+
+
+class SelectorFactoryTests(unittest.TestCase):
+    def test_heuristic_used_when_ranker_disabled(self):
+        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", False):
+            selector = news_bot._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, news_bot.HeuristicSelector)
+
+    def test_heuristic_used_when_no_url_configured(self):
+        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", True), patch.object(
+            news_bot.SETTINGS, "news_ranker_url", ""
+        ):
+            selector = news_bot._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, news_bot.HeuristicSelector)
+
+    def test_llm_selector_used_when_enabled_and_url_present(self):
+        """No credential needed — a reachable local endpoint is the only gate."""
+        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", True), patch.object(
+            news_bot.SETTINGS, "news_ranker_url", "http://ollama:11434"
+        ):
+            selector = news_bot._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, news_bot.LlmSelector)
+
+
+class PipelineIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        news_bot.STATE.data["sent_headline_keys"] = {}
+        news_bot.STATE.data["recent_titles"] = {}
+
+    @staticmethod
+    def _rss(*items):
+        """items: (title, pubdate_or_None) pairs."""
+        body = "".join(
+            f"<item><title>{title}</title><link>https://example.com/{i}</link>"
+            + (f"<pubDate>{pub}</pubDate>" if pub else "")
+            + "</item>"
+            for i, (title, pub) in enumerate(items)
+        )
+        response = MagicMock()
+        response.text = f"<rss><channel>{body}</channel></rss>"
+        response.raise_for_status.return_value = None
+        return response
+
+    @staticmethod
+    def _patches():
+        return (
+            patch.object(news_bot.SETTINGS, "news_api_key", ""),
+            patch.object(news_bot.SETTINGS, "freenews_api_key", ""),
+            patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""),
+            patch.object(news_bot.SETTINGS, "news_ranker_enabled", False),
+            patch.object(news_bot, "_source_allowed", return_value=True),
+        )
+
+    def _run(self, mock_get, response):
+        mock_get.return_value = response
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            return news_bot.get_global_news()
+        finally:
+            for item in patches:
+                item.stop()
+
+    @patch("news_bot.requests.get")
+    def test_section_renders_and_returns_selections(self, mock_get):
+        fresh = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        rendered, selections = self._run(
+            mock_get, self._rss(("Fed rate decision", fresh), ("Norway budget talks", fresh))
+        )
+        self.assertIn("Top Global News", rendered)
+        self.assertGreaterEqual(len(selections), 1)
+
+    @patch("news_bot.requests.get")
+    def test_empty_pool_renders_the_empty_message(self, mock_get):
+        response = MagicMock()
+        response.text = "<rss><channel></channel></rss>"
+        response.raise_for_status.return_value = None
+        rendered, selections = self._run(mock_get, response)
+        self.assertIn("No fresh global headlines", rendered)
+        self.assertEqual(selections, [])
+
+    @patch("news_bot.requests.get")
+    def test_stale_dated_items_are_dropped_by_the_ceiling(self, mock_get):
+        rendered, selections = self._run(
+            mock_get, self._rss(("Ancient story", "Mon, 01 Jun 2020 10:00:00 GMT"))
+        )
+        self.assertEqual(selections, [])
+        self.assertIn("No fresh global headlines", rendered)
+
+    @patch("news_bot.requests.get")
+    def test_undated_items_survive_the_ceiling(self, mock_get):
+        rendered, selections = self._run(mock_get, self._rss(("Undated story", None)))
+        self.assertIn("Undated story", rendered)
+        self.assertEqual(len(selections), 1)
+
+    @patch("news_bot.requests.get")
+    def test_already_seen_headline_is_suppressed(self, mock_get):
+        fresh = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        today = datetime.today().strftime("%Y-%m-%d")
+        news_bot.STATE.mark_headline_seen(
+            "global_news", news_bot._headline_keys("Seen already", None), today
+        )
+        rendered, selections = self._run(mock_get, self._rss(("Seen already", fresh)))
+        self.assertEqual(selections, [])
+
+
+class MarkOnSendTests(unittest.TestCase):
+    def setUp(self):
+        news_bot.STATE.data["sent_headline_keys"] = {}
+        news_bot.STATE.data["recent_titles"] = {}
+
+    @staticmethod
+    def _briefing():
+        candidate = _cand("Fed holds rates steady", "https://a.example/1")
+        return news_bot.Briefing(
+            message="body",
+            pending=[
+                ("global_news", key)
+                for key in news_bot._headline_keys(candidate.title, candidate.url)
+            ],
+            titles=[candidate.title],
+        )
+
+    def _run_job(self, send_succeeds):
+        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
+            news_bot, "send_telegram_message", return_value=send_succeeds
+        ), patch.object(news_bot.STATE, "save"):
+            return news_bot.job_daily_briefing()
+
+    def _seen(self):
+        return news_bot.STATE.has_seen_headline(
+            "global_news", news_bot._cluster_key("Fed holds rates steady"), window_days=7
+        )
+
+    def test_failed_send_does_not_mark_headlines_seen(self):
+        self.assertFalse(self._run_job(send_succeeds=False))
+        self.assertFalse(self._seen())
+
+    def test_successful_send_marks_headlines_seen(self):
+        self.assertTrue(self._run_job(send_succeeds=True))
+        self.assertTrue(self._seen())
+
+    def test_successful_send_records_titles_for_the_recent_window(self):
+        self._run_job(send_succeeds=True)
+        self.assertIn("Fed holds rates steady", news_bot.STATE.recent_titles(window_days=7))
+
+    def test_failed_send_records_no_titles(self):
+        self._run_job(send_succeeds=False)
+        self.assertEqual(news_bot.STATE.recent_titles(window_days=7), [])
+
+    def test_collapsed_duplicates_are_marked_alongside_the_shown_headline(self):
+        shown = _cand("Fed holds interest rates steady", "https://a.example/1")
+        dupe = _cand("Federal Reserve keeps rates unchanged", "https://b.example/2")
+        selection = news_bot.Selection(candidate=shown, duplicates=[dupe], reason="")
+        pending = news_bot._pending_keys("global_news", [selection])
+        self.assertIn(("global_news", news_bot._cluster_key(dupe.title)), pending)
+
+    def test_every_news_section_contributes_pending_keys(self):
+        """Regression guard: _is_duplicate_headline is read-only, so any section
+        whose selections are not committed loses deduplication entirely."""
+        selection = news_bot.Selection(
+            candidate=_cand("Business story", "https://a.example/b"), duplicates=[], reason=""
+        )
+        with patch.object(
+            news_bot, "get_norwegian_morning_news", return_value=("n", [])
+        ), patch.object(news_bot, "get_global_news", return_value=("g", [])), patch.object(
+            news_bot, "get_business_and_stocks", return_value=("b", [selection])
+        ), patch.object(
+            news_bot, "get_trade_candidates", return_value="t"
+        ), patch.object(
+            news_bot, "build_daily_intro", return_value="i"
+        ):
+            briefing = news_bot.compose_briefing(datetime(2026, 8, 13, 7, 0))
+        sections = {section for section, _key in briefing.pending}
+        self.assertIn("business_news", sections)
+
+    def test_command_briefing_commits_only_on_success(self):
+        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
+            news_bot, "send_telegram_message", return_value=False
+        ):
+            news_bot._send_briefing(datetime(2026, 8, 13, 7, 0), "chat-1")
+        self.assertFalse(self._seen())
+
+        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
+            news_bot, "send_telegram_message", return_value=True
+        ):
+            news_bot._send_briefing(datetime(2026, 8, 13, 7, 0), "chat-1")
+        self.assertTrue(self._seen())
+
+
+class FeedFairShareTests(unittest.TestCase):
+    """One prolific feed must not starve the others.
+
+    Cross-outlet deduplication only works if the pool actually contains items
+    from more than one outlet.
+    """
+
+    @staticmethod
+    def _feed_items(prefix, count):
+        return [(f"{prefix} story {i}", f"https://{prefix}.example/{i}", None) for i in range(count)]
+
+    def test_prolific_first_feed_does_not_starve_later_feeds(self):
+        def fake_fetch(feed_url, max_items=20):
+            counts = {"a": 100, "b": 100, "c": 100}
+            name = feed_url.split("//")[1].split(".")[0]
+            return self._feed_items(name, counts[name])[:max_items]
+
+        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
+            items = news_bot._fetch_rss_from_feeds(
+                ["https://a.example/f", "https://b.example/f", "https://c.example/f"],
+                max_items=30,
+            )
+        domains = {url.split("//")[1].split(".")[0] for _t, url, _p in items}
+        self.assertEqual(domains, {"a", "b", "c"})
+        self.assertLessEqual(len(items), 30)
+
+    def test_short_feeds_do_not_waste_the_quota(self):
+        def fake_fetch(feed_url, max_items=20):
+            name = feed_url.split("//")[1].split(".")[0]
+            count = 1 if name == "a" else 100
+            return self._feed_items(name, count)[:max_items]
+
+        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
+            items = news_bot._fetch_rss_from_feeds(
+                ["https://a.example/f", "https://b.example/f"], max_items=30
+            )
+        self.assertEqual(len(items), 30)
+
+    def test_failing_feed_does_not_break_the_others(self):
+        def fake_fetch(feed_url, max_items=20):
+            if "broken" in feed_url:
+                return []
+            return self._feed_items("ok", 10)[:max_items]
+
+        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
+            items = news_bot._fetch_rss_from_feeds(
+                ["https://broken.example/f", "https://ok.example/f"], max_items=20
+            )
+        self.assertEqual(len(items), 10)
+
+    def test_empty_feed_list_returns_empty(self):
+        self.assertEqual(news_bot._fetch_rss_from_feeds([], max_items=10), [])
+
+
+class TrustedDomainTests(unittest.TestCase):
+    def test_bbc_co_uk_links_are_allowed(self):
+        """BBC RSS links point at bbc.co.uk; an allowlist with only bbc.com
+        silently dropped every BBC item."""
+        self.assertTrue(news_bot._source_allowed("https://www.bbc.co.uk/news/articles/abc"))
+
+    def test_bbc_com_links_are_still_allowed(self):
+        self.assertTrue(news_bot._source_allowed("https://www.bbc.com/news/articles/abc"))
+
+    def test_untrusted_domain_is_still_rejected(self):
+        self.assertFalse(news_bot._source_allowed("https://not-a-real-outlet.example/x"))
+
+
+class HealthReportTests(unittest.TestCase):
+    def tearDown(self):
+        news_bot.RANKER_STATUS.update(
+            {"path": "unknown", "latency_ms": None, "error": None, "error_at": None}
+        )
+
+    def test_health_report_includes_the_ranker_path(self):
+        news_bot.RANKER_STATUS.update({"path": "llm", "latency_ms": 1840, "error": None})
+        report = news_bot.build_health_report()
+        self.assertIn("Ranker path: llm", report)
+        self.assertIn("1840", report)
+
+    def test_health_report_surfaces_the_last_ranker_error(self):
+        news_bot.RANKER_STATUS.update(
+            {
+                "path": "heuristic",
+                "error": "APITimeoutError: timed out",
+                "error_at": "2026-08-13T07:00:01",
+            }
+        )
+        self.assertIn("APITimeoutError", news_bot.build_health_report())
+
+    def test_health_report_omits_the_error_line_when_clean(self):
+        news_bot.RANKER_STATUS.update({"path": "heuristic", "latency_ms": None, "error": None})
+        self.assertNotIn("Last ranker error", news_bot.build_health_report())
+
+    def test_health_report_retains_pre_existing_fields(self):
+        report = news_bot.build_health_report()
+        self.assertIn("Bot Health Check", report)
+        self.assertIn("Last run status", report)
+        self.assertIn("Timezone", report)
 
 
 if __name__ == "__main__":

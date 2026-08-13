@@ -23,7 +23,9 @@ The bot is built in Python and scheduled with APScheduler.
 - **Typed settings validation** via `pydantic-settings`.
 - **Fallback-safe behavior** when API data is missing or incomplete.
 - **Automatic retries/backoff** for external API calls.
-- **Duplicate headline suppression** across same-day sends.
+- **Relevance-ranked headlines** by importance, topic weight, and recency — not raw feed order.
+- **Cross-outlet and cross-day deduplication**, so one story appears once.
+- **Local LLM ranking** via Ollama — no API key, no data leaves your network — with a deterministic heuristic fallback.
 - **Telegram command support** (`/now`, `/morning`, `/evening`, `/watchlist`, `/health`).
 - **Health ping** support for runtime monitoring.
 - **CI test workflow** via GitHub Actions.
@@ -120,6 +122,104 @@ python news_bot.py
 - `FINNHUB_CACHE_TTL_SECONDS` - Finnhub quote cache duration (default `120`)
 - `FINNHUB_FAILURE_COOLDOWN_SECONDS` - cooldown on Finnhub failures/rate limits (default `180`)
 - `FINNHUB_MAX_SYMBOLS_PER_REFRESH` - max symbols per section refreshed via Finnhub (default `16`)
+
+### News ranking
+
+The bot ranks headlines rather than taking whatever the feeds list first.
+Ranking combines real-world importance, your topic weights, and recency, and
+collapses the same story reported by multiple outlets into a single line.
+
+Two ranking paths:
+
+- **Local LLM ranking** (default) — a model running in Ollama on your own
+  hardware. Catches cross-outlet paraphrase such as "Fed holds rates steady"
+  and "Federal Reserve keeps rates unchanged", which share almost no words.
+  No API key, no cost per briefing, and no headline ever leaves your network.
+- **Heuristic ranking** (automatic fallback) — recency decay, keyword topic
+  weights, and source tier. No network at all, fully deterministic.
+
+The heuristic path is used whenever the LLM path is unavailable *or fails*:
+Ollama not running, model not pulled, timeout, or malformed response. A
+section always renders.
+
+The LLM does not see the whole candidate pool. The heuristic pre-ranks and
+the LLM re-ranks its top `NEWS_RANKER_MAX_CANDIDATES` — so the pool stays
+wide enough for cross-outlet deduplication while the slow path only handles
+a short, already-good list. Latency scales with that number, not pool size.
+
+**Connecting to Ollama.** By default the bot talks to a host named `ollama`
+on the *ranker network*. Two ways to provide it:
+
+- *Reuse an existing Ollama* (recommended if you already run one). Point the
+  ranker network at that project's network in `.env`:
+
+  ```bash
+  RANKER_NETWORK=poster-bot_default
+  RANKER_NETWORK_EXTERNAL=true
+  ```
+
+  Find the network name with:
+  `docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' ollama`
+
+- *Use the bundled service*, off by default so it never duplicates an Ollama
+  you already run:
+
+  ```bash
+  docker compose --profile bundled-ollama up -d
+  ```
+
+  This starts Ollama and pulls `NEWS_RANKER_MODEL` into a named volume.
+
+Outside Docker, run Ollama yourself and set
+`NEWS_RANKER_URL=http://localhost:11434`:
+
+```bash
+ollama pull llama3.2:3b
+```
+
+Note that `NEWS_FETCH_PRIORITY` now orders a single pooled candidate set
+rather than selecting one provider — every configured provider is fetched on
+each send, which is what makes cross-outlet deduplication possible.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NEWS_RANKER_ENABLED` | `true` | Kill switch |
+| `NEWS_RANKER_URL` | `http://localhost:11434` | Ollama endpoint (compose sets `http://ollama:11434`) |
+| `NEWS_RANKER_MODEL` | `llama3.2:3b` | Ranking model; must be pulled into Ollama |
+| `NEWS_RANKER_MAX_CANDIDATES` | `20` | Shortlist size sent to the LLM |
+| `NEWS_RANKER_TIMEOUT_SECONDS` | `240` | Per-call timeout |
+| `RANKER_NETWORK` | bundled net | Network carrying Ollama |
+| `RANKER_NETWORK_EXTERNAL` | `false` | Set `true` to reuse another project's network |
+| `NEWS_MAX_AGE_HOURS` | `30` | Freshness ceiling; undated items exempt |
+| `NEWS_CANDIDATE_POOL_SIZE` | `60` | Candidates ranked per section |
+| `NEWS_DEDUP_WINDOW_DAYS` | `7` | Cross-day suppression window (includes today) |
+| `NEWS_RECENT_TITLE_DAYS` | `3` | Recent titles sent to the ranker |
+| `NEWS_TOPIC_WEIGHTS` | unset | Weight overrides, e.g. `markets:2.5,sports:0.1` |
+
+Topic categories are `markets`, `norway`, `india`, `tech` (up-weighted) and
+`sports`, `celebrity`, `crime`, `lifestyle`, `shopping` (down-weighted).
+Down-weighting is not exclusion — a low-weight headline still appears when
+nothing better is available.
+
+There is no per-briefing cost — the trade is hardware instead. Measured on a
+Raspberry Pi 5 (CPU only) against a warm `llama3.2:3b`:
+
+| Candidates sent | Latency |
+|---|---|
+| 10 | ~51 s |
+| 20 | ~74 s |
+| 40 | ~150 s |
+
+Hence the default shortlist of 20 and the 240 s timeout. Small models are the
+weak link on quality, not just speed: in testing, `llama3.2:3b` collapsed
+obvious repeats correctly but missed a genuine cross-outlet duplicate and
+paired two different central banks as the same story. If ranking quality
+matters more than keeping everything on one small box, point
+`NEWS_RANKER_URL` at a machine running a 7B+ model. GPU acceleration for the
+bundled service is a commented-out block in `docker-compose.yml`.
+
+Run `/health` to see which path is active, the model, call latency, and the
+last ranker error.
 
 ### Optional Universe Configuration
 
