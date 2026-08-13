@@ -6,11 +6,13 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html import escape
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 from urllib.parse import urlparse
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET
 
 from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -107,6 +109,8 @@ class AppSettings(BaseSettings):
         "bbc.com,theguardian.com,nrk.no,aftenposten.no,e24.no,apnews.com,marketwatch.com"
     )
     blocked_news_domains: str = "news.google.com,pinterest.com,tiktok.com"
+    news_max_age_hours: int = 30
+    news_candidate_pool_size: int = 60
     trade_min_score: int = 3
     trade_min_week_momentum_pct: float = 1.0
     trade_min_day_change_pct: float = 0.0
@@ -454,9 +458,77 @@ def build_daily_intro(now: Optional[datetime] = None) -> str:
     return f"{escape(greeting)}\nHello, {recipient}!\n📅 {date_key}\n"
 
 
-def _parse_rss_items(xml_text: str, max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
-    items: List[Tuple[str, Optional[str]]] = []
+def _parse_feed_datetime(raw: Optional[str]) -> Optional[datetime]:
+    """Parse an RSS/Atom/JSON publish timestamp into tz-aware UTC.
+
+    Feeds are inconsistent: RSS uses RFC 2822 pubDate, Atom and dc:date use
+    ISO 8601, and some feeds emit neither. Returns None rather than raising so
+    an unparseable date degrades to "unknown age" instead of dropping the item.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    parsed: Optional[datetime] = None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        parsed = None
+
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One news item, normalised across providers and ready for ranking."""
+
+    title: str
+    url: Optional[str]
+    domain: str
+    published_at: Optional[datetime]
+    provider: str
+    trusted: bool
+
+
+def _make_candidate(
+    title: str, url: Optional[str], published_at: Optional[datetime], provider: str
+) -> Candidate:
+    domain = _safe_domain(url)
+    trusted = bool(domain) and any(domain.endswith(entry) for entry in TRUSTED_DOMAINS)
+    return Candidate(
+        title=title.strip(),
+        url=url,
+        domain=domain,
+        published_at=published_at,
+        provider=provider,
+        trusted=trusted,
+    )
+
+
+def _age_hours(candidate: Candidate, now: Optional[datetime] = None) -> Optional[float]:
+    """Hours since publication, or None when the feed gave no usable date."""
+    if candidate.published_at is None:
+        return None
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return max(0.0, (reference - candidate.published_at).total_seconds() / 3600.0)
+
+
+def _parse_rss_items(
+    xml_text: str, max_items: int = 20
+) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
+    items: List[Tuple[str, Optional[str], Optional[datetime]]] = []
     root = ET.fromstring(xml_text)
+    dc_ns = "{http://purl.org/dc/elements/1.1/}"
 
     for node in root.findall(".//item"):
         title = (node.findtext("title") or "").strip()
@@ -465,8 +537,11 @@ def _parse_rss_items(xml_text: str, max_items: int = 20) -> List[Tuple[str, Opti
             guid = (node.findtext("guid") or "").strip()
             if guid.startswith("http"):
                 link = guid
+        published = _parse_feed_datetime(node.findtext("pubDate")) or _parse_feed_datetime(
+            node.findtext(f"{dc_ns}date")
+        )
         if title:
-            items.append((title, link))
+            items.append((title, link, published))
         if len(items) >= max_items:
             return items
 
@@ -482,14 +557,19 @@ def _parse_rss_items(xml_text: str, max_items: int = 20) -> List[Tuple[str, Opti
                 break
             if href and not link:
                 link = href
+        published = _parse_feed_datetime(
+            node.findtext(f"{atom_ns}published")
+        ) or _parse_feed_datetime(node.findtext(f"{atom_ns}updated"))
         if title:
-            items.append((title, link))
+            items.append((title, link, published))
         if len(items) >= max_items:
             return items
     return items
 
 
-def _fetch_rss_items(feed_url: str, max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
+def _fetch_rss_items(
+    feed_url: str, max_items: int = 20
+) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
     try:
         response = _with_retry(
             lambda: requests.get(
@@ -507,7 +587,9 @@ def _fetch_rss_items(feed_url: str, max_items: int = 20) -> List[Tuple[str, Opti
         return []
 
 
-def _extract_articles_from_payload(payload: Any) -> List[Tuple[str, Optional[str]]]:
+def _extract_articles_from_payload(
+    payload: Any,
+) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
     containers: List[Any] = []
     if isinstance(payload, dict):
         for key in ("articles", "data", "results", "news"):
@@ -517,20 +599,28 @@ def _extract_articles_from_payload(payload: Any) -> List[Tuple[str, Optional[str
     elif isinstance(payload, list):
         containers.append(payload)
 
-    items: List[Tuple[str, Optional[str]]] = []
+    items: List[Tuple[str, Optional[str], Optional[datetime]]] = []
     for container in containers:
         for article in container:
             if not isinstance(article, dict):
                 continue
             title = article.get("title") or article.get("headline") or article.get("name")
             url = article.get("url") or article.get("link") or article.get("source_url")
+            published = _parse_feed_datetime(
+                article.get("publishedAt")
+                or article.get("published_at")
+                or article.get("pubDate")
+                or article.get("date")
+            )
             if isinstance(title, str) and title.strip():
                 normalized_url = url.strip() if isinstance(url, str) and url.strip() else None
-                items.append((title.strip(), normalized_url))
+                items.append((title.strip(), normalized_url, published))
     return items
 
 
-def _fetch_newsapi_items(scope: str, max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
+def _fetch_newsapi_items(
+    scope: str, max_items: int = 20
+) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
     api_key = (SETTINGS.news_api_key or "").strip()
     if not api_key:
         return []
@@ -566,7 +656,9 @@ def _active_freenews_key() -> str:
     return ""
 
 
-def _fetch_freenews_items(scope: str, max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
+def _fetch_freenews_items(
+    scope: str, max_items: int = 20
+) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
     api_key = _active_freenews_key()
     if not api_key:
         return []
@@ -595,8 +687,10 @@ def _fetch_freenews_items(scope: str, max_items: int = 20) -> List[Tuple[str, Op
         return []
 
 
-def _fetch_rss_from_feeds(feed_urls: List[str], max_items: int = 20) -> List[Tuple[str, Optional[str]]]:
-    items: List[Tuple[str, Optional[str]]] = []
+def _fetch_rss_from_feeds(
+    feed_urls: List[str], max_items: int = 20
+) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
+    items: List[Tuple[str, Optional[str], Optional[datetime]]] = []
     for feed_url in feed_urls:
         for item in _fetch_rss_items(feed_url, max_items=max_items):
             items.append(item)
@@ -623,7 +717,7 @@ def _build_news_section(
     lines = [title]
     count = 0
 
-    source_candidates: List[Tuple[str, List[Tuple[str, Optional[str]]]]] = []
+    source_candidates: List[Tuple[str, List[Tuple[str, Optional[str], Optional[datetime]]]]] = []
     for provider in _news_provider_priority():
         if provider == "newsapi":
             source_candidates.append(("newsapi", _fetch_newsapi_items(scope, max_items=20)))
@@ -633,7 +727,7 @@ def _build_news_section(
             source_candidates.append(("rss", _fetch_rss_from_feeds(feed_urls, max_items=30)))
 
     for _provider, headlines in source_candidates:
-        for headline, url in headlines:
+        for headline, url, _published in headlines:
             if not _source_allowed(url):
                 continue
             if _is_duplicate_headline(section_key, headline, url, date_key):

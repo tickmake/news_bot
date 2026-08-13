@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import news_bot
@@ -313,6 +313,144 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(params["timeout"], 25)
         # Read timeout must outlast the server-side hold.
         self.assertGreater(mock_get.call_args.kwargs["timeout"], 25)
+
+
+class FeedDateParsingTests(unittest.TestCase):
+    def test_parses_rfc2822_pubdate(self):
+        parsed = news_bot._parse_feed_datetime("Thu, 13 Aug 2026 04:55:58 GMT")
+        self.assertEqual(parsed, datetime(2026, 8, 13, 4, 55, 58, tzinfo=timezone.utc))
+
+    def test_parses_iso8601_with_trailing_z(self):
+        parsed = news_bot._parse_feed_datetime("2026-08-13T10:00:47Z")
+        self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 47, tzinfo=timezone.utc))
+
+    def test_parses_iso8601_with_offset_and_normalises_to_utc(self):
+        parsed = news_bot._parse_feed_datetime("2026-08-13T12:00:00+02:00")
+        self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 0, tzinfo=timezone.utc))
+
+    def test_naive_timestamp_is_treated_as_utc(self):
+        parsed = news_bot._parse_feed_datetime("2026-08-13T10:00:00")
+        self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 0, tzinfo=timezone.utc))
+
+    def test_returns_none_for_malformed_input(self):
+        self.assertIsNone(news_bot._parse_feed_datetime("not a date"))
+
+    def test_returns_none_for_empty_and_missing_input(self):
+        self.assertIsNone(news_bot._parse_feed_datetime(""))
+        self.assertIsNone(news_bot._parse_feed_datetime(None))
+
+
+class RssDateExtractionTests(unittest.TestCase):
+    def test_extracts_pubdate_from_rss_item(self):
+        xml_text = (
+            "<rss><channel>"
+            "<item><title>T1</title><link>https://example.com/1</link>"
+            "<pubDate>Thu, 13 Aug 2026 04:55:58 GMT</pubDate></item>"
+            "</channel></rss>"
+        )
+        items = news_bot._parse_rss_items(xml_text)
+        self.assertEqual(len(items), 1)
+        title, url, published = items[0]
+        self.assertEqual(title, "T1")
+        self.assertEqual(url, "https://example.com/1")
+        self.assertEqual(published, datetime(2026, 8, 13, 4, 55, 58, tzinfo=timezone.utc))
+
+    def test_prefers_pubdate_over_dc_date(self):
+        xml_text = (
+            '<rss xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>'
+            "<item><title>T1</title><link>https://example.com/1</link>"
+            "<pubDate>Thu, 13 Aug 2026 04:00:00 GMT</pubDate>"
+            "<dc:date>2026-08-13T09:00:00Z</dc:date></item>"
+            "</channel></rss>"
+        )
+        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        self.assertEqual(published.hour, 4)
+
+    def test_falls_back_to_dc_date_when_pubdate_absent(self):
+        xml_text = (
+            '<rss xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>'
+            "<item><title>T1</title><link>https://example.com/1</link>"
+            "<dc:date>2026-08-13T09:48:44Z</dc:date></item>"
+            "</channel></rss>"
+        )
+        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        self.assertEqual(published, datetime(2026, 8, 13, 9, 48, 44, tzinfo=timezone.utc))
+
+    def test_item_without_any_date_yields_none(self):
+        xml_text = (
+            "<rss><channel>"
+            "<item><title>T1</title><link>https://example.com/1</link></item>"
+            "</channel></rss>"
+        )
+        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        self.assertIsNone(published)
+
+    def test_atom_entry_published_is_parsed(self):
+        xml_text = (
+            '<feed xmlns="http://www.w3.org/2005/Atom">'
+            "<entry><title>A1</title>"
+            '<link href="https://example.com/a1" rel="alternate"/>'
+            "<published>2026-08-13T06:30:00Z</published></entry>"
+            "</feed>"
+        )
+        title, url, published = news_bot._parse_rss_items(xml_text)[0]
+        self.assertEqual(title, "A1")
+        self.assertEqual(url, "https://example.com/a1")
+        self.assertEqual(published, datetime(2026, 8, 13, 6, 30, 0, tzinfo=timezone.utc))
+
+
+class XmlHardeningTests(unittest.TestCase):
+    def test_entity_expansion_bomb_is_rejected(self):
+        bomb = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE lolz [<!ENTITY lol "lol">'
+            '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">'
+            '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">]>'
+            "<rss><channel><item><title>&lol3;</title></item></channel></rss>"
+        )
+        with self.assertRaises(Exception):
+            news_bot._parse_rss_items(bomb)
+
+    def test_ordinary_feeds_still_parse(self):
+        xml_text = (
+            "<rss><channel>"
+            "<item><title>Normal</title><link>https://example.com/1</link></item>"
+            "</channel></rss>"
+        )
+        self.assertEqual(len(news_bot._parse_rss_items(xml_text)), 1)
+
+
+class CandidateModelTests(unittest.TestCase):
+    def test_trusted_domain_is_flagged(self):
+        candidate = news_bot._make_candidate(
+            "Headline", "https://www.reuters.com/x", None, "rss"
+        )
+        self.assertEqual(candidate.domain, "reuters.com")
+        self.assertTrue(candidate.trusted)
+
+    def test_unknown_domain_is_not_trusted(self):
+        candidate = news_bot._make_candidate(
+            "Headline", "https://random-blog.example/x", None, "rss"
+        )
+        self.assertFalse(candidate.trusted)
+
+    def test_age_hours_is_none_without_a_date(self):
+        candidate = news_bot._make_candidate("Headline", None, None, "rss")
+        self.assertIsNone(news_bot._age_hours(candidate))
+
+    def test_age_hours_computed_from_published_at(self):
+        now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+        candidate = news_bot._make_candidate(
+            "Headline", None, now - timedelta(hours=5), "rss"
+        )
+        self.assertAlmostEqual(news_bot._age_hours(candidate, now), 5.0, places=3)
+
+    def test_future_timestamps_clamp_to_zero(self):
+        now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+        candidate = news_bot._make_candidate(
+            "Headline", None, now + timedelta(hours=2), "rss"
+        )
+        self.assertEqual(news_bot._age_hours(candidate, now), 0.0)
 
 
 if __name__ == "__main__":
