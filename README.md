@@ -23,7 +23,9 @@ The bot is built in Python and scheduled with APScheduler.
 - **Typed settings validation** via `pydantic-settings`.
 - **Fallback-safe behavior** when API data is missing or incomplete.
 - **Automatic retries/backoff** for external API calls.
-- **Duplicate headline suppression** across same-day sends.
+- **Relevance-ranked headlines** by importance, topic weight, and recency — not raw feed order.
+- **Cross-outlet and cross-day deduplication**, so one story appears once.
+- **Optional LLM ranking** via the Anthropic API, with a deterministic heuristic fallback.
 - **Telegram command support** (`/now`, `/morning`, `/evening`, `/watchlist`, `/health`).
 - **Health ping** support for runtime monitoring.
 - **CI test workflow** via GitHub Actions.
@@ -120,6 +122,52 @@ python news_bot.py
 - `FINNHUB_CACHE_TTL_SECONDS` - Finnhub quote cache duration (default `120`)
 - `FINNHUB_FAILURE_COOLDOWN_SECONDS` - cooldown on Finnhub failures/rate limits (default `180`)
 - `FINNHUB_MAX_SYMBOLS_PER_REFRESH` - max symbols per section refreshed via Finnhub (default `16`)
+
+### News ranking
+
+The bot ranks headlines rather than taking whatever the feeds list first.
+Ranking combines real-world importance, your topic weights, and recency, and
+collapses the same story reported by multiple outlets into a single line.
+
+Two ranking paths:
+
+- **LLM ranking** (default when `ANTHROPIC_API_KEY` is set) — catches
+  cross-outlet paraphrase such as "Fed holds rates steady" and "Federal
+  Reserve keeps rates unchanged", which share almost no words.
+- **Heuristic ranking** (automatic fallback) — recency decay, keyword topic
+  weights, and source tier. No API key, no network, fully deterministic.
+
+The heuristic path is used whenever the LLM path is unavailable *or fails*:
+missing key, timeout, rate limit, refusal, or malformed response. A section
+always renders.
+
+Note that `NEWS_FETCH_PRIORITY` now orders a single pooled candidate set
+rather than selecting one provider — every configured provider is fetched on
+each send, which is what makes cross-outlet deduplication possible.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | unset | Enables LLM ranking |
+| `NEWS_RANKER_ENABLED` | `true` | Kill switch |
+| `NEWS_RANKER_MODEL` | `claude-opus-5` | Ranking model |
+| `NEWS_RANKER_EFFORT` | `low` | Effort level |
+| `NEWS_RANKER_TIMEOUT_SECONDS` | `20` | Per-call timeout |
+| `NEWS_MAX_AGE_HOURS` | `30` | Freshness ceiling; undated items exempt |
+| `NEWS_CANDIDATE_POOL_SIZE` | `60` | Candidates ranked per section |
+| `NEWS_DEDUP_WINDOW_DAYS` | `7` | Cross-day suppression window (includes today) |
+| `NEWS_RECENT_TITLE_DAYS` | `3` | Recent titles sent to the ranker |
+| `NEWS_TOPIC_WEIGHTS` | unset | Weight overrides, e.g. `markets:2.5,sports:0.1` |
+
+Topic categories are `markets`, `norway`, `india`, `tech` (up-weighted) and
+`sports`, `celebrity`, `crime`, `lifestyle`, `shopping` (down-weighted).
+Down-weighting is not exclusion — a low-weight headline still appears when
+nothing better is available.
+
+Approximate monthly cost at two briefings per day: `claude-opus-5` ~$7,
+`claude-sonnet-5` ~$4, `claude-haiku-4-5` ~$1.50.
+
+Run `/health` to see which path is active, the model, call latency, and the
+last ranker error.
 
 ### Optional Universe Configuration
 

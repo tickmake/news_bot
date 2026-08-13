@@ -1844,12 +1844,21 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
 
 def build_health_report() -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return (
-        "✅ Bot Health Check\n"
-        f"Time: {now}\n"
-        f"Timezone: {SETTINGS.tz}\n"
-        f"Last run status: {STATE.data.get('last_run_status', 'unknown')}\n"
-    )
+    latency = RANKER_STATUS.get("latency_ms")
+    lines = [
+        "✅ Bot Health Check",
+        f"Time: {now}",
+        f"Timezone: {SETTINGS.tz}",
+        f"Last run status: {STATE.data.get('last_run_status', 'unknown')}",
+        f"Ranker path: {RANKER_STATUS.get('path', 'unknown')}",
+        f"Ranker model: {SETTINGS.news_ranker_model}",
+        f"Ranker latency: {latency if latency is not None else 'n/a'} ms",
+    ]
+    if RANKER_STATUS.get("error"):
+        lines.append(
+            f"Last ranker error: {RANKER_STATUS['error']} at {RANKER_STATUS.get('error_at')}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 @dataclass

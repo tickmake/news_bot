@@ -1129,5 +1129,38 @@ class MarkOnSendTests(unittest.TestCase):
         self.assertTrue(self._seen())
 
 
+class HealthReportTests(unittest.TestCase):
+    def tearDown(self):
+        news_bot.RANKER_STATUS.update(
+            {"path": "unknown", "latency_ms": None, "error": None, "error_at": None}
+        )
+
+    def test_health_report_includes_the_ranker_path(self):
+        news_bot.RANKER_STATUS.update({"path": "llm", "latency_ms": 1840, "error": None})
+        report = news_bot.build_health_report()
+        self.assertIn("Ranker path: llm", report)
+        self.assertIn("1840", report)
+
+    def test_health_report_surfaces_the_last_ranker_error(self):
+        news_bot.RANKER_STATUS.update(
+            {
+                "path": "heuristic",
+                "error": "APITimeoutError: timed out",
+                "error_at": "2026-08-13T07:00:01",
+            }
+        )
+        self.assertIn("APITimeoutError", news_bot.build_health_report())
+
+    def test_health_report_omits_the_error_line_when_clean(self):
+        news_bot.RANKER_STATUS.update({"path": "heuristic", "latency_ms": None, "error": None})
+        self.assertNotIn("Last ranker error", news_bot.build_health_report())
+
+    def test_health_report_retains_pre_existing_fields(self):
+        report = news_bot.build_health_report()
+        self.assertIn("Bot Health Check", report)
+        self.assertIn("Last run status", report)
+        self.assertIn("Timezone", report)
+
+
 if __name__ == "__main__":
     unittest.main()
