@@ -111,6 +111,8 @@ class AppSettings(BaseSettings):
     blocked_news_domains: str = "news.google.com,pinterest.com,tiktok.com"
     news_max_age_hours: int = 30
     news_candidate_pool_size: int = 60
+    news_dedup_window_days: int = 7
+    news_recent_title_days: int = 3
     trade_min_score: int = 3
     trade_min_week_momentum_pct: float = 1.0
     trade_min_day_change_pct: float = 0.0
@@ -192,6 +194,7 @@ class AppState:
         self.path = path
         self.data: Dict[str, Any] = {
             "sent_headline_keys": {},
+            "recent_titles": {},
             "telegram_update_offset": 0,
             "last_health_ping_date": "",
             "last_run_status": "",
@@ -232,23 +235,79 @@ class AppState:
             except Exception as exc:
                 LOGGER.warning("state_save_failed detail=%s", exc)
 
-    def mark_headline_seen(self, section: str, key: str, date_key: str) -> None:
+    @staticmethod
+    def _window_cutoff(window_days: int, today: Optional[str]) -> str:
+        """Earliest date key still inside the window, as YYYY-MM-DD.
+
+        The window is calendar days back from `today`, not "the last N buckets
+        that happen to have data" — otherwise a gap in sends would drag a stale
+        bucket back into the window, and a single stored bucket would always
+        count as recent.
+        """
+        anchor_text = today or datetime.today().strftime("%Y-%m-%d")
+        try:
+            anchor = datetime.strptime(anchor_text, "%Y-%m-%d")
+        except ValueError:
+            anchor = datetime.today()
+        return (anchor - timedelta(days=max(0, window_days - 1))).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _prune_buckets(bucket: Dict[str, Any], keep: int = 7) -> None:
+        if len(bucket) > keep:
+            for old_date in sorted(bucket.keys())[:-keep]:
+                bucket.pop(old_date, None)
+
+    def mark_headline_seen(self, section: str, keys: Iterable[str], date_key: str) -> None:
+        # A bare string is iterable, so passing one would silently store its
+        # individual characters. Accept it as a single key instead.
+        if isinstance(keys, str):
+            keys = [keys]
         with STATE_LOCK:
             sent = self.data.setdefault("sent_headline_keys", {})
             section_bucket = sent.setdefault(section, {})
-            keys = section_bucket.setdefault(date_key, [])
-            if key not in keys:
-                keys.append(key)
-            # keep state bounded
-            if len(section_bucket.keys()) > 7:
-                old_dates = sorted(section_bucket.keys())[:-7]
-                for old_date in old_dates:
-                    section_bucket.pop(old_date, None)
+            day_keys = section_bucket.setdefault(date_key, [])
+            for key in keys:
+                if key not in day_keys:
+                    day_keys.append(key)
+            self._prune_buckets(section_bucket)
 
-    def has_seen_headline(self, section: str, key: str, date_key: str) -> bool:
+    def has_seen_headline(
+        self,
+        section: str,
+        key: str,
+        window_days: int = 7,
+        today: Optional[str] = None,
+    ) -> bool:
         with STATE_LOCK:
-            sent = self.data.get("sent_headline_keys", {})
-            return key in sent.get(section, {}).get(date_key, [])
+            section_bucket = self.data.get("sent_headline_keys", {}).get(section, {})
+            cutoff = self._window_cutoff(window_days, today)
+            for date_key, keys in section_bucket.items():
+                if date_key >= cutoff and key in keys:
+                    return True
+            return False
+
+    def record_recent_title(self, title: str, date_key: str) -> None:
+        with STATE_LOCK:
+            recent = self.data.setdefault("recent_titles", {})
+            day_titles = recent.setdefault(date_key, [])
+            if title not in day_titles:
+                day_titles.append(title)
+            self._prune_buckets(recent)
+
+    def recent_titles(
+        self, window_days: int = 3, limit: int = 30, today: Optional[str] = None
+    ) -> List[str]:
+        with STATE_LOCK:
+            recent = self.data.get("recent_titles", {})
+            cutoff = self._window_cutoff(window_days, today)
+            collected: List[str] = []
+            for date_key in sorted(recent.keys()):
+                if date_key < cutoff:
+                    continue
+                for title in recent.get(date_key, []):
+                    if title not in collected:
+                        collected.append(title)
+            return collected[-limit:]
 
     @property
     def telegram_update_offset(self) -> int:
@@ -350,16 +409,48 @@ def _source_allowed(url: Optional[str]) -> bool:
     return True
 
 
+TITLE_STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "is",
+        "of", "on", "or", "the", "to", "with",
+        "av", "de", "den", "det", "en", "er", "et", "i", "og", "om",
+        "på", "som", "til",
+    }
+)
+
+
+def _normalise_title_tokens(title: str) -> List[str]:
+    cleaned = "".join(
+        char if char.isalnum() or char.isspace() else " " for char in title.casefold()
+    )
+    return sorted({token for token in cleaned.split() if token and token not in TITLE_STOPWORDS})
+
+
 def _headline_key(title: str, url: Optional[str]) -> str:
     return hashlib.sha256(f"{title}|{url or ''}".encode("utf-8")).hexdigest()
 
 
-def _is_duplicate_headline(section: str, title: str, url: Optional[str], date_key: str) -> bool:
-    key = _headline_key(title, url)
-    if STATE.has_seen_headline(section, key, date_key):
-        return True
-    STATE.mark_headline_seen(section, key, date_key)
-    return False
+def _cluster_key(title: str) -> str:
+    """Order-insensitive key that survives light rewording of the same headline.
+
+    Catches reordered and re-punctuated variants across days. It does NOT catch
+    full cross-outlet paraphrase — that is the LlmSelector's job.
+    """
+    return hashlib.sha256("|".join(_normalise_title_tokens(title)).encode("utf-8")).hexdigest()
+
+
+def _headline_keys(title: str, url: Optional[str]) -> List[str]:
+    """Exact key plus order-insensitive cluster key for one headline."""
+    return [_headline_key(title, url), _cluster_key(title)]
+
+
+def _is_duplicate_headline(section: str, title: str, url: Optional[str]) -> bool:
+    """Read-only check. Marking seen happens after a successful send."""
+    window = max(1, SETTINGS.news_dedup_window_days)
+    return any(
+        STATE.has_seen_headline(section, key, window_days=window)
+        for key in _headline_keys(title, url)
+    )
 
 
 def _format_headline_line(index: int, title: str, url: Optional[str]) -> str:
@@ -730,7 +821,7 @@ def _build_news_section(
         for headline, url, _published in headlines:
             if not _source_allowed(url):
                 continue
-            if _is_duplicate_headline(section_key, headline, url, date_key):
+            if _is_duplicate_headline(section_key, headline, url):
                 continue
             count += 1
             lines.append(_format_headline_line(count, headline, url))

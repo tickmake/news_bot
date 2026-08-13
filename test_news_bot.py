@@ -276,7 +276,11 @@ class NewsBotTests(unittest.TestCase):
 
             reloaded = news_bot.AppState(path)
             self.assertEqual(reloaded.telegram_update_offset, 42)
-            self.assertTrue(reloaded.has_seen_headline("global_news", "key1", "2026-06-01"))
+            self.assertTrue(
+                reloaded.has_seen_headline(
+                    "global_news", "key1", window_days=7, today="2026-06-01"
+                )
+            )
 
     def test_fetch_ticker_history_caches_result(self):
         news_bot.HISTORY_CACHE.clear()
@@ -451,6 +455,138 @@ class CandidateModelTests(unittest.TestCase):
             "Headline", None, now + timedelta(hours=2), "rss"
         )
         self.assertEqual(news_bot._age_hours(candidate, now), 0.0)
+
+
+class ClusterKeyTests(unittest.TestCase):
+    def test_identical_titles_share_a_cluster_key(self):
+        self.assertEqual(
+            news_bot._cluster_key("Fed holds rates steady"),
+            news_bot._cluster_key("Fed holds rates steady"),
+        )
+
+    def test_cluster_key_ignores_case_and_punctuation(self):
+        self.assertEqual(
+            news_bot._cluster_key("Fed holds rates steady!"),
+            news_bot._cluster_key("fed holds rates, steady"),
+        )
+
+    def test_cluster_key_ignores_word_order(self):
+        self.assertEqual(
+            news_bot._cluster_key("Fed holds rates steady"),
+            news_bot._cluster_key("Rates steady, Fed holds"),
+        )
+
+    def test_cluster_key_ignores_stopwords(self):
+        self.assertEqual(
+            news_bot._cluster_key("The Fed holds the rates steady"),
+            news_bot._cluster_key("Fed holds rates steady"),
+        )
+
+    def test_different_stories_have_different_cluster_keys(self):
+        self.assertNotEqual(
+            news_bot._cluster_key("Fed holds rates steady"),
+            news_bot._cluster_key("Norway raises fuel duty"),
+        )
+
+
+class DedupWindowTests(unittest.TestCase):
+    def setUp(self):
+        self.state = news_bot.AppState(path=os.path.join(tempfile.mkdtemp(), "state.json"))
+
+    def test_headline_seen_yesterday_is_suppressed_today(self):
+        self.state.mark_headline_seen("global", ["k1"], "2026-08-12")
+        self.assertTrue(
+            self.state.has_seen_headline("global", "k1", window_days=7, today="2026-08-13")
+        )
+
+    def test_headline_outside_the_window_is_not_suppressed(self):
+        self.state.mark_headline_seen("global", ["k1"], "2026-08-01")
+        self.assertFalse(
+            self.state.has_seen_headline("global", "k1", window_days=3, today="2026-08-13")
+        )
+
+    def test_window_is_measured_in_calendar_days_not_buckets_present(self):
+        """A gap in sends must not drag a stale bucket back into the window."""
+        self.state.mark_headline_seen("global", ["old"], "2026-08-01")
+        self.state.mark_headline_seen("global", ["new"], "2026-08-13")
+        self.assertFalse(
+            self.state.has_seen_headline("global", "old", window_days=7, today="2026-08-13")
+        )
+        self.assertTrue(
+            self.state.has_seen_headline("global", "new", window_days=7, today="2026-08-13")
+        )
+
+    def test_window_boundary_is_inclusive_of_today_and_six_days_back(self):
+        """window_days=7 means today plus the six days before it."""
+        self.state.mark_headline_seen("global", ["inside"], "2026-08-07")
+        self.state.mark_headline_seen("global", ["outside"], "2026-08-06")
+        self.assertTrue(
+            self.state.has_seen_headline("global", "inside", window_days=7, today="2026-08-13")
+        )
+        self.assertFalse(
+            self.state.has_seen_headline("global", "outside", window_days=7, today="2026-08-13")
+        )
+
+    def test_bare_string_key_is_treated_as_one_key_not_characters(self):
+        self.state.mark_headline_seen("global", "key1", "2026-08-13")
+        self.assertTrue(
+            self.state.has_seen_headline("global", "key1", window_days=7, today="2026-08-13")
+        )
+        self.assertFalse(
+            self.state.has_seen_headline("global", "k", window_days=7, today="2026-08-13")
+        )
+
+    def test_sections_do_not_leak_into_each_other(self):
+        self.state.mark_headline_seen("global", ["k1"], "2026-08-12")
+        self.assertFalse(
+            self.state.has_seen_headline("norway", "k1", window_days=7, today="2026-08-13")
+        )
+
+    def test_multiple_keys_are_marked_together(self):
+        self.state.mark_headline_seen("global", ["exact", "cluster"], "2026-08-13")
+        self.assertTrue(
+            self.state.has_seen_headline("global", "exact", window_days=7, today="2026-08-13")
+        )
+        self.assertTrue(
+            self.state.has_seen_headline("global", "cluster", window_days=7, today="2026-08-13")
+        )
+
+    def test_bucket_retention_is_bounded(self):
+        for day in range(1, 15):
+            self.state.mark_headline_seen("global", [f"k{day}"], f"2026-08-{day:02d}")
+        buckets = self.state.data["sent_headline_keys"]["global"]
+        self.assertLessEqual(len(buckets), 7)
+
+
+class RecentTitleTests(unittest.TestCase):
+    def setUp(self):
+        self.state = news_bot.AppState(path=os.path.join(tempfile.mkdtemp(), "state.json"))
+
+    def test_recent_titles_are_returned_within_the_window(self):
+        self.state.record_recent_title("Fed holds rates steady", "2026-08-12")
+        self.assertIn(
+            "Fed holds rates steady",
+            self.state.recent_titles(window_days=7, today="2026-08-13"),
+        )
+
+    def test_recent_titles_outside_the_window_are_excluded(self):
+        self.state.record_recent_title("Old story", "2026-08-01")
+        self.assertNotIn(
+            "Old story", self.state.recent_titles(window_days=3, today="2026-08-13")
+        )
+
+    def test_recent_titles_are_capped(self):
+        for index in range(50):
+            self.state.record_recent_title(f"Story {index}", "2026-08-13")
+        self.assertLessEqual(
+            len(self.state.recent_titles(window_days=7, limit=30, today="2026-08-13")), 30
+        )
+
+    def test_duplicate_titles_are_not_stored_twice(self):
+        self.state.record_recent_title("Same story", "2026-08-13")
+        self.state.record_recent_title("Same story", "2026-08-13")
+        titles = self.state.recent_titles(window_days=7, today="2026-08-13")
+        self.assertEqual(titles.count("Same story"), 1)
 
 
 if __name__ == "__main__":
