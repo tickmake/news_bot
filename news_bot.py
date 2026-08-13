@@ -1852,17 +1852,64 @@ def build_health_report() -> str:
     )
 
 
-def compose_briefing(now: Optional[datetime] = None) -> str:
+@dataclass
+class Briefing:
+    """A rendered briefing plus the headline keys it is responsible for.
+
+    Keys are marked seen only after a successful send. Marking them at build
+    time meant a failed send permanently suppressed a day of news.
+    """
+
+    message: str
+    pending: List[Tuple[str, str]] = field(default_factory=list)
+    titles: List[str] = field(default_factory=list)
+
+
+def _pending_keys(section: str, selections: List[Selection]) -> List[Tuple[str, str]]:
+    """Every key for shown headlines and the duplicates collapsed into them."""
+    pending: List[Tuple[str, str]] = []
+    for selection in selections:
+        for candidate in [selection.candidate] + list(selection.duplicates):
+            for key in _headline_keys(candidate.title, candidate.url):
+                pending.append((section, key))
+    return pending
+
+
+def compose_briefing(now: Optional[datetime] = None) -> Briefing:
     now = now or datetime.now()
-    return (
+    norway_text, norway_selections = get_norwegian_morning_news()
+    global_text, global_selections = get_global_news()
+    business_text, business_selections = get_business_and_stocks()
+
+    message = (
         build_daily_intro(now)
         + "\n"
-        + get_norwegian_morning_news()[0]
-        + get_global_news()[0]
-        + get_business_and_stocks()[0]
+        + norway_text
+        + global_text
+        + business_text
         + "\n\n"
         + get_trade_candidates()
     )
+    pending = (
+        _pending_keys("norway_news", norway_selections)
+        + _pending_keys("global_news", global_selections)
+        + _pending_keys("business_news", business_selections)
+    )
+    all_selections = norway_selections + global_selections + business_selections
+    titles = [selection.candidate.title for selection in all_selections]
+    return Briefing(message=message, pending=pending, titles=titles)
+
+
+def _commit_briefing(briefing: Briefing) -> None:
+    """Record what was shown. Call only after a confirmed successful send."""
+    date_key = datetime.today().strftime("%Y-%m-%d")
+    by_section: Dict[str, List[str]] = {}
+    for section, key in briefing.pending:
+        by_section.setdefault(section, []).append(key)
+    for section, keys in by_section.items():
+        STATE.mark_headline_seen(section, keys, date_key)
+    for title in briefing.titles:
+        STATE.record_recent_title(title, date_key)
 
 
 def job_daily_briefing(force_hour: Optional[int] = None) -> bool:
@@ -1870,8 +1917,12 @@ def job_daily_briefing(force_hour: Optional[int] = None) -> bool:
     if force_hour is not None:
         run_time = run_time.replace(hour=force_hour, minute=0, second=0, microsecond=0)
     LOGGER.info("briefing_start at=%s", run_time.isoformat())
-    message = compose_briefing(run_time)
-    success = send_telegram_message(message)
+    briefing = compose_briefing(run_time)
+    success = send_telegram_message(briefing.message)
+    if success:
+        _commit_briefing(briefing)
+    else:
+        LOGGER.warning("briefing_send_failed headlines_not_marked=%d", len(briefing.pending))
     STATE.data["last_run_status"] = "success" if success else "failed"
     STATE.save()
     return success
@@ -1901,16 +1952,20 @@ def _command_help_text() -> str:
     )
 
 
+def _send_briefing(now: datetime, chat_id: str) -> None:
+    briefing = compose_briefing(now)
+    if send_telegram_message(briefing.message, chat_id=chat_id):
+        _commit_briefing(briefing)
+
+
 def _handle_command(command: str, chat_id: str) -> None:
     normalized = command.strip().split()[0].lower()
     if normalized == "/now":
-        send_telegram_message(compose_briefing(datetime.now()), chat_id=chat_id)
+        _send_briefing(datetime.now(), chat_id)
     elif normalized == "/morning":
-        now = datetime.now().replace(hour=7, minute=0, second=0, microsecond=0)
-        send_telegram_message(compose_briefing(now), chat_id=chat_id)
+        _send_briefing(datetime.now().replace(hour=7, minute=0, second=0, microsecond=0), chat_id)
     elif normalized == "/evening":
-        now = datetime.now().replace(hour=19, minute=0, second=0, microsecond=0)
-        send_telegram_message(compose_briefing(now), chat_id=chat_id)
+        _send_briefing(datetime.now().replace(hour=19, minute=0, second=0, microsecond=0), chat_id)
     elif normalized == "/watchlist":
         payload = get_business_and_stocks()[0] + "\n\n" + get_trade_candidates()
         send_telegram_message(payload, chat_id=chat_id)

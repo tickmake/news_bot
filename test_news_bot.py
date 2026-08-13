@@ -1045,5 +1045,89 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(selections, [])
 
 
+class MarkOnSendTests(unittest.TestCase):
+    def setUp(self):
+        news_bot.STATE.data["sent_headline_keys"] = {}
+        news_bot.STATE.data["recent_titles"] = {}
+
+    @staticmethod
+    def _briefing():
+        candidate = _cand("Fed holds rates steady", "https://a.example/1")
+        return news_bot.Briefing(
+            message="body",
+            pending=[
+                ("global_news", key)
+                for key in news_bot._headline_keys(candidate.title, candidate.url)
+            ],
+            titles=[candidate.title],
+        )
+
+    def _run_job(self, send_succeeds):
+        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
+            news_bot, "send_telegram_message", return_value=send_succeeds
+        ), patch.object(news_bot.STATE, "save"):
+            return news_bot.job_daily_briefing()
+
+    def _seen(self):
+        return news_bot.STATE.has_seen_headline(
+            "global_news", news_bot._cluster_key("Fed holds rates steady"), window_days=7
+        )
+
+    def test_failed_send_does_not_mark_headlines_seen(self):
+        self.assertFalse(self._run_job(send_succeeds=False))
+        self.assertFalse(self._seen())
+
+    def test_successful_send_marks_headlines_seen(self):
+        self.assertTrue(self._run_job(send_succeeds=True))
+        self.assertTrue(self._seen())
+
+    def test_successful_send_records_titles_for_the_recent_window(self):
+        self._run_job(send_succeeds=True)
+        self.assertIn("Fed holds rates steady", news_bot.STATE.recent_titles(window_days=7))
+
+    def test_failed_send_records_no_titles(self):
+        self._run_job(send_succeeds=False)
+        self.assertEqual(news_bot.STATE.recent_titles(window_days=7), [])
+
+    def test_collapsed_duplicates_are_marked_alongside_the_shown_headline(self):
+        shown = _cand("Fed holds interest rates steady", "https://a.example/1")
+        dupe = _cand("Federal Reserve keeps rates unchanged", "https://b.example/2")
+        selection = news_bot.Selection(candidate=shown, duplicates=[dupe], reason="")
+        pending = news_bot._pending_keys("global_news", [selection])
+        self.assertIn(("global_news", news_bot._cluster_key(dupe.title)), pending)
+
+    def test_every_news_section_contributes_pending_keys(self):
+        """Regression guard: _is_duplicate_headline is read-only, so any section
+        whose selections are not committed loses deduplication entirely."""
+        selection = news_bot.Selection(
+            candidate=_cand("Business story", "https://a.example/b"), duplicates=[], reason=""
+        )
+        with patch.object(
+            news_bot, "get_norwegian_morning_news", return_value=("n", [])
+        ), patch.object(news_bot, "get_global_news", return_value=("g", [])), patch.object(
+            news_bot, "get_business_and_stocks", return_value=("b", [selection])
+        ), patch.object(
+            news_bot, "get_trade_candidates", return_value="t"
+        ), patch.object(
+            news_bot, "build_daily_intro", return_value="i"
+        ):
+            briefing = news_bot.compose_briefing(datetime(2026, 8, 13, 7, 0))
+        sections = {section for section, _key in briefing.pending}
+        self.assertIn("business_news", sections)
+
+    def test_command_briefing_commits_only_on_success(self):
+        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
+            news_bot, "send_telegram_message", return_value=False
+        ):
+            news_bot._send_briefing(datetime(2026, 8, 13, 7, 0), "chat-1")
+        self.assertFalse(self._seen())
+
+        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
+            news_bot, "send_telegram_message", return_value=True
+        ):
+            news_bot._send_briefing(datetime(2026, 8, 13, 7, 0), "chat-1")
+        self.assertTrue(self._seen())
+
+
 if __name__ == "__main__":
     unittest.main()
