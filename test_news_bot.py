@@ -97,8 +97,10 @@ class NewsBotTests(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.text = (
             "<rss><channel>"
-            "<item><title>Title 1</title><link>https://example.com/1</link></item>"
-            "<item><title>Title 2</title><link>https://example.com/2</link></item>"
+            "<item><title>Fed holds interest rates steady</title>"
+            "<link>https://example.com/1</link></item>"
+            "<item><title>Norway raises fuel duty next year</title>"
+            "<link>https://example.com/2</link></item>"
             "</channel></rss>"
         )
         mock_response.raise_for_status.return_value = None
@@ -107,12 +109,14 @@ class NewsBotTests(unittest.TestCase):
         with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
             news_bot.SETTINGS, "freenews_api_key", ""
         ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot.SETTINGS, "news_ranker_enabled", False
+        ), patch.object(
             news_bot, "_source_allowed", return_value=True
         ):
-            result = news_bot.get_global_news()
+            result, _ = news_bot.get_global_news()
 
         self.assertIn("Top Global News", result)
-        self.assertIn("Title 1", result)
+        self.assertIn("Fed holds interest rates steady", result)
         self.assertIn("https://example.com/2", result)
 
     @patch("news_bot.requests.get")
@@ -128,9 +132,11 @@ class NewsBotTests(unittest.TestCase):
         with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
             news_bot.SETTINGS, "freenews_api_key", ""
         ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot.SETTINGS, "news_ranker_enabled", False
+        ), patch.object(
             news_bot, "_source_allowed", return_value=True
         ):
-            result = news_bot.get_global_news()
+            result, _ = news_bot.get_global_news()
         self.assertIn("Public headline", result)
 
     @patch("news_bot.requests.get")
@@ -147,34 +153,44 @@ class NewsBotTests(unittest.TestCase):
         with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
             news_bot.SETTINGS, "freenews_api_key", ""
         ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            news_bot.SETTINGS, "news_ranker_enabled", False
+        ), patch.object(
             news_bot, "_source_allowed", return_value=True
         ):
-            result = news_bot.get_norwegian_morning_news()
+            result, _ = news_bot.get_norwegian_morning_news()
 
         self.assertIn("Early Morning Norway News", result)
         self.assertIn("NRK headline", result)
         self.assertIn("https://example.no/1", result)
 
     @patch("news_bot.requests.get")
-    def test_get_global_news_prefers_newsapi_when_key_present(self, mock_get):
+    def test_get_global_news_pools_api_and_rss_providers(self, mock_get):
         news_bot.STATE.data["sent_headline_keys"] = {}
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = {
-            "articles": [
-                {"title": "API headline", "url": "https://example.com/api"},
-            ]
+            "articles": [{"title": "API headline", "url": "https://example.com/api"}]
         }
+        mock_response.text = (
+            "<rss><channel>"
+            "<item><title>RSS headline</title><link>https://example.com/rss</link></item>"
+            "</channel></rss>"
+        )
         mock_get.return_value = mock_response
 
         with patch.object(news_bot.SETTINGS, "news_api_key", "abc"), patch.object(
             news_bot.SETTINGS, "freenews_api_key", ""
         ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
             news_bot.SETTINGS, "news_fetch_priority", "newsapi,rss"
+        ), patch.object(
+            news_bot.SETTINGS, "news_ranker_enabled", False
         ), patch.object(news_bot, "_source_allowed", return_value=True):
-            result = news_bot.get_global_news()
+            result, _selections = news_bot.get_global_news()
 
+        # Both providers now contribute to one pool rather than the first
+        # provider short-circuiting the rest.
         self.assertIn("API headline", result)
+        self.assertIn("RSS headline", result)
 
     def test_active_finnhub_key_supports_legacy_env_name(self):
         with patch.object(news_bot.SETTINGS, "finnhub_api_key", ""), patch.object(
@@ -188,7 +204,8 @@ class NewsBotTests(unittest.TestCase):
         news_bot.STATE.data["sent_headline_keys"] = {}
         mock_news_section.return_value = (
             "💼 Top Business Stories:\n"
-            '1. Market headline (<a href="https://example.com/market">more</a>)\n'
+            '1. Market headline (<a href="https://example.com/market">more</a>)\n',
+            [],
         )
         mock_collect_live.return_value = [
             {
@@ -210,7 +227,7 @@ class NewsBotTests(unittest.TestCase):
         with patch.object(news_bot.SETTINGS, "finnhub_api_key", ""), patch.object(
             news_bot.SETTINGS, "finhub_api_key", ""
         ):
-            result = news_bot.get_business_and_stocks()
+            result, _selections = news_bot.get_business_and_stocks()
         self.assertIn("Top Business Stories", result)
         self.assertIn("Market headline", result)
         self.assertIn("Live Stock Movers", result)
@@ -943,6 +960,89 @@ class SelectorFactoryTests(unittest.TestCase):
         finally:
             if saved is not None:
                 os.environ["ANTHROPIC_API_KEY"] = saved
+
+
+class PipelineIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        news_bot.STATE.data["sent_headline_keys"] = {}
+        news_bot.STATE.data["recent_titles"] = {}
+
+    @staticmethod
+    def _rss(*items):
+        """items: (title, pubdate_or_None) pairs."""
+        body = "".join(
+            f"<item><title>{title}</title><link>https://example.com/{i}</link>"
+            + (f"<pubDate>{pub}</pubDate>" if pub else "")
+            + "</item>"
+            for i, (title, pub) in enumerate(items)
+        )
+        response = MagicMock()
+        response.text = f"<rss><channel>{body}</channel></rss>"
+        response.raise_for_status.return_value = None
+        return response
+
+    @staticmethod
+    def _patches():
+        return (
+            patch.object(news_bot.SETTINGS, "news_api_key", ""),
+            patch.object(news_bot.SETTINGS, "freenews_api_key", ""),
+            patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""),
+            patch.object(news_bot.SETTINGS, "news_ranker_enabled", False),
+            patch.object(news_bot, "_source_allowed", return_value=True),
+        )
+
+    def _run(self, mock_get, response):
+        mock_get.return_value = response
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            return news_bot.get_global_news()
+        finally:
+            for item in patches:
+                item.stop()
+
+    @patch("news_bot.requests.get")
+    def test_section_renders_and_returns_selections(self, mock_get):
+        fresh = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        rendered, selections = self._run(
+            mock_get, self._rss(("Fed rate decision", fresh), ("Norway budget talks", fresh))
+        )
+        self.assertIn("Top Global News", rendered)
+        self.assertGreaterEqual(len(selections), 1)
+
+    @patch("news_bot.requests.get")
+    def test_empty_pool_renders_the_empty_message(self, mock_get):
+        response = MagicMock()
+        response.text = "<rss><channel></channel></rss>"
+        response.raise_for_status.return_value = None
+        rendered, selections = self._run(mock_get, response)
+        self.assertIn("No fresh global headlines", rendered)
+        self.assertEqual(selections, [])
+
+    @patch("news_bot.requests.get")
+    def test_stale_dated_items_are_dropped_by_the_ceiling(self, mock_get):
+        rendered, selections = self._run(
+            mock_get, self._rss(("Ancient story", "Mon, 01 Jun 2020 10:00:00 GMT"))
+        )
+        self.assertEqual(selections, [])
+        self.assertIn("No fresh global headlines", rendered)
+
+    @patch("news_bot.requests.get")
+    def test_undated_items_survive_the_ceiling(self, mock_get):
+        rendered, selections = self._run(mock_get, self._rss(("Undated story", None)))
+        self.assertIn("Undated story", rendered)
+        self.assertEqual(len(selections), 1)
+
+    @patch("news_bot.requests.get")
+    def test_already_seen_headline_is_suppressed(self, mock_get):
+        fresh = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        today = datetime.today().strftime("%Y-%m-%d")
+        news_bot.STATE.mark_headline_seen(
+            "global_news", news_bot._headline_keys("Seen already", None), today
+        )
+        rendered, selections = self._run(mock_get, self._rss(("Seen already", fresh)))
+        self.assertEqual(selections, [])
 
 
 if __name__ == "__main__":

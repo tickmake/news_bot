@@ -1231,6 +1231,57 @@ def _build_selector(section: str, now: datetime) -> Selector:
     )
 
 
+def _collect_candidates(scope: str, feed_urls: List[str], pool_size: int) -> List[Candidate]:
+    """Pool every configured provider rather than stopping at the first.
+
+    Cross-outlet deduplication is impossible without this: you cannot collapse
+    duplicates you never fetched. NEWS_FETCH_PRIORITY now orders the pool
+    rather than selecting a single provider.
+    """
+    raw: List[Tuple[str, Optional[str], Optional[datetime], str]] = []
+    for provider in _news_provider_priority():
+        try:
+            if provider == "newsapi":
+                items = _fetch_newsapi_items(scope, max_items=pool_size)
+            elif provider == "freenews":
+                items = _fetch_freenews_items(scope, max_items=pool_size)
+            elif provider == "rss":
+                items = _fetch_rss_from_feeds(feed_urls, max_items=pool_size)
+            else:
+                continue
+        except Exception as exc:
+            LOGGER.warning("provider_failed provider=%s detail=%s", provider, exc)
+            continue
+        for title, url, published in items:
+            raw.append((title, url, published, provider))
+
+    now = datetime.now(timezone.utc)
+    max_age = max(1, SETTINGS.news_max_age_hours)
+    candidates: List[Candidate] = []
+    seen_exact: set = set()
+
+    for title, url, published, provider in raw:
+        if not title:
+            continue
+        if not _source_allowed(url):
+            continue
+        candidate = _make_candidate(title, url, published, provider)
+        age = _age_hours(candidate, now)
+        # Undated items are exempt: some feeds expose no date at all, and
+        # dropping them would silently remove an entire source.
+        if age is not None and age > max_age:
+            continue
+        exact = _headline_key(candidate.title, candidate.url)
+        if exact in seen_exact:
+            continue
+        seen_exact.add(exact)
+        candidates.append(candidate)
+        if len(candidates) >= pool_size:
+            break
+
+    return candidates
+
+
 def _build_news_section(
     section_key: str,
     scope: str,
@@ -1238,39 +1289,50 @@ def _build_news_section(
     feed_urls: List[str],
     empty_message: str,
     max_headlines: int = 5,
-) -> str:
-    date_key = datetime.today().strftime("%Y-%m-%d")
+) -> Tuple[str, List[Selection]]:
+    pool_size = max(max_headlines, SETTINGS.news_candidate_pool_size)
+    pool = _collect_candidates(scope, feed_urls, pool_size)
+
+    # Suppress anything already shown inside the dedup window.
+    eligible = [
+        candidate
+        for candidate in pool
+        if not _is_duplicate_headline(section_key, candidate.title, candidate.url)
+    ]
+
+    now = datetime.now(timezone.utc)
+    selector = _build_selector(section_key, now)
+    selections = selector.select(eligible, section_key, max_headlines)
+
+    # LlmSelector returns [] on any failure; fall through to the heuristic.
+    if not selections and eligible and not isinstance(selector, HeuristicSelector):
+        RANKER_STATUS["path"] = "heuristic"
+        selections = HeuristicSelector(now=now).select(eligible, section_key, max_headlines)
+
+    collapsed = sum(len(selection.duplicates) for selection in selections)
+    LOGGER.info(
+        "news_select section=%s pool=%d eligible=%d selected=%d collapsed=%d path=%s latency_ms=%s",
+        section_key,
+        len(pool),
+        len(eligible),
+        len(selections),
+        collapsed,
+        RANKER_STATUS["path"],
+        RANKER_STATUS["latency_ms"],
+    )
+
     lines = [title]
-    count = 0
-
-    source_candidates: List[Tuple[str, List[Tuple[str, Optional[str], Optional[datetime]]]]] = []
-    for provider in _news_provider_priority():
-        if provider == "newsapi":
-            source_candidates.append(("newsapi", _fetch_newsapi_items(scope, max_items=20)))
-        elif provider == "freenews":
-            source_candidates.append(("freenews", _fetch_freenews_items(scope, max_items=20)))
-        elif provider == "rss":
-            source_candidates.append(("rss", _fetch_rss_from_feeds(feed_urls, max_items=30)))
-
-    for _provider, headlines in source_candidates:
-        for headline, url, _published in headlines:
-            if not _source_allowed(url):
-                continue
-            if _is_duplicate_headline(section_key, headline, url):
-                continue
-            count += 1
-            lines.append(_format_headline_line(count, headline, url))
-            if count >= max_headlines:
-                break
-        if count >= max_headlines:
-            break
-
-    if count == 0:
+    if not selections:
         lines.append(empty_message)
-    return "\n".join(lines) + "\n\n"
+    else:
+        for index, selection in enumerate(selections, start=1):
+            lines.append(
+                _format_headline_line(index, selection.candidate.title, selection.candidate.url)
+            )
+    return "\n".join(lines) + "\n\n", selections
 
 
-def get_global_news() -> str:
+def get_global_news() -> Tuple[str, List[Selection]]:
     return _build_news_section(
         section_key="global_news",
         scope="global",
@@ -1280,7 +1342,7 @@ def get_global_news() -> str:
     )
 
 
-def get_norwegian_morning_news() -> str:
+def get_norwegian_morning_news() -> Tuple[str, List[Selection]]:
     return _build_news_section(
         section_key="norway_news",
         scope="norway",
@@ -1550,15 +1612,16 @@ def _build_live_universe(limit: int = 40) -> Dict[str, str]:
     return universe
 
 
-def get_business_and_stocks() -> str:
-    biz_str = _build_news_section(
+def get_business_and_stocks() -> Tuple[str, List[Selection]]:
+    biz_str, biz_selections = _build_news_section(
         section_key="business_news",
         scope="business",
         title="💼 Top Business Stories:",
         feed_urls=BUSINESS_NEWS_FEEDS,
         empty_message="No fresh business headlines available right now.",
         max_headlines=8,
-    ).strip()
+    )
+    biz_str = biz_str.strip()
 
     quotes = _collect_live_quotes(STOCK_SCREENERS + FUND_SCREENERS, count_per_screener=SETTINGS.screener_quote_limit)
     stock_quotes = [quote for quote in quotes if _is_stock_quote(quote)]
@@ -1580,7 +1643,7 @@ def get_business_and_stocks() -> str:
 
     stock_str = "\n".join(stock_section)
     fund_str = "\n".join(fund_section)
-    return f"{biz_str}\n\n{stock_str}\n\n{fund_str}"
+    return f"{biz_str}\n\n{stock_str}\n\n{fund_str}", biz_selections
 
 
 def _compute_atr_percent(history: Any) -> Optional[float]:
@@ -1794,9 +1857,9 @@ def compose_briefing(now: Optional[datetime] = None) -> str:
     return (
         build_daily_intro(now)
         + "\n"
-        + get_norwegian_morning_news()
-        + get_global_news()
-        + get_business_and_stocks()
+        + get_norwegian_morning_news()[0]
+        + get_global_news()[0]
+        + get_business_and_stocks()[0]
         + "\n\n"
         + get_trade_candidates()
     )
@@ -1849,7 +1912,7 @@ def _handle_command(command: str, chat_id: str) -> None:
         now = datetime.now().replace(hour=19, minute=0, second=0, microsecond=0)
         send_telegram_message(compose_briefing(now), chat_id=chat_id)
     elif normalized == "/watchlist":
-        payload = get_business_and_stocks() + "\n\n" + get_trade_candidates()
+        payload = get_business_and_stocks()[0] + "\n\n" + get_trade_candidates()
         send_telegram_message(payload, chat_id=chat_id)
     elif normalized == "/health":
         send_telegram_message(build_health_report(), chat_id=chat_id)
