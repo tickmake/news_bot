@@ -698,6 +698,27 @@ class HeuristicSelectorTests(unittest.TestCase):
         result = self.selector.select(pool, "global", 1)
         self.assertEqual(result[0].candidate.url, "https://a.example/fed")
 
+    def test_downweight_survives_a_colliding_upweight_keyword(self):
+        """A celebrity story mentioning Oslo must not inherit Norway's boost.
+
+        Taking max() of matched weights made down-weights inert whenever any
+        up-weight keyword also matched.
+        """
+        pool = [
+            _cand("Actor spotted at film premiere in Oslo", "https://a.example/celeb"),
+            _cand("Bond yields rise ahead of Treasury auction", "https://a.example/bonds"),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/bonds")
+
+    def test_pure_upweight_still_outranks_a_collision(self):
+        pool = [
+            _cand("Actor spotted at film premiere in Oslo", "https://a.example/celeb"),
+            _cand("Norges Bank signals rate decision for Norway", "https://a.example/nb"),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/nb")
+
     def test_downweighted_story_still_appears_when_nothing_better_exists(self):
         pool = [_cand("Football match ends in a draw", "https://a.example/sport")]
         self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
@@ -898,6 +919,40 @@ class LlmSelectorTests(unittest.TestCase):
         self.assertEqual(t.body["format"], news_bot.RANKER_RESPONSE_SCHEMA)
         self.assertEqual(t.body["model"], news_bot.SETTINGS.news_ranker_model)
         self.assertFalse(t.body["stream"])
+
+    def test_pool_is_shortlisted_before_the_call(self):
+        """Local inference times out on a full pool, so only the heuristic's
+        best N are sent."""
+        pool = [
+            _cand(title, f"https://a.example/{i}")
+            for i, title in enumerate(DISTINCT_HEADLINES)
+        ]
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 3):
+            selector.select(pool, "global", 2)
+        sent = t.body["messages"][1]["content"]
+        self.assertEqual(sent.count("\n["), 3)
+
+    def test_shortlist_keeps_ids_aligned_with_what_was_sent(self):
+        """Returned ids index the shortlist, not the original pool."""
+        pool = [
+            _cand("Celebrity wedding photos revealed", "https://a.example/celeb"),
+            _cand("Fed signals inflation rate decision", "https://a.example/fed"),
+        ]
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 1):
+            result = selector.select(pool, "global", 1)
+        # The heuristic ranks the markets story first, so id 0 is that one.
+        self.assertEqual(result[0].candidate.url, "https://a.example/fed")
+
+    def test_small_pool_is_sent_untouched(self):
+        pool = [_cand("Only story", "https://a.example/1")]
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 20):
+            self.assertEqual(len(selector.select(pool, "global", 5)), 1)
 
     def test_request_is_deterministic(self):
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})

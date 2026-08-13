@@ -122,9 +122,14 @@ class AppSettings(BaseSettings):
     # Ollama-compatible endpoint. In docker-compose this is the bundled service;
     # point it at any other host to reuse an existing Ollama instance.
     news_ranker_url: str = "http://localhost:11434"
-    news_ranker_model: str = "qwen2.5:7b"
-    # Local inference is slower than a hosted API, especially on CPU.
-    news_ranker_timeout_seconds: int = 120
+    news_ranker_model: str = "llama3.2:3b"
+    # Local CPU inference is slow. Measured on the Raspberry Pi 5 target with a
+    # warm llama3.2:3b: 20 candidates ~74s, 40 ~150s.
+    news_ranker_timeout_seconds: int = 240
+    # The LLM re-ranks the heuristic's top N rather than the whole pool. The
+    # pool stays large so cross-outlet dedup and the heuristic keep their
+    # breadth, while the slow path sees a manageable, already-good shortlist.
+    news_ranker_max_candidates: int = 20
     trade_min_score: int = 3
     trade_min_week_momentum_pct: float = 1.0
     trade_min_day_change_pct: float = 0.0
@@ -997,15 +1002,27 @@ class HeuristicSelector:
         return pow(2.0, -age / RECENCY_HALF_LIFE_HOURS)
 
     def _topic_score(self, candidate: Candidate) -> float:
+        """Combine matched categories, applying down-weights as a penalty.
+
+        Taking max() of matched weights made down-weights inert whenever any
+        up-weight keyword also matched, so "Actor spotted at film premiere in
+        Oslo" inherited Norway's full boost from the word "Oslo". Boosts and
+        penalties are combined instead, so a story carrying both signals lands
+        below neutral without being excluded outright.
+        """
         haystack = candidate.title.casefold()
         matched = [
             self.weights[name]
             for name, spec in TOPIC_CATEGORIES.items()
             if any(keyword in haystack for keyword in spec["keywords"])
         ]
-        if not matched:
-            return NEUTRAL_TOPIC_WEIGHT / 2.0
-        return max(matched) / 2.0
+        boosts = [weight for weight in matched if weight > NEUTRAL_TOPIC_WEIGHT]
+        penalties = [weight for weight in matched if weight < NEUTRAL_TOPIC_WEIGHT]
+
+        score = max(boosts) if boosts else NEUTRAL_TOPIC_WEIGHT
+        if penalties:
+            score *= min(penalties)
+        return score / 2.0
 
     def _score(self, candidate: Candidate) -> float:
         return (
@@ -1145,10 +1162,24 @@ class LlmSelector:
             )
         return "Candidates:\n" + "\n".join(lines)
 
+    def _shortlist(self, pool: List[Candidate]) -> List[Candidate]:
+        """Cut the pool to the heuristic's best N before the slow LLM call.
+
+        Latency scales with candidate count and local CPU inference is slow, so
+        handing the model the whole pool times out. Pre-ranking keeps the pool
+        wide for dedup and the heuristic while the LLM re-ranks a shortlist.
+        """
+        cap = max(1, SETTINGS.news_ranker_max_candidates)
+        if len(pool) <= cap:
+            return pool
+        scorer = HeuristicSelector(now=self.now)
+        return sorted(pool, key=lambda c: (-scorer._score(c), c.title))[:cap]
+
     def select(self, pool: List[Candidate], section: str, limit: int) -> List[Selection]:
         if not pool or self.transport is None:
             return []
 
+        pool = self._shortlist(pool)
         started = time.time()
         try:
             response = self.transport(

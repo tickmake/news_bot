@@ -1,25 +1,23 @@
 services:
+  # Optional bundled Ollama, for hosts that do not already run one.
+  # Off by default -- start it with:  docker compose --profile bundled-ollama up
+  # If you already run an Ollama container named `ollama` (see
+  # RANKER_NETWORK below), leave this profile off and the bot will use it.
   ollama:
+    profiles: ["bundled-ollama"]
     image: ollama/ollama:latest
     container_name: news_bot_ollama
     restart: unless-stopped
     volumes:
       # Models are large; keep them out of the image and across restarts.
       - ollama_models:/root/.ollama
-    # Not published to the host by default — only the bot needs to reach it.
-    # Uncomment to inspect the API from your machine:
-    # ports:
-    #   - "11434:11434"
     healthcheck:
-      # The bot degrades to heuristic ranking if Ollama is down, so this gates
-      # startup order only; it is not a hard dependency.
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 60s
     # Uncomment for NVIDIA GPU acceleration (needs nvidia-container-toolkit).
-    # Without this Ollama runs on CPU, which is slower but works.
     # deploy:
     #   resources:
     #     reservations:
@@ -28,10 +26,10 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 
-  # One-shot: pulls the ranking model into the shared volume, then exits.
-  # Without this the first briefing falls back to heuristic ranking while
-  # Ollama downloads the model on demand.
+  # One-shot model pull for the bundled Ollama. Same profile, so it only runs
+  # when the bundled service does.
   ollama-pull:
+    profiles: ["bundled-ollama"]
     image: ollama/ollama:latest
     container_name: news_bot_ollama_pull
     depends_on:
@@ -49,16 +47,17 @@ services:
     command:
       - >
         until ollama list >/dev/null 2>&1; do echo "waiting for ollama"; sleep 3; done;
-        ollama pull '${NEWS_RANKER_MODEL:-qwen2.5:7b}'
+        ollama pull '${NEWS_RANKER_MODEL:-llama3.2:3b}'
     restart: "no"
 
   news-notifier:
     build: . # 👈 This tells Portainer to look for the Dockerfile in your Git repo
     container_name: daily_news_bot
     restart: unless-stopped
-    depends_on:
-      ollama:
-        condition: service_started
+    networks:
+      - default
+      # Lets the bot resolve an Ollama running in another compose project.
+      - ranker
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
@@ -71,17 +70,38 @@ services:
       - FREENEWS_API_URL=${FREENEWS_API_URL}
       - FINNHUB_API_URL=${FINNHUB_API_URL}
       - TZ=${TZ}
-      # News ranking. The bot reaches Ollama over the compose network; if it is
-      # unreachable the briefing still renders via the heuristic ranker.
+      # News ranking. `ollama` resolves to whichever Ollama is on the ranker
+      # network -- the bundled service or a pre-existing container of that
+      # name. If it is unreachable the briefing still renders via the
+      # heuristic ranker, so this is never a hard dependency.
       - NEWS_RANKER_ENABLED=${NEWS_RANKER_ENABLED:-true}
       - NEWS_RANKER_URL=${NEWS_RANKER_URL:-http://ollama:11434}
-      - NEWS_RANKER_MODEL=${NEWS_RANKER_MODEL:-qwen2.5:7b}
-      - NEWS_RANKER_TIMEOUT_SECONDS=${NEWS_RANKER_TIMEOUT_SECONDS:-120}
-      - NEWS_MAX_AGE_HOURS=${NEWS_MAX_AGE_HOURS:-30}
+      - NEWS_RANKER_MODEL=${NEWS_RANKER_MODEL:-llama3.2:3b}
+      # Measured on a Raspberry Pi 5 with a warm llama3.2:3b: 20 candidates
+      # ~74s, 40 ~150s. Keep the shortlist small and the timeout generous.
+      - NEWS_RANKER_TIMEOUT_SECONDS=${NEWS_RANKER_TIMEOUT_SECONDS:-240}
+      - NEWS_RANKER_MAX_CANDIDATES=${NEWS_RANKER_MAX_CANDIDATES:-20}
+      # The fetch pool stays wide so cross-outlet dedup and the heuristic keep
+      # their breadth; only the LLM sees the shortlist above.
       - NEWS_CANDIDATE_POOL_SIZE=${NEWS_CANDIDATE_POOL_SIZE:-60}
+      - NEWS_MAX_AGE_HOURS=${NEWS_MAX_AGE_HOURS:-30}
       - NEWS_DEDUP_WINDOW_DAYS=${NEWS_DEDUP_WINDOW_DAYS:-7}
       - NEWS_RECENT_TITLE_DAYS=${NEWS_RECENT_TITLE_DAYS:-3}
       - NEWS_TOPIC_WEIGHTS=${NEWS_TOPIC_WEIGHTS}
+
+networks:
+  default:
+  # Network carrying the Ollama the bot should talk to.
+  #
+  # Default is the bundled service's own network. To reuse an Ollama from
+  # another compose project, set RANKER_NETWORK to that project's network and
+  # RANKER_NETWORK_EXTERNAL=true, e.g. in .env:
+  #   RANKER_NETWORK=poster-bot_default
+  #   RANKER_NETWORK_EXTERNAL=true
+  # Find it with: docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' ollama
+  ranker:
+    name: ${RANKER_NETWORK:-daily-news-bot_ranker}
+    external: ${RANKER_NETWORK_EXTERNAL:-false}
 
 volumes:
   ollama_models:

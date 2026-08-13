@@ -142,13 +142,39 @@ The heuristic path is used whenever the LLM path is unavailable *or fails*:
 Ollama not running, model not pulled, timeout, or malformed response. A
 section always renders.
 
-`docker compose up` starts Ollama alongside the bot and pulls the ranking
-model into a named volume on first run. Running outside Docker, start Ollama
-yourself and set `NEWS_RANKER_URL=http://localhost:11434`:
+The LLM does not see the whole candidate pool. The heuristic pre-ranks and
+the LLM re-ranks its top `NEWS_RANKER_MAX_CANDIDATES` — so the pool stays
+wide enough for cross-outlet deduplication while the slow path only handles
+a short, already-good list. Latency scales with that number, not pool size.
+
+**Connecting to Ollama.** By default the bot talks to a host named `ollama`
+on the *ranker network*. Two ways to provide it:
+
+- *Reuse an existing Ollama* (recommended if you already run one). Point the
+  ranker network at that project's network in `.env`:
+
+  ```bash
+  RANKER_NETWORK=poster-bot_default
+  RANKER_NETWORK_EXTERNAL=true
+  ```
+
+  Find the network name with:
+  `docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' ollama`
+
+- *Use the bundled service*, off by default so it never duplicates an Ollama
+  you already run:
+
+  ```bash
+  docker compose --profile bundled-ollama up -d
+  ```
+
+  This starts Ollama and pulls `NEWS_RANKER_MODEL` into a named volume.
+
+Outside Docker, run Ollama yourself and set
+`NEWS_RANKER_URL=http://localhost:11434`:
 
 ```bash
-ollama serve &
-ollama pull qwen2.5:7b
+ollama pull llama3.2:3b
 ```
 
 Note that `NEWS_FETCH_PRIORITY` now orders a single pooled candidate set
@@ -159,8 +185,11 @@ each send, which is what makes cross-outlet deduplication possible.
 |---|---|---|
 | `NEWS_RANKER_ENABLED` | `true` | Kill switch |
 | `NEWS_RANKER_URL` | `http://localhost:11434` | Ollama endpoint (compose sets `http://ollama:11434`) |
-| `NEWS_RANKER_MODEL` | `qwen2.5:7b` | Ranking model; must be pulled into Ollama |
-| `NEWS_RANKER_TIMEOUT_SECONDS` | `120` | Per-call timeout |
+| `NEWS_RANKER_MODEL` | `llama3.2:3b` | Ranking model; must be pulled into Ollama |
+| `NEWS_RANKER_MAX_CANDIDATES` | `20` | Shortlist size sent to the LLM |
+| `NEWS_RANKER_TIMEOUT_SECONDS` | `240` | Per-call timeout |
+| `RANKER_NETWORK` | bundled net | Network carrying Ollama |
+| `RANKER_NETWORK_EXTERNAL` | `false` | Set `true` to reuse another project's network |
 | `NEWS_MAX_AGE_HOURS` | `30` | Freshness ceiling; undated items exempt |
 | `NEWS_CANDIDATE_POOL_SIZE` | `60` | Candidates ranked per section |
 | `NEWS_DEDUP_WINDOW_DAYS` | `7` | Cross-day suppression window (includes today) |
@@ -172,11 +201,22 @@ Topic categories are `markets`, `norway`, `india`, `tech` (up-weighted) and
 Down-weighting is not exclusion — a low-weight headline still appears when
 nothing better is available.
 
-There is no per-briefing cost — the trade is hardware instead. `qwen2.5:7b`
-needs roughly 5–6 GB of RAM and ranks a 60-headline pool in a few seconds on
-a GPU, or tens of seconds on CPU. Drop to `qwen2.5:3b` on a constrained host,
-accepting weaker schema adherence, or raise to a 14b model if you have the
-memory. GPU acceleration is a commented-out block in `docker-compose.yml`.
+There is no per-briefing cost — the trade is hardware instead. Measured on a
+Raspberry Pi 5 (CPU only) against a warm `llama3.2:3b`:
+
+| Candidates sent | Latency |
+|---|---|
+| 10 | ~51 s |
+| 20 | ~74 s |
+| 40 | ~150 s |
+
+Hence the default shortlist of 20 and the 240 s timeout. Small models are the
+weak link on quality, not just speed: in testing, `llama3.2:3b` collapsed
+obvious repeats correctly but missed a genuine cross-outlet duplicate and
+paired two different central banks as the same story. If ranking quality
+matters more than keeping everything on one small box, point
+`NEWS_RANKER_URL` at a machine running a 7B+ model. GPU acceleration for the
+bundled service is a commented-out block in `docker-compose.yml`.
 
 Run `/health` to see which path is active, the model, call latency, and the
 last ranker error.
