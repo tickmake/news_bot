@@ -760,36 +760,37 @@ class HeuristicSelectorTests(unittest.TestCase):
         self.assertGreaterEqual(total, 2)
 
 
-def _text_response(text, stop_reason="end_turn"):
-    block = MagicMock()
-    block.type = "text"
-    block.text = text
+def _ollama_response(payload_text, status=200):
+    """Stub of an Ollama /api/chat response."""
     response = MagicMock()
-    response.content = [block]
-    response.stop_reason = stop_reason
+    response.status_code = status
+    response.json.return_value = {"message": {"role": "assistant", "content": payload_text}}
+    response.raise_for_status.return_value = None
     return response
 
 
-class _StubMessages:
-    def __init__(self, payload=None, exception=None, stop_reason="end_turn"):
+class _StubTransport:
+    """Records calls and returns a canned Ollama response."""
+
+    def __init__(self, payload=None, exception=None, raw_text=None, response=None):
         self.payload = payload
         self.exception = exception
-        self.stop_reason = stop_reason
+        self.raw_text = raw_text
+        self.response = response
         self.calls = []
 
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
+    def __call__(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
         if self.exception is not None:
             raise self.exception
-        return _text_response(json.dumps(self.payload), self.stop_reason)
+        if self.response is not None:
+            return self.response
+        text = self.raw_text if self.raw_text is not None else json.dumps(self.payload)
+        return _ollama_response(text)
 
-
-class _StubClient:
-    def __init__(self, payload=None, exception=None, stop_reason="end_turn"):
-        self.messages = _StubMessages(payload, exception, stop_reason)
-
-    def with_options(self, **_kwargs):
-        return self
+    @property
+    def body(self):
+        return self.calls[0]["json"]
 
 
 class LlmSelectorTests(unittest.TestCase):
@@ -800,22 +801,22 @@ class LlmSelectorTests(unittest.TestCase):
             _cand("Norway raises fuel duty", "https://c.example/3"),
         ]
 
-    def _select(self, client, limit=2):
-        selector = news_bot.LlmSelector(client=client, now=FIXED_NOW, recent_titles=[])
+    def _select(self, transport, limit=2):
+        selector = news_bot.LlmSelector(transport=transport, now=FIXED_NOW, recent_titles=[])
         return selector.select(self.pool, "global", limit)
 
     def test_selects_by_returned_index(self):
-        client = _StubClient({"selections": [{"id": 2, "duplicate_ids": [], "reason": "big"}]})
-        self.assertEqual(self._select(client)[0].candidate.url, "https://c.example/3")
+        t = _StubTransport({"selections": [{"id": 2, "duplicate_ids": [], "reason": "big"}]})
+        self.assertEqual(self._select(t)[0].candidate.url, "https://c.example/3")
 
     def test_duplicate_ids_are_attached_to_the_selection(self):
-        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [1], "reason": "dupe"}]})
-        result = self._select(client)
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [1], "reason": "dupe"}]})
+        result = self._select(t)
         self.assertEqual(len(result[0].duplicates), 1)
         self.assertEqual(result[0].duplicates[0].url, "https://b.example/2")
 
     def test_out_of_range_ids_are_dropped(self):
-        client = _StubClient(
+        t = _StubTransport(
             {
                 "selections": [
                     {"id": 99, "duplicate_ids": [], "reason": "bad"},
@@ -823,16 +824,16 @@ class LlmSelectorTests(unittest.TestCase):
                 ]
             }
         )
-        result = self._select(client)
+        result = self._select(t)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].candidate.url, "https://a.example/1")
 
     def test_out_of_range_duplicate_ids_are_dropped(self):
-        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [99], "reason": "x"}]})
-        self.assertEqual(self._select(client)[0].duplicates, [])
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [99], "reason": "x"}]})
+        self.assertEqual(self._select(t)[0].duplicates, [])
 
     def test_non_integer_ids_are_dropped(self):
-        client = _StubClient(
+        t = _StubTransport(
             {
                 "selections": [
                     {"id": "zero", "duplicate_ids": [], "reason": "x"},
@@ -840,12 +841,12 @@ class LlmSelectorTests(unittest.TestCase):
                 ]
             }
         )
-        result = self._select(client)
+        result = self._select(t)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].candidate.url, "https://b.example/2")
 
     def test_repeated_ids_are_deduplicated(self):
-        client = _StubClient(
+        t = _StubTransport(
             {
                 "selections": [
                     {"id": 0, "duplicate_ids": [], "reason": "a"},
@@ -853,44 +854,55 @@ class LlmSelectorTests(unittest.TestCase):
                 ]
             }
         )
-        self.assertEqual(len(self._select(client)), 1)
+        self.assertEqual(len(self._select(t)), 1)
 
     def test_result_is_truncated_to_the_limit(self):
-        client = _StubClient(
+        t = _StubTransport(
             {"selections": [{"id": i, "duplicate_ids": [], "reason": "x"} for i in range(3)]}
         )
-        self.assertEqual(len(self._select(client, limit=2)), 2)
+        self.assertEqual(len(self._select(t, limit=2)), 2)
 
-    def test_empty_pool_does_not_call_the_api(self):
-        client = _StubClient({"selections": []})
-        selector = news_bot.LlmSelector(client=client, now=FIXED_NOW, recent_titles=[])
+    def test_empty_pool_does_not_call_the_model(self):
+        t = _StubTransport({"selections": []})
+        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
         self.assertEqual(selector.select([], "global", 5), [])
-        self.assertEqual(client.messages.calls, [])
+        self.assertEqual(t.calls, [])
 
     def test_recent_titles_are_included_in_the_prompt(self):
-        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
         selector = news_bot.LlmSelector(
-            client=client, now=FIXED_NOW, recent_titles=["Previously shown story"]
+            transport=t, now=FIXED_NOW, recent_titles=["Previously shown story"]
         )
         selector.select(self.pool, "global", 2)
-        self.assertIn("Previously shown story", json.dumps(client.messages.calls[0]))
+        self.assertIn("Previously shown story", json.dumps(t.body))
 
     def test_candidate_titles_are_included_in_the_prompt(self):
-        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
-        self._select(client)
-        self.assertIn("Norway raises fuel duty", json.dumps(client.messages.calls[0]))
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t)
+        self.assertIn("Norway raises fuel duty", json.dumps(t.body))
 
     def test_prompt_frames_candidates_as_untrusted_data(self):
-        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
-        self._select(client)
-        self.assertIn("UNTRUSTED", json.dumps(client.messages.calls[0]))
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t)
+        self.assertIn("UNTRUSTED", json.dumps(t.body))
 
-    def test_request_uses_structured_output_schema(self):
-        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
-        self._select(client)
-        call = client.messages.calls[0]
-        self.assertEqual(call["output_config"]["format"]["type"], "json_schema")
-        self.assertEqual(call["model"], news_bot.SETTINGS.news_ranker_model)
+    def test_request_targets_the_configured_ollama_endpoint(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        with patch.object(news_bot.SETTINGS, "news_ranker_url", "http://ollama:11434"):
+            self._select(t)
+        self.assertEqual(t.calls[0]["url"], "http://ollama:11434/api/chat")
+
+    def test_request_pins_the_json_schema_and_model(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t)
+        self.assertEqual(t.body["format"], news_bot.RANKER_RESPONSE_SCHEMA)
+        self.assertEqual(t.body["model"], news_bot.SETTINGS.news_ranker_model)
+        self.assertFalse(t.body["stream"])
+
+    def test_request_is_deterministic(self):
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t)
+        self.assertEqual(t.body["options"]["temperature"], 0)
 
 
 class LlmSelectorFallthroughTests(unittest.TestCase):
@@ -899,47 +911,58 @@ class LlmSelectorFallthroughTests(unittest.TestCase):
     def setUp(self):
         self.pool = [_cand("Fed holds interest rates steady", "https://a.example/1")]
 
-    def _select_with(self, client):
-        selector = news_bot.LlmSelector(client=client, now=FIXED_NOW, recent_titles=[])
+    def _select_with(self, transport):
+        selector = news_bot.LlmSelector(transport=transport, now=FIXED_NOW, recent_titles=[])
         return selector.select(self.pool, "global", 5)
 
-    def test_missing_client_returns_empty(self):
-        selector = news_bot.LlmSelector(client=None, now=FIXED_NOW, recent_titles=[])
+    def test_missing_transport_returns_empty(self):
+        selector = news_bot.LlmSelector(transport=None, now=FIXED_NOW, recent_titles=[])
         self.assertEqual(selector.select(self.pool, "global", 5), [])
 
-    def test_api_exception_returns_empty(self):
-        self.assertEqual(self._select_with(_StubClient(exception=RuntimeError("boom"))), [])
+    def test_connection_error_returns_empty(self):
+        """The common case: Ollama is not running."""
+        exc = news_bot.requests.exceptions.ConnectionError("refused")
+        self.assertEqual(self._select_with(_StubTransport(exception=exc)), [])
 
-    def test_timeout_exception_returns_empty(self):
-        self.assertEqual(self._select_with(_StubClient(exception=TimeoutError("slow"))), [])
+    def test_timeout_returns_empty(self):
+        exc = news_bot.requests.exceptions.Timeout("too slow")
+        self.assertEqual(self._select_with(_StubTransport(exception=exc)), [])
+
+    def test_http_error_returns_empty(self):
+        response = MagicMock()
+        response.status_code = 404
+        response.raise_for_status.side_effect = news_bot.requests.exceptions.HTTPError(
+            "model not found"
+        )
+        self.assertEqual(self._select_with(_StubTransport(response=response)), [])
 
     def test_malformed_json_returns_empty(self):
-        client = _StubClient()
-        client.messages.create = lambda **_kw: _text_response("not json at all")
-        self.assertEqual(self._select_with(client), [])
+        self.assertEqual(self._select_with(_StubTransport(raw_text="not json at all")), [])
 
     def test_missing_selections_key_returns_empty(self):
-        self.assertEqual(self._select_with(_StubClient({"wrong": []})), [])
+        self.assertEqual(self._select_with(_StubTransport({"wrong": []})), [])
 
-    def test_refusal_stop_reason_returns_empty(self):
-        client = _StubClient(
-            {"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]},
-            stop_reason="refusal",
-        )
-        self.assertEqual(self._select_with(client), [])
+    def test_unexpected_envelope_returns_empty(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"unexpected": "shape"}
+        self.assertEqual(self._select_with(_StubTransport(response=response)), [])
 
     def test_all_ids_invalid_returns_empty(self):
-        client = _StubClient({"selections": [{"id": 99, "duplicate_ids": [], "reason": "x"}]})
-        self.assertEqual(self._select_with(client), [])
+        t = _StubTransport({"selections": [{"id": 99, "duplicate_ids": [], "reason": "x"}]})
+        self.assertEqual(self._select_with(t), [])
 
     def test_failure_is_recorded_for_health(self):
         news_bot.RANKER_STATUS["error"] = None
-        self._select_with(_StubClient(exception=RuntimeError("boom")))
+        self._select_with(_StubTransport(exception=RuntimeError("boom")))
         self.assertIsNotNone(news_bot.RANKER_STATUS["error"])
 
     def test_success_clears_a_previous_error(self):
         news_bot.RANKER_STATUS["error"] = "stale"
-        self._select_with(_StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]}))
+        self._select_with(
+            _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        )
         self.assertIsNone(news_bot.RANKER_STATUS["error"])
 
 
@@ -949,17 +972,20 @@ class SelectorFactoryTests(unittest.TestCase):
             selector = news_bot._build_selector("global", FIXED_NOW)
         self.assertIsInstance(selector, news_bot.HeuristicSelector)
 
-    def test_heuristic_used_when_no_credential(self):
-        saved = os.environ.pop("ANTHROPIC_API_KEY", None)
-        try:
-            with patch.object(news_bot.SETTINGS, "news_ranker_enabled", True), patch.object(
-                news_bot.SETTINGS, "anthropic_api_key", ""
-            ):
-                selector = news_bot._build_selector("global", FIXED_NOW)
-            self.assertIsInstance(selector, news_bot.HeuristicSelector)
-        finally:
-            if saved is not None:
-                os.environ["ANTHROPIC_API_KEY"] = saved
+    def test_heuristic_used_when_no_url_configured(self):
+        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", True), patch.object(
+            news_bot.SETTINGS, "news_ranker_url", ""
+        ):
+            selector = news_bot._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, news_bot.HeuristicSelector)
+
+    def test_llm_selector_used_when_enabled_and_url_present(self):
+        """No credential needed — a reachable local endpoint is the only gate."""
+        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", True), patch.object(
+            news_bot.SETTINGS, "news_ranker_url", "http://ollama:11434"
+        ):
+            selector = news_bot._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, news_bot.LlmSelector)
 
 
 class PipelineIntegrationTests(unittest.TestCase):

@@ -9,7 +9,7 @@ apscheduler==3.10.4
 # Feed bodies are untrusted third-party input; stdlib ElementTree is
 # vulnerable to XML entity-expansion denial of service.
 defusedxml==0.7.1
-# Optional ranking path; the bot falls back to heuristics if this is absent.
-anthropic==0.121.0
+# The news ranker talks to a local Ollama endpoint over plain HTTP via
+# `requests`, so no LLM SDK is needed.
 pydantic==2.13.4
 pydantic-settings==2.11.0

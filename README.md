@@ -25,7 +25,7 @@ The bot is built in Python and scheduled with APScheduler.
 - **Automatic retries/backoff** for external API calls.
 - **Relevance-ranked headlines** by importance, topic weight, and recency — not raw feed order.
 - **Cross-outlet and cross-day deduplication**, so one story appears once.
-- **Optional LLM ranking** via the Anthropic API, with a deterministic heuristic fallback.
+- **Local LLM ranking** via Ollama — no API key, no data leaves your network — with a deterministic heuristic fallback.
 - **Telegram command support** (`/now`, `/morning`, `/evening`, `/watchlist`, `/health`).
 - **Health ping** support for runtime monitoring.
 - **CI test workflow** via GitHub Actions.
@@ -131,15 +131,25 @@ collapses the same story reported by multiple outlets into a single line.
 
 Two ranking paths:
 
-- **LLM ranking** (default when `ANTHROPIC_API_KEY` is set) — catches
-  cross-outlet paraphrase such as "Fed holds rates steady" and "Federal
-  Reserve keeps rates unchanged", which share almost no words.
+- **Local LLM ranking** (default) — a model running in Ollama on your own
+  hardware. Catches cross-outlet paraphrase such as "Fed holds rates steady"
+  and "Federal Reserve keeps rates unchanged", which share almost no words.
+  No API key, no cost per briefing, and no headline ever leaves your network.
 - **Heuristic ranking** (automatic fallback) — recency decay, keyword topic
-  weights, and source tier. No API key, no network, fully deterministic.
+  weights, and source tier. No network at all, fully deterministic.
 
 The heuristic path is used whenever the LLM path is unavailable *or fails*:
-missing key, timeout, rate limit, refusal, or malformed response. A section
-always renders.
+Ollama not running, model not pulled, timeout, or malformed response. A
+section always renders.
+
+`docker compose up` starts Ollama alongside the bot and pulls the ranking
+model into a named volume on first run. Running outside Docker, start Ollama
+yourself and set `NEWS_RANKER_URL=http://localhost:11434`:
+
+```bash
+ollama serve &
+ollama pull qwen2.5:7b
+```
 
 Note that `NEWS_FETCH_PRIORITY` now orders a single pooled candidate set
 rather than selecting one provider — every configured provider is fetched on
@@ -147,11 +157,10 @@ each send, which is what makes cross-outlet deduplication possible.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | unset | Enables LLM ranking |
 | `NEWS_RANKER_ENABLED` | `true` | Kill switch |
-| `NEWS_RANKER_MODEL` | `claude-opus-5` | Ranking model |
-| `NEWS_RANKER_EFFORT` | `low` | Effort level |
-| `NEWS_RANKER_TIMEOUT_SECONDS` | `20` | Per-call timeout |
+| `NEWS_RANKER_URL` | `http://localhost:11434` | Ollama endpoint (compose sets `http://ollama:11434`) |
+| `NEWS_RANKER_MODEL` | `qwen2.5:7b` | Ranking model; must be pulled into Ollama |
+| `NEWS_RANKER_TIMEOUT_SECONDS` | `120` | Per-call timeout |
 | `NEWS_MAX_AGE_HOURS` | `30` | Freshness ceiling; undated items exempt |
 | `NEWS_CANDIDATE_POOL_SIZE` | `60` | Candidates ranked per section |
 | `NEWS_DEDUP_WINDOW_DAYS` | `7` | Cross-day suppression window (includes today) |
@@ -163,8 +172,11 @@ Topic categories are `markets`, `norway`, `india`, `tech` (up-weighted) and
 Down-weighting is not exclusion — a low-weight headline still appears when
 nothing better is available.
 
-Approximate monthly cost at two briefings per day: `claude-opus-5` ~$7,
-`claude-sonnet-5` ~$4, `claude-haiku-4-5` ~$1.50.
+There is no per-briefing cost — the trade is hardware instead. `qwen2.5:7b`
+needs roughly 5–6 GB of RAM and ranks a 60-headline pool in a few seconds on
+a GPU, or tens of seconds on CPU. Drop to `qwen2.5:3b` on a constrained host,
+accepting weaker schema adherence, or raise to a 14b model if you have the
+memory. GPU acceleration is a commented-out block in `docker-compose.yml`.
 
 Run `/health` to see which path is active, the model, call latency, and the
 last ranker error.

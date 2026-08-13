@@ -118,11 +118,13 @@ class AppSettings(BaseSettings):
     news_dedup_window_days: int = 7
     news_recent_title_days: int = 3
     news_topic_weights: str = ""
-    anthropic_api_key: str = ""
     news_ranker_enabled: bool = True
-    news_ranker_model: str = "claude-opus-5"
-    news_ranker_effort: str = "low"
-    news_ranker_timeout_seconds: int = 20
+    # Ollama-compatible endpoint. In docker-compose this is the bundled service;
+    # point it at any other host to reuse an existing Ollama instance.
+    news_ranker_url: str = "http://localhost:11434"
+    news_ranker_model: str = "qwen2.5:7b"
+    # Local inference is slower than a hosted API, especially on CPU.
+    news_ranker_timeout_seconds: int = 120
     trade_min_score: int = 3
     trade_min_week_momentum_pct: float = 1.0
     trade_min_day_change_pct: float = 0.0
@@ -1080,28 +1082,13 @@ RANKER_RESPONSE_SCHEMA: Dict[str, Any] = {
 }
 
 
-def _anthropic_client() -> Any:
-    """Build a client, or return None if unavailable. Never raises."""
-    if not SETTINGS.news_ranker_enabled:
-        return None
-    if not (SETTINGS.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")):
-        return None
-    try:
-        import anthropic  # imported lazily so a missing package cannot block startup
-    except ImportError as exc:
-        LOGGER.warning("anthropic_import_failed detail=%s", exc)
-        return None
-    try:
-        if SETTINGS.anthropic_api_key:
-            return anthropic.Anthropic(api_key=SETTINGS.anthropic_api_key)
-        return anthropic.Anthropic()
-    except Exception as exc:
-        LOGGER.warning("anthropic_client_failed detail=%s", exc)
-        return None
-
-
 class LlmSelector:
-    """Ranks and deduplicates via one Claude call. Returns [] on any failure.
+    """Ranks and deduplicates via one local-LLM call. Returns [] on any failure.
+
+    Talks to an Ollama-compatible /api/chat endpoint over plain HTTP — no SDK
+    and no credential, because the model runs on infrastructure you control.
+    Ollama's `format` parameter takes a JSON schema, so the response is
+    constrained the same way a hosted structured-output call would be.
 
     The model returns indices only, never text. Displayed headlines always come
     from the local Candidate, so a malformed or manipulated response can at
@@ -1110,11 +1097,12 @@ class LlmSelector:
 
     def __init__(
         self,
-        client: Any = None,
+        transport: Optional[Callable[..., Any]] = None,
         now: Optional[datetime] = None,
         recent_titles: Optional[List[str]] = None,
     ) -> None:
-        self.client = client
+        # `transport` is injected in tests; production uses requests.post.
+        self.transport = transport
         self.now = now or datetime.now(timezone.utc)
         self.recent_titles = recent_titles or []
 
@@ -1158,29 +1146,32 @@ class LlmSelector:
         return "Candidates:\n" + "\n".join(lines)
 
     def select(self, pool: List[Candidate], section: str, limit: int) -> List[Selection]:
-        if not pool or self.client is None:
+        if not pool or self.transport is None:
             return []
 
         started = time.time()
         try:
-            client = self.client.with_options(
-                timeout=float(max(1, SETTINGS.news_ranker_timeout_seconds))
-            )
-            response = client.messages.create(
-                model=SETTINGS.news_ranker_model,
-                max_tokens=8000,
-                system=self._system_prompt(limit),
-                messages=[{"role": "user", "content": self._user_prompt(pool)}],
-                output_config={
-                    "effort": SETTINGS.news_ranker_effort,
-                    "format": {"type": "json_schema", "schema": RANKER_RESPONSE_SCHEMA},
+            response = self.transport(
+                f"{SETTINGS.news_ranker_url.rstrip('/')}/api/chat",
+                json={
+                    "model": SETTINGS.news_ranker_model,
+                    "messages": [
+                        {"role": "system", "content": self._system_prompt(limit)},
+                        {"role": "user", "content": self._user_prompt(pool)},
+                    ],
+                    "stream": False,
+                    # A JSON schema here constrains generation, so there is no
+                    # regex extraction and no retry-on-parse loop.
+                    "format": RANKER_RESPONSE_SCHEMA,
+                    "options": {"temperature": 0},
                 },
+                timeout=float(max(1, SETTINGS.news_ranker_timeout_seconds)),
             )
-            if getattr(response, "stop_reason", None) == "refusal":
-                raise ValueError("ranker refused the request")
-            text = next(
-                block.text for block in response.content if getattr(block, "type", "") == "text"
-            )
+            response.raise_for_status()
+            envelope = response.json()
+            if not isinstance(envelope, dict) or "message" not in envelope:
+                raise ValueError(f"unexpected ranker envelope: {type(envelope).__name__}")
+            text = (envelope.get("message") or {}).get("content") or ""
             selections = self._to_selections(json.loads(text), pool, limit)
             if not selections:
                 raise ValueError("ranker returned no usable selections")
@@ -1238,14 +1229,18 @@ class LlmSelector:
 
 
 def _build_selector(section: str, now: datetime) -> Selector:
-    """LlmSelector when a credential is available, HeuristicSelector otherwise."""
-    client = _anthropic_client()
-    if client is None:
+    """LlmSelector when a ranker endpoint is configured, HeuristicSelector otherwise.
+
+    There is no credential check: the ranker is a local service, so a reachable
+    URL is the only gate. If it is unreachable at call time, LlmSelector returns
+    [] and the caller falls through to the heuristic.
+    """
+    if not (SETTINGS.news_ranker_enabled and SETTINGS.news_ranker_url.strip()):
         RANKER_STATUS["path"] = "heuristic"
         return HeuristicSelector(now=now)
     RANKER_STATUS["path"] = "llm"
     return LlmSelector(
-        client=client,
+        transport=requests.post,
         now=now,
         recent_titles=STATE.recent_titles(
             window_days=max(1, SETTINGS.news_recent_title_days), limit=30
