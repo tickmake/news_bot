@@ -743,5 +743,207 @@ class HeuristicSelectorTests(unittest.TestCase):
         self.assertGreaterEqual(total, 2)
 
 
+def _text_response(text, stop_reason="end_turn"):
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+    response = MagicMock()
+    response.content = [block]
+    response.stop_reason = stop_reason
+    return response
+
+
+class _StubMessages:
+    def __init__(self, payload=None, exception=None, stop_reason="end_turn"):
+        self.payload = payload
+        self.exception = exception
+        self.stop_reason = stop_reason
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.exception is not None:
+            raise self.exception
+        return _text_response(json.dumps(self.payload), self.stop_reason)
+
+
+class _StubClient:
+    def __init__(self, payload=None, exception=None, stop_reason="end_turn"):
+        self.messages = _StubMessages(payload, exception, stop_reason)
+
+    def with_options(self, **_kwargs):
+        return self
+
+
+class LlmSelectorTests(unittest.TestCase):
+    def setUp(self):
+        self.pool = [
+            _cand("Fed holds interest rates steady", "https://a.example/1"),
+            _cand("Federal Reserve keeps rates unchanged", "https://b.example/2"),
+            _cand("Norway raises fuel duty", "https://c.example/3"),
+        ]
+
+    def _select(self, client, limit=2):
+        selector = news_bot.LlmSelector(client=client, now=FIXED_NOW, recent_titles=[])
+        return selector.select(self.pool, "global", limit)
+
+    def test_selects_by_returned_index(self):
+        client = _StubClient({"selections": [{"id": 2, "duplicate_ids": [], "reason": "big"}]})
+        self.assertEqual(self._select(client)[0].candidate.url, "https://c.example/3")
+
+    def test_duplicate_ids_are_attached_to_the_selection(self):
+        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [1], "reason": "dupe"}]})
+        result = self._select(client)
+        self.assertEqual(len(result[0].duplicates), 1)
+        self.assertEqual(result[0].duplicates[0].url, "https://b.example/2")
+
+    def test_out_of_range_ids_are_dropped(self):
+        client = _StubClient(
+            {
+                "selections": [
+                    {"id": 99, "duplicate_ids": [], "reason": "bad"},
+                    {"id": 0, "duplicate_ids": [], "reason": "ok"},
+                ]
+            }
+        )
+        result = self._select(client)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/1")
+
+    def test_out_of_range_duplicate_ids_are_dropped(self):
+        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [99], "reason": "x"}]})
+        self.assertEqual(self._select(client)[0].duplicates, [])
+
+    def test_non_integer_ids_are_dropped(self):
+        client = _StubClient(
+            {
+                "selections": [
+                    {"id": "zero", "duplicate_ids": [], "reason": "x"},
+                    {"id": 1, "duplicate_ids": [], "reason": "y"},
+                ]
+            }
+        )
+        result = self._select(client)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].candidate.url, "https://b.example/2")
+
+    def test_repeated_ids_are_deduplicated(self):
+        client = _StubClient(
+            {
+                "selections": [
+                    {"id": 0, "duplicate_ids": [], "reason": "a"},
+                    {"id": 0, "duplicate_ids": [], "reason": "b"},
+                ]
+            }
+        )
+        self.assertEqual(len(self._select(client)), 1)
+
+    def test_result_is_truncated_to_the_limit(self):
+        client = _StubClient(
+            {"selections": [{"id": i, "duplicate_ids": [], "reason": "x"} for i in range(3)]}
+        )
+        self.assertEqual(len(self._select(client, limit=2)), 2)
+
+    def test_empty_pool_does_not_call_the_api(self):
+        client = _StubClient({"selections": []})
+        selector = news_bot.LlmSelector(client=client, now=FIXED_NOW, recent_titles=[])
+        self.assertEqual(selector.select([], "global", 5), [])
+        self.assertEqual(client.messages.calls, [])
+
+    def test_recent_titles_are_included_in_the_prompt(self):
+        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        selector = news_bot.LlmSelector(
+            client=client, now=FIXED_NOW, recent_titles=["Previously shown story"]
+        )
+        selector.select(self.pool, "global", 2)
+        self.assertIn("Previously shown story", json.dumps(client.messages.calls[0]))
+
+    def test_candidate_titles_are_included_in_the_prompt(self):
+        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(client)
+        self.assertIn("Norway raises fuel duty", json.dumps(client.messages.calls[0]))
+
+    def test_prompt_frames_candidates_as_untrusted_data(self):
+        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(client)
+        self.assertIn("UNTRUSTED", json.dumps(client.messages.calls[0]))
+
+    def test_request_uses_structured_output_schema(self):
+        client = _StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(client)
+        call = client.messages.calls[0]
+        self.assertEqual(call["output_config"]["format"]["type"], "json_schema")
+        self.assertEqual(call["model"], news_bot.SETTINGS.news_ranker_model)
+
+
+class LlmSelectorFallthroughTests(unittest.TestCase):
+    """Every failure mode must fall through, never raise."""
+
+    def setUp(self):
+        self.pool = [_cand("Fed holds interest rates steady", "https://a.example/1")]
+
+    def _select_with(self, client):
+        selector = news_bot.LlmSelector(client=client, now=FIXED_NOW, recent_titles=[])
+        return selector.select(self.pool, "global", 5)
+
+    def test_missing_client_returns_empty(self):
+        selector = news_bot.LlmSelector(client=None, now=FIXED_NOW, recent_titles=[])
+        self.assertEqual(selector.select(self.pool, "global", 5), [])
+
+    def test_api_exception_returns_empty(self):
+        self.assertEqual(self._select_with(_StubClient(exception=RuntimeError("boom"))), [])
+
+    def test_timeout_exception_returns_empty(self):
+        self.assertEqual(self._select_with(_StubClient(exception=TimeoutError("slow"))), [])
+
+    def test_malformed_json_returns_empty(self):
+        client = _StubClient()
+        client.messages.create = lambda **_kw: _text_response("not json at all")
+        self.assertEqual(self._select_with(client), [])
+
+    def test_missing_selections_key_returns_empty(self):
+        self.assertEqual(self._select_with(_StubClient({"wrong": []})), [])
+
+    def test_refusal_stop_reason_returns_empty(self):
+        client = _StubClient(
+            {"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]},
+            stop_reason="refusal",
+        )
+        self.assertEqual(self._select_with(client), [])
+
+    def test_all_ids_invalid_returns_empty(self):
+        client = _StubClient({"selections": [{"id": 99, "duplicate_ids": [], "reason": "x"}]})
+        self.assertEqual(self._select_with(client), [])
+
+    def test_failure_is_recorded_for_health(self):
+        news_bot.RANKER_STATUS["error"] = None
+        self._select_with(_StubClient(exception=RuntimeError("boom")))
+        self.assertIsNotNone(news_bot.RANKER_STATUS["error"])
+
+    def test_success_clears_a_previous_error(self):
+        news_bot.RANKER_STATUS["error"] = "stale"
+        self._select_with(_StubClient({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]}))
+        self.assertIsNone(news_bot.RANKER_STATUS["error"])
+
+
+class SelectorFactoryTests(unittest.TestCase):
+    def test_heuristic_used_when_ranker_disabled(self):
+        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", False):
+            selector = news_bot._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, news_bot.HeuristicSelector)
+
+    def test_heuristic_used_when_no_credential(self):
+        saved = os.environ.pop("ANTHROPIC_API_KEY", None)
+        try:
+            with patch.object(news_bot.SETTINGS, "news_ranker_enabled", True), patch.object(
+                news_bot.SETTINGS, "anthropic_api_key", ""
+            ):
+                selector = news_bot._build_selector("global", FIXED_NOW)
+            self.assertIsInstance(selector, news_bot.HeuristicSelector)
+        finally:
+            if saved is not None:
+                os.environ["ANTHROPIC_API_KEY"] = saved
+
+
 if __name__ == "__main__":
     unittest.main()
