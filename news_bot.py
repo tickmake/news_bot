@@ -113,6 +113,7 @@ class AppSettings(BaseSettings):
     news_candidate_pool_size: int = 60
     news_dedup_window_days: int = 7
     news_recent_title_days: int = 3
+    news_topic_weights: str = ""
     trade_min_score: int = 3
     trade_min_week_momentum_pct: float = 1.0
     trade_min_day_change_pct: float = 0.0
@@ -794,6 +795,232 @@ def _news_provider_priority() -> List[str]:
     providers = _split_csv(SETTINGS.news_fetch_priority or "")
     sanitized = [provider for provider in providers if provider in {"newsapi", "freenews", "rss"}]
     return sanitized or ["rss"]
+
+
+# Topic categories drive both selectors: the LLM receives the names and
+# weights, the heuristic additionally matches the keyword sets. Keywords cover
+# English and Norwegian because the Norway section is Norwegian-language.
+TOPIC_CATEGORIES: Dict[str, Dict[str, Any]] = {
+    "markets": {
+        "weight": 2.0,
+        "keywords": frozenset(
+            {
+                "fed", "rate", "rates", "inflation", "earnings", "bourse",
+                "market", "markets", "stocks", "bond", "yield", "recession",
+                "gdp", "tariff", "central bank", "rente", "børs", "aksjer",
+                "inflasjon", "økonomi",
+            }
+        ),
+    },
+    "norway": {
+        "weight": 2.0,
+        "keywords": frozenset(
+            {
+                "norway", "norwegian", "oslo", "norge", "norsk", "regjeringen",
+                "stortinget", "nrk", "kommune", "statsminister", "kroner",
+            }
+        ),
+    },
+    "india": {
+        "weight": 2.0,
+        "keywords": frozenset(
+            {
+                "india", "indian", "delhi", "mumbai", "rbi", "sensex", "nifty",
+                "rupee", "modi", "bengaluru",
+            }
+        ),
+    },
+    "tech": {
+        "weight": 1.5,
+        "keywords": frozenset(
+            {
+                "ai", "chip", "chips", "semiconductor", "software", "startup",
+                "cloud", "data", "cyber", "robot", "teknologi", "kunstig",
+                "openai", "anthropic", "nvidia",
+            }
+        ),
+    },
+    "sports": {
+        "weight": 0.3,
+        "keywords": frozenset(
+            {
+                "football", "soccer", "cricket", "tennis", "olympic", "league",
+                "match", "goal", "striker", "fotball", "kamp", "seier",
+            }
+        ),
+    },
+    "celebrity": {
+        "weight": 0.3,
+        "keywords": frozenset(
+            {
+                "celebrity", "actor", "actress", "singer", "album", "movie",
+                "netflix", "royal", "wedding", "kjendis", "skuespiller",
+            }
+        ),
+    },
+    "crime": {
+        "weight": 0.3,
+        "keywords": frozenset(
+            {
+                "murder", "stabbing", "arrested", "assault", "burglary",
+                "shooting", "drapet", "politiet", "siktet", "tyveri",
+            }
+        ),
+    },
+    "lifestyle": {
+        "weight": 0.3,
+        "keywords": frozenset(
+            {
+                "recipe", "horoscope", "diet", "wellness", "travel", "fashion",
+                "oppskrift", "livsstil", "reise",
+            }
+        ),
+    },
+    "shopping": {
+        "weight": 0.3,
+        "keywords": frozenset(
+            {
+                "deal", "deals", "discount", "sale", "coupon", "best buy",
+                "prime day", "black friday", "tilbud", "rabatt",
+            }
+        ),
+    },
+}
+
+NEUTRAL_TOPIC_WEIGHT = 1.0
+RECENCY_HALF_LIFE_HOURS = 10.0
+NEUTRAL_RECENCY_SCORE = 0.4
+RECENCY_WEIGHT = 0.45
+TOPIC_WEIGHT = 0.40
+TIER_WEIGHT = 0.15
+DUPLICATE_SIMILARITY_THRESHOLD = 0.6
+
+
+def _resolve_topic_weights() -> Dict[str, float]:
+    """Category weights, with NEWS_TOPIC_WEIGHTS overriding defaults."""
+    weights = {name: float(spec["weight"]) for name, spec in TOPIC_CATEGORIES.items()}
+    for entry in _split_csv(SETTINGS.news_topic_weights or ""):
+        name, separator, raw_value = entry.partition(":")
+        if not separator:
+            continue
+        name = name.strip().lower()
+        if name not in weights:
+            LOGGER.warning("topic_weight_unknown category=%s", name)
+            continue
+        try:
+            weights[name] = float(raw_value.strip())
+        except ValueError:
+            LOGGER.warning("topic_weight_invalid category=%s value=%s", name, raw_value)
+    return weights
+
+
+@dataclass(frozen=True)
+class Selection:
+    """One chosen headline plus the near-duplicates collapsed into it."""
+
+    candidate: Candidate
+    duplicates: List[Candidate] = field(default_factory=list)
+    reason: str = ""
+
+
+class Selector(Protocol):
+    def select(self, pool: List[Candidate], section: str, limit: int) -> List[Selection]:
+        ...
+
+
+def _title_shingles(title: str, size: int = 4) -> frozenset:
+    normalised = " ".join(_normalise_title_tokens(title))
+    if len(normalised) < size:
+        return frozenset({normalised}) if normalised else frozenset()
+    return frozenset(normalised[i : i + size] for i in range(len(normalised) - size + 1))
+
+
+def _jaccard(left: frozenset, right: frozenset) -> float:
+    if not left or not right:
+        return 0.0
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+class HeuristicSelector:
+    """Deterministic ranker. No network, no credential, no dependencies.
+
+    Catches reworded duplicates via shingle similarity, but not full
+    cross-outlet paraphrase — that is an accepted limitation of this path.
+    """
+
+    def __init__(self, now: Optional[datetime] = None) -> None:
+        self.now = now or datetime.now(timezone.utc)
+        self.weights = _resolve_topic_weights()
+
+    def _recency_score(self, candidate: Candidate) -> float:
+        age = _age_hours(candidate, self.now)
+        if age is None:
+            return NEUTRAL_RECENCY_SCORE
+        return pow(2.0, -age / RECENCY_HALF_LIFE_HOURS)
+
+    def _topic_score(self, candidate: Candidate) -> float:
+        haystack = candidate.title.casefold()
+        matched = [
+            self.weights[name]
+            for name, spec in TOPIC_CATEGORIES.items()
+            if any(keyword in haystack for keyword in spec["keywords"])
+        ]
+        if not matched:
+            return NEUTRAL_TOPIC_WEIGHT / 2.0
+        return max(matched) / 2.0
+
+    def _score(self, candidate: Candidate) -> float:
+        return (
+            RECENCY_WEIGHT * self._recency_score(candidate)
+            + TOPIC_WEIGHT * self._topic_score(candidate)
+            + TIER_WEIGHT * (1.0 if candidate.trusted else 0.5)
+        )
+
+    def select(self, pool: List[Candidate], section: str, limit: int) -> List[Selection]:
+        if not pool:
+            return []
+
+        # Sort by score, then title, so ties resolve deterministically.
+        ranked = sorted(pool, key=lambda c: (-self._score(c), c.title))
+
+        selections: List[Selection] = []
+        chosen_shingles: List[frozenset] = []
+        chosen_urls: Dict[str, int] = {}
+
+        for candidate in ranked:
+            shingles = _title_shingles(candidate.title)
+            duplicate_index: Optional[int] = None
+
+            if candidate.url and candidate.url in chosen_urls:
+                duplicate_index = chosen_urls[candidate.url]
+            else:
+                for index, existing in enumerate(chosen_shingles):
+                    if _jaccard(shingles, existing) >= DUPLICATE_SIMILARITY_THRESHOLD:
+                        duplicate_index = index
+                        break
+
+            if duplicate_index is not None:
+                selections[duplicate_index].duplicates.append(candidate)
+                continue
+
+            # Keep scanning past the limit so duplicates of already-chosen
+            # headlines are still collected and can be marked seen.
+            if len(selections) >= limit:
+                continue
+
+            selections.append(
+                Selection(
+                    candidate=candidate,
+                    duplicates=[],
+                    reason=f"heuristic score={self._score(candidate):.3f}",
+                )
+            )
+            chosen_shingles.append(shingles)
+            if candidate.url:
+                chosen_urls[candidate.url] = len(selections) - 1
+
+        return selections
 
 
 def _build_news_section(

@@ -589,5 +589,159 @@ class RecentTitleTests(unittest.TestCase):
         self.assertEqual(titles.count("Same story"), 1)
 
 
+FIXED_NOW = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _cand(title, url=None, hours_old=1.0, trusted=True, provider="rss"):
+    """Test helper: build a Candidate with an age relative to FIXED_NOW."""
+    published = None if hours_old is None else FIXED_NOW - timedelta(hours=hours_old)
+    base = news_bot._make_candidate(title, url, published, provider)
+    return news_bot.Candidate(
+        title=base.title,
+        url=base.url,
+        domain=base.domain,
+        published_at=base.published_at,
+        provider=base.provider,
+        trusted=trusted,
+    )
+
+
+class TopicWeightTests(unittest.TestCase):
+    def test_defaults_are_used_when_override_is_empty(self):
+        with patch.object(news_bot.SETTINGS, "news_topic_weights", ""):
+            weights = news_bot._resolve_topic_weights()
+        self.assertEqual(weights["markets"], news_bot.TOPIC_CATEGORIES["markets"]["weight"])
+
+    def test_override_replaces_a_single_category(self):
+        with patch.object(news_bot.SETTINGS, "news_topic_weights", "markets:5.0"):
+            weights = news_bot._resolve_topic_weights()
+        self.assertEqual(weights["markets"], 5.0)
+        self.assertEqual(weights["sports"], news_bot.TOPIC_CATEGORIES["sports"]["weight"])
+
+    def test_unknown_categories_in_the_override_are_ignored(self):
+        with patch.object(news_bot.SETTINGS, "news_topic_weights", "nonsense:9.0"):
+            weights = news_bot._resolve_topic_weights()
+        self.assertNotIn("nonsense", weights)
+
+    def test_malformed_override_entries_are_skipped(self):
+        with patch.object(news_bot.SETTINGS, "news_topic_weights", "markets:abc,tech:1.0"):
+            weights = news_bot._resolve_topic_weights()
+        self.assertEqual(weights["markets"], news_bot.TOPIC_CATEGORIES["markets"]["weight"])
+        self.assertEqual(weights["tech"], 1.0)
+
+
+DISTINCT_HEADLINES = [
+    "Fed holds interest rates steady after inflation data",
+    "Norway raises fuel duty in autumn budget proposal",
+    "India central bank signals caution on rupee volatility",
+    "Semiconductor makers warn of oversupply next quarter",
+    "Storm warning issued across the western coastline",
+    "Housing starts fall for a third consecutive month",
+    "Oil majors report weaker refining margins",
+    "Regulators open inquiry into cloud outage",
+    "Wheat prices climb on export restrictions",
+    "Transit strike disrupts commuter services",
+]
+
+
+class HeuristicSelectorTests(unittest.TestCase):
+    def setUp(self):
+        self.selector = news_bot.HeuristicSelector(now=FIXED_NOW)
+
+    def test_returns_at_most_the_limit(self):
+        pool = [
+            _cand(title, f"https://a.example/{i}")
+            for i, title in enumerate(DISTINCT_HEADLINES)
+        ]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 5)
+
+    def test_headlines_differing_by_one_token_are_treated_as_duplicates(self):
+        """Documents a real limitation: short titles are noisy under shingle
+        similarity, so near-identical phrasings collapse. Acceptable, because
+        real headlines that differ by one token usually are the same story."""
+        pool = [_cand(f"Story number {i}", f"https://a.example/{i}") for i in range(5)]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
+
+    def test_empty_pool_returns_empty_list(self):
+        self.assertEqual(self.selector.select([], "global", 5), [])
+
+    def test_fresher_story_outranks_older_one_all_else_equal(self):
+        pool = [
+            _cand("Fed holds rates steady in August", "https://a.example/old", hours_old=20),
+            _cand("Fed lifts rates sharply in August", "https://a.example/new", hours_old=1),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/new")
+
+    def test_upweighted_topic_outranks_downweighted_topic(self):
+        pool = [
+            _cand("Celebrity wedding photos revealed", "https://a.example/celeb"),
+            _cand("Fed signals inflation rate decision", "https://a.example/fed"),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.url, "https://a.example/fed")
+
+    def test_downweighted_story_still_appears_when_nothing_better_exists(self):
+        pool = [_cand("Football match ends in a draw", "https://a.example/sport")]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
+
+    def test_trusted_source_breaks_a_tie(self):
+        pool = [
+            _cand("Fed rate decision today", "https://untrusted.example/x", trusted=False),
+            _cand("Fed rate verdict today", "https://www.reuters.com/x", trusted=True),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(result[0].candidate.domain, "reuters.com")
+
+    def test_reworded_duplicates_collapse_into_one_selection(self):
+        pool = [
+            _cand("Fed holds interest rates steady", "https://a.example/1"),
+            _cand("Fed holds steady interest rates", "https://b.example/2"),
+        ]
+        result = self.selector.select(pool, "global", 5)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0].duplicates), 1)
+
+    def test_identical_urls_collapse_even_with_different_titles(self):
+        pool = [
+            _cand("Version one of the headline", "https://a.example/same"),
+            _cand("A completely different phrasing entirely", "https://a.example/same"),
+        ]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
+
+    def test_distinct_stories_are_not_collapsed(self):
+        pool = [
+            _cand("Fed holds interest rates steady", "https://a.example/1"),
+            _cand("Norway raises fuel duty next year", "https://b.example/2"),
+        ]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 2)
+
+    def test_undated_candidate_is_eligible_and_scores_neutrally(self):
+        pool = [_cand("Some undated headline", "https://a.example/1", hours_old=None)]
+        self.assertEqual(len(self.selector.select(pool, "global", 5)), 1)
+
+    def test_selection_is_deterministic(self):
+        pool = [
+            _cand(title, f"https://a.example/{i}")
+            for i, title in enumerate(DISTINCT_HEADLINES)
+        ]
+        first = [s.candidate.url for s in self.selector.select(pool, "global", 5)]
+        second = [s.candidate.url for s in self.selector.select(pool, "global", 5)]
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 5)
+
+    def test_duplicates_beyond_the_limit_are_still_collected(self):
+        """Duplicates must be marked seen even when the limit is already full."""
+        pool = [
+            _cand("Fed holds interest rates steady", "https://a.example/1"),
+            _cand("Norway raises fuel duty next year", "https://b.example/2"),
+            _cand("Fed holds steady interest rates", "https://c.example/3"),
+        ]
+        result = self.selector.select(pool, "global", 1)
+        self.assertEqual(len(result), 1)
+        total = sum(1 + len(s.duplicates) for s in result)
+        self.assertGreaterEqual(total, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
