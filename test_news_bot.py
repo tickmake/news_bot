@@ -1440,5 +1440,39 @@ class TradeGateTests(unittest.TestCase):
         self.assertEqual(failed, ["trend", "momentum_5d", "volatility"])
 
 
+class TradeRankingTests(unittest.TestCase):
+    def test_orders_by_week_momentum_first(self):
+        low = _metrics(symbol="LOW", week_momentum_pct=1.0)
+        high = _metrics(symbol="HIGH", week_momentum_pct=9.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([low, high], key=news_bot._rank_key)],
+            ["HIGH", "LOW"],
+        )
+
+    def test_volume_breaks_momentum_ties(self):
+        quiet = _metrics(symbol="QUIET", week_momentum_pct=3.0, volume_ratio=1.0)
+        busy = _metrics(symbol="BUSY", week_momentum_pct=3.0, volume_ratio=2.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([quiet, busy], key=news_bot._rank_key)],
+            ["BUSY", "QUIET"],
+        )
+
+    def test_lower_atr_breaks_volume_ties(self):
+        calm = _metrics(symbol="CALM", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=1.0)
+        wild = _metrics(symbol="WILD", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=4.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([calm, wild], key=news_bot._rank_key)],
+            ["CALM", "WILD"],
+        )
+
+    def test_symbol_makes_full_ties_deterministic(self):
+        a = _metrics(symbol="AAA")
+        b = _metrics(symbol="BBB")
+        self.assertEqual(
+            [m.symbol for m in sorted([b, a], key=news_bot._rank_key)],
+            ["AAA", "BBB"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1858,6 +1858,22 @@ def _failed_gates(metrics: TradeMetrics) -> List[str]:
     return failed
 
 
+def _rank_key(metrics: TradeMetrics) -> Tuple[float, float, float, str]:
+    """Ordering for qualifying candidates: momentum, then confirmation, then calm.
+
+    An ordinal rule rather than a weighted composite. Choosing weights needs
+    backtesting this codebase has no harness for, and arbitrary weights
+    presented as precision are worse than an explicit ordering. Symbol sorts
+    last so identical metrics always produce the same output.
+    """
+    return (
+        -metrics.week_momentum_pct,
+        -metrics.volume_ratio,
+        metrics.atr_pct,
+        metrics.symbol,
+    )
+
+
 def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d") -> Any:
     """Fetch and cache yfinance OHLCV history to avoid repeated slow calls."""
     cache_key = f"{symbol}|{period}|{interval}"
