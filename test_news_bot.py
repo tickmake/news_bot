@@ -1474,5 +1474,71 @@ class TradeRankingTests(unittest.TestCase):
         )
 
 
+class CandidateUniverseTests(unittest.TestCase):
+    def setUp(self):
+        self._patches = [
+            patch.object(news_bot, "USA_STOCK_UNIVERSE", {"Apple": "AAPL"}),
+            patch.object(news_bot, "INDIA_STOCK_UNIVERSE", {"Infosys": "INFY.NS"}),
+            patch.object(news_bot, "NORWAY_STOCK_UNIVERSE", {"Equinor": "EQNR.OL"}),
+            patch.object(news_bot, "INDIA_MUTUAL_FUNDS", {}),
+            patch.object(news_bot, "NORWAY_MUTUAL_FUNDS", {}),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def test_watchlist_survives_healthy_screeners(self):
+        """Regression: the watchlist used to be appended after ~67 screener
+        names and then truncated away entirely."""
+        screener = {f"Mover {i}": f"SCR{i}" for i in range(67)}
+        with patch.object(news_bot, "_build_live_universe", return_value=screener):
+            universe = news_bot._build_candidate_universe(30)
+        symbols = [symbol for _, symbol in universe]
+        self.assertEqual(len(symbols), 30)
+        for expected in ("AAPL", "INFY.NS", "EQNR.OL"):
+            self.assertIn(expected, symbols)
+
+    def test_watchlist_entries_come_first(self):
+        screener = {f"Mover {i}": f"SCR{i}" for i in range(10)}
+        with patch.object(news_bot, "_build_live_universe", return_value=screener):
+            universe = news_bot._build_candidate_universe(10)
+        self.assertEqual(
+            [symbol for _, symbol in universe[:3]], ["AAPL", "INFY.NS", "EQNR.OL"]
+        )
+
+    def test_screener_not_called_when_watchlist_fills_budget(self):
+        with patch.object(news_bot, "_build_live_universe") as mock_live:
+            universe = news_bot._build_candidate_universe(3)
+        mock_live.assert_not_called()
+        self.assertEqual(len(universe), 3)
+
+    def test_oversized_watchlist_truncates_and_warns(self):
+        with patch.object(news_bot, "USA_STOCK_UNIVERSE", {f"N{i}": f"S{i}" for i in range(10)}):
+            with patch.object(news_bot, "_build_live_universe") as mock_live:
+                with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
+                    universe = news_bot._build_candidate_universe(4)
+        mock_live.assert_not_called()
+        self.assertEqual(len(universe), 4)
+        self.assertTrue(any("watchlist_truncated" in line for line in logs.output))
+
+    def test_symbol_in_both_appears_once_with_watchlist_label(self):
+        screener = {"Apple Inc Screener Name": "AAPL", "Other": "OTHR"}
+        with patch.object(news_bot, "_build_live_universe", return_value=screener):
+            universe = news_bot._build_candidate_universe(10)
+        apple_labels = [label for label, symbol in universe if symbol == "AAPL"]
+        self.assertEqual(len(apple_labels), 1)
+        self.assertIn("[USA Stock]", apple_labels[0])
+
+    def test_labels_carry_market_suffix(self):
+        with patch.object(news_bot, "_build_live_universe", return_value={}):
+            universe = news_bot._build_candidate_universe(10)
+        labels = dict((symbol, label) for label, symbol in universe)
+        self.assertEqual(labels["AAPL"], "Apple [USA Stock]")
+        self.assertEqual(labels["EQNR.OL"], "Equinor [Norway Stock]")
+
+
 if __name__ == "__main__":
     unittest.main()

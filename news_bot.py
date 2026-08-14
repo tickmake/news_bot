@@ -1958,6 +1958,63 @@ def _analyze_short_term_candidate(symbol: str) -> Optional[Dict[str, float]]:
         return None
 
 
+def _configured_watchlist() -> List[Tuple[str, str]]:
+    """(label, symbol) pairs for every symbol configured via environment."""
+    entries: List[Tuple[str, str]] = []
+    for suffix, mapping in (
+        ("USA Stock", USA_STOCK_UNIVERSE),
+        ("India Stock", INDIA_STOCK_UNIVERSE),
+        ("Norway Stock", NORWAY_STOCK_UNIVERSE),
+        ("India Fund", INDIA_MUTUAL_FUNDS),
+        ("Norway Fund", NORWAY_MUTUAL_FUNDS),
+    ):
+        for name, symbol in mapping.items():
+            entries.append((f"{name} [{suffix}]", symbol))
+    return entries
+
+
+def _build_candidate_universe(max_symbols: int) -> List[Tuple[str, str]]:
+    """Configured watchlist first, screener discovery filling what remains.
+
+    The previous order appended the watchlist *after* ~67 screener names and
+    then truncated to the cap, so with healthy screeners no configured symbol
+    was ever analysed. Whichever side loses a slot now, it is reported.
+
+    Screener names are discovery only: they decide which symbols are looked at,
+    never whether one qualifies. That decision belongs to _failed_gates, which
+    reads completed-session metrics.
+    """
+    selected: List[Tuple[str, str]] = []
+    seen: set = set()
+
+    for label, symbol in _configured_watchlist():
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        selected.append((label, symbol))
+
+    if len(selected) > max_symbols:
+        LOGGER.warning(
+            "watchlist_truncated configured=%s analysed=%s detail=raise TRADE_UNIVERSE_MAX to analyse all",
+            len(selected),
+            max_symbols,
+        )
+        return selected[:max_symbols]
+
+    # A full budget means no screener call at all.
+    if len(selected) >= max_symbols:
+        return selected
+
+    for label, symbol in _build_live_universe(limit=max_symbols).items():
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        selected.append((label, symbol))
+        if len(selected) >= max_symbols:
+            break
+    return selected
+
+
 def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int = 5) -> str:
     if universe is None:
         universe = _build_live_universe(limit=45)
