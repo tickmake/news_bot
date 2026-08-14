@@ -1895,69 +1895,6 @@ def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d"
     return history
 
 
-def _analyze_short_term_candidate(symbol: str) -> Optional[Dict[str, float]]:
-    try:
-        history = _fetch_ticker_history(symbol)
-        close_series = history["Close"].dropna()
-        if len(close_series) < 30:
-            return None
-        last_close = float(close_series.iloc[-1])
-        prev_close = float(close_series.iloc[-2])
-        if prev_close == 0:
-            return None
-        day_change_pct = ((last_close - prev_close) / prev_close) * 100
-        reference_close = float(close_series.iloc[-6]) if len(close_series) >= 6 else float(close_series.iloc[0])
-        if reference_close == 0:
-            return None
-        week_momentum_pct = ((last_close - reference_close) / reference_close) * 100
-        ema_20 = float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
-        trend_ok = last_close > ema_20
-
-        volume_ratio = 1.0
-        if "Volume" in history:
-            volume_series = history["Volume"].dropna()
-            if len(volume_series) >= 20:
-                avg_volume_20 = float(volume_series.tail(20).mean())
-                if avg_volume_20 > 0:
-                    volume_ratio = float(volume_series.iloc[-1]) / avg_volume_20
-
-        rolling_high_20 = float(close_series.tail(20).max())
-        drawdown_pct = ((rolling_high_20 - last_close) / rolling_high_20) * 100 if rolling_high_20 else 0.0
-        atr_pct = _compute_atr_percent(history)
-        if atr_pct is None:
-            return None
-
-        score = 0
-        if trend_ok:
-            score += 1
-        if week_momentum_pct >= SETTINGS.trade_min_week_momentum_pct:
-            score += 1
-        if day_change_pct > SETTINGS.trade_min_day_change_pct:
-            score += 1
-        if volume_ratio >= SETTINGS.trade_min_volume_ratio:
-            score += 1
-        if drawdown_pct <= SETTINGS.trade_max_drawdown_pct:
-            score += 1
-        if atr_pct <= SETTINGS.trade_max_atr_pct:
-            score += 1
-
-        if score < SETTINGS.trade_min_score:
-            return None
-
-        return {
-            "score": float(score),
-            "last_close": last_close,
-            "day_change_pct": day_change_pct,
-            "week_momentum_pct": week_momentum_pct,
-            "volume_ratio": volume_ratio,
-            "drawdown_pct": drawdown_pct,
-            "atr_pct": atr_pct,
-        }
-    except Exception as exc:
-        LOGGER.debug("candidate_analysis_failed symbol=%s detail=%s", symbol, exc)
-        return None
-
-
 def _configured_watchlist() -> List[Tuple[str, str]]:
     """(label, symbol) pairs for every symbol configured via environment."""
     entries: List[Tuple[str, str]] = []
@@ -2015,88 +1952,143 @@ def _build_candidate_universe(max_symbols: int) -> List[Tuple[str, str]]:
     return selected
 
 
-def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int = 5) -> str:
-    if universe is None:
-        universe = _build_live_universe(limit=45)
-        configured_universe = {
-            **{f"{name} [USA Stock]": sym for name, sym in USA_STOCK_UNIVERSE.items()},
-            **{f"{name} [India Stock]": sym for name, sym in INDIA_STOCK_UNIVERSE.items()},
-            **{f"{name} [Norway Stock]": sym for name, sym in NORWAY_STOCK_UNIVERSE.items()},
-            **{f"{name} [India Fund]": sym for name, sym in INDIA_MUTUAL_FUNDS.items()},
-            **{f"{name} [Norway Fund]": sym for name, sym in NORWAY_MUTUAL_FUNDS.items()},
-        }
-        for label, symbol in configured_universe.items():
-            if symbol not in universe.values():
-                universe[label] = symbol
+@dataclass
+class ScreenOutcome:
+    """What one screening run saw. Rendered as the diagnostic footer.
 
-    # Cap the universe so a cold cache cannot trigger an unbounded number of
-    # slow yfinance calls and stall the briefing / a `/now` command.
-    universe_max = max(1, SETTINGS.trade_universe_max)
-    candidate_items = list(universe.items())[:universe_max]
+    Invariant: checked - no_data == len(qualified) + sum(failed_counts.values())
+    when the deadline did not truncate the run.
+    """
 
-    scored: List[Tuple[float, float, float, str, str, Dict[str, float]]] = []
+    checked: int = 0
+    analysed: int = 0
+    no_data: int = 0
+    qualified: List[TradeMetrics] = field(default_factory=list)
+    failed_counts: Dict[str, int] = field(default_factory=dict)
+    deadline_hit: bool = False
+
+
+def _screen_universe(
+    candidate_items: List[Tuple[str, str]]
+) -> Tuple[ScreenOutcome, Dict[str, str]]:
+    outcome = ScreenOutcome(checked=len(candidate_items))
+    labels = {symbol: name for name, symbol in candidate_items}
     workers = max(1, min(SETTINGS.trade_fetch_workers, len(candidate_items) or 1))
     deadline = time.time() + max(5, SETTINGS.trade_total_deadline_seconds)
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_to_meta = {
-            pool.submit(_analyze_short_term_candidate, symbol): (name, symbol)
-            for name, symbol in candidate_items
+        future_to_symbol = {
+            pool.submit(_compute_trade_metrics, symbol): symbol
+            for _, symbol in candidate_items
         }
-        for future in as_completed(future_to_meta):
-            name, symbol = future_to_meta[future]
-            if time.time() >= deadline:
-                LOGGER.warning("trade_candidates_deadline_reached analysed=%s", len(scored))
-                for pending in future_to_meta:
-                    pending.cancel()
-                break
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
             try:
                 metrics = future.result()
             except Exception as exc:
                 LOGGER.debug("candidate_future_failed symbol=%s detail=%s", symbol, exc)
-                continue
-            if metrics:
-                scored.append((metrics["score"], metrics["week_momentum_pct"], metrics["day_change_pct"], name, symbol, metrics))
+                metrics = None
+
+            outcome.analysed += 1
+            if metrics is None:
+                outcome.no_data += 1
+            else:
+                failed = _failed_gates(metrics)
+                if failed:
+                    outcome.failed_counts[failed[0]] = (
+                        outcome.failed_counts.get(failed[0], 0) + 1
+                    )
+                else:
+                    outcome.qualified.append(metrics)
+
+            # Checked after the result is consumed: testing first discarded work
+            # that had already finished.
+            if time.time() >= deadline:
+                LOGGER.warning(
+                    "trade_candidates_deadline_reached analysed=%s of=%s",
+                    outcome.analysed,
+                    outcome.checked,
+                )
+                outcome.deadline_hit = True
+                for pending in future_to_symbol:
+                    pending.cancel()
+                break
+
+    outcome.qualified.sort(key=_rank_key)
+    return outcome, labels
+
+
+def _render_gate_summary() -> str:
+    text = (
+        f"Gates: trend>EMA20, "
+        f"5D>={SETTINGS.trade_min_week_momentum_pct:.1f}%, "
+        f"1D>{SETTINGS.trade_min_day_change_pct:.1f}%, "
+        f"DD<={SETTINGS.trade_max_drawdown_pct:.1f}%, "
+        f"ATR<={SETTINGS.trade_max_atr_pct:.1f}%"
+    )
+    return text.replace("<=", "≤").replace(">=", "≥").replace(">", "›")
+
+
+def _render_diagnostics(outcome: ScreenOutcome) -> List[str]:
+    checked_text = f"Checked {outcome.checked}"
+    if outcome.deadline_hit:
+        checked_text += f" (deadline hit, analysed {outcome.analysed} of {outcome.checked})"
+    lines = [
+        f"{checked_text} · no data {outcome.no_data} · qualified {len(outcome.qualified)}"
+    ]
+    present = [gate for gate in TRADE_GATES if outcome.failed_counts.get(gate)]
+    if present:
+        lines.append(
+            "Failed: " + ", ".join(f"{gate} {outcome.failed_counts[gate]}" for gate in present)
+        )
+    return lines
+
+
+def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int = 5) -> str:
+    universe_max = max(1, SETTINGS.trade_universe_max)
+    if universe is None:
+        candidate_items = _build_candidate_universe(universe_max)
+    else:
+        candidate_items = list(universe.items())[:universe_max]
+
+    outcome, labels = _screen_universe(candidate_items)
 
     lines = [
         "⚠️ Short-Term Trade Candidates (Informational Only):",
-        "No guarantee of 1-2% daily profit. Use strict risk management.",
-        (
-            f"Filters: score>={SETTINGS.trade_min_score}, "
-            f"5D>={SETTINGS.trade_min_week_momentum_pct:.1f}%, "
-            f"1D>{SETTINGS.trade_min_day_change_pct:.1f}%, "
-            f"Volx>={SETTINGS.trade_min_volume_ratio:.2f}, "
-            f"DD<={SETTINGS.trade_max_drawdown_pct:.1f}%, ATR<={SETTINGS.trade_max_atr_pct:.1f}%"
-        ),
+        "Not investment advice. No guarantee of profit. Use strict risk management.",
+        _render_gate_summary(),
+        "Metrics use each symbol's last completed session.",
     ]
-    lines[2] = lines[2].replace("<=", "≤").replace(">=", "≥").replace(">", "›")
-    if not scored:
-        lines.append("No candidates met the momentum criteria today.")
-        return "\n".join(lines) + "\n\n"
 
-    scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-    rows: List[List[str]] = []
-    for idx, (_, _, _, name, symbol, metrics) in enumerate(scored[:top_n], 1):
-        rows.append(
-            [
-                str(idx),
-                _truncate(name, 24),
-                symbol,
-                f"{metrics['last_close']:.2f}",
-                f"{metrics['day_change_pct']:+.2f}%",
-                f"{metrics['week_momentum_pct']:+.2f}%",
-                f"{metrics['volume_ratio']:.2f}",
-                f"{metrics['drawdown_pct']:.2f}%",
-                f"{metrics['atr_pct']:.2f}%",
-                str(int(metrics["score"])),
-            ]
+    if outcome.qualified:
+        rows: List[List[str]] = []
+        for idx, metrics in enumerate(outcome.qualified[:top_n], 1):
+            confirmed = "✓" if metrics.volume_ratio >= SETTINGS.trade_min_volume_ratio else ""
+            rows.append(
+                [
+                    str(idx),
+                    _truncate(labels.get(metrics.symbol, metrics.symbol), 24),
+                    metrics.symbol,
+                    metrics.session,
+                    f"{metrics.last_close:.2f}",
+                    f"{metrics.day_change_pct:+.2f}%",
+                    f"{metrics.week_momentum_pct:+.2f}%",
+                    f"{metrics.volume_ratio:.2f}{confirmed}",
+                    f"{metrics.drawdown_pct:.2f}%",
+                    f"{metrics.atr_pct:.2f}%",
+                ]
+            )
+        lines.append(
+            _render_pre_table(
+                "Candidates",
+                ["#", "Name", "Symbol", "Session", "Close", "1D", "5D", "Volx", "DD", "ATR"],
+                rows,
+            )
         )
-    lines.append(
-        _render_pre_table(
-            "Candidates",
-            ["#", "Name", "Symbol", "Close", "1D", "5D", "Volx", "DD", "ATR", "Score"],
-            rows,
-        )
-    )
+    else:
+        lines.append("No candidates qualified.")
+
+    lines.extend(_render_diagnostics(outcome))
     return "\n".join(lines) + "\n\n"
 
 

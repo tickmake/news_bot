@@ -47,33 +47,25 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(parsed_empty, fallback)
         self.assertEqual(parsed_invalid, fallback)
 
-    @patch("news_bot._analyze_short_term_candidate")
-    def test_get_trade_candidates_formats_ranked_output(self, mock_analyze):
+    @patch("news_bot._compute_trade_metrics")
+    def test_get_trade_candidates_formats_ranked_output(self, mock_metrics):
         def side_effect(symbol):
             data = {
-                "AAA": {
-                    "score": 4.0,
-                    "last_close": 100.0,
-                    "day_change_pct": 1.2,
-                    "week_momentum_pct": 3.5,
-                    "volume_ratio": 1.6,
-                    "drawdown_pct": 2.1,
-                    "atr_pct": 1.4,
-                },
-                "BBB": {
-                    "score": 3.0,
-                    "last_close": 80.0,
-                    "day_change_pct": 0.4,
-                    "week_momentum_pct": 2.1,
-                    "volume_ratio": 1.3,
-                    "drawdown_pct": 3.0,
-                    "atr_pct": 2.0,
-                },
+                "AAA": news_bot.TradeMetrics(
+                    symbol="AAA", session="2026-08-13", last_close=100.0,
+                    day_change_pct=1.2, week_momentum_pct=3.5, volume_ratio=1.6,
+                    drawdown_pct=2.1, atr_pct=1.4, above_ema20=True,
+                ),
+                "BBB": news_bot.TradeMetrics(
+                    symbol="BBB", session="2026-08-13", last_close=80.0,
+                    day_change_pct=0.4, week_momentum_pct=2.1, volume_ratio=1.3,
+                    drawdown_pct=3.0, atr_pct=2.0, above_ema20=True,
+                ),
                 "CCC": None,
             }
             return data.get(symbol)
 
-        mock_analyze.side_effect = side_effect
+        mock_metrics.side_effect = side_effect
 
         result = news_bot.get_trade_candidates(
             universe={"Alpha": "AAA", "Beta": "BBB", "Gamma": "CCC"},
@@ -86,13 +78,13 @@ class NewsBotTests(unittest.TestCase):
         self.assertIn("Beta", result)
         self.assertIn("BBB", result)
         self.assertNotIn("Gamma", result)
-        self.assertIn("No guarantee of 1-2% daily profit", result)
+        self.assertIn("Not investment advice. No guarantee of profit.", result)
 
-    @patch("news_bot._analyze_short_term_candidate")
-    def test_get_trade_candidates_no_matches(self, mock_analyze):
-        mock_analyze.return_value = None
+    @patch("news_bot._compute_trade_metrics")
+    def test_get_trade_candidates_no_matches(self, mock_metrics):
+        mock_metrics.return_value = None
         result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=2)
-        self.assertIn("No candidates met the momentum criteria today.", result)
+        self.assertIn("No candidates qualified.", result)
 
     @patch("news_bot.requests.get")
     def test_get_global_news_success(self, mock_get):
@@ -315,13 +307,13 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(mock_ticker.call_count, 1)
         news_bot.HISTORY_CACHE.clear()
 
-    @patch("news_bot._analyze_short_term_candidate")
-    def test_get_trade_candidates_caps_universe(self, mock_analyze):
-        mock_analyze.return_value = None
+    @patch("news_bot._compute_trade_metrics")
+    def test_get_trade_candidates_caps_universe(self, mock_metrics):
+        mock_metrics.return_value = None
         big_universe = {f"Name{i}": f"SYM{i}" for i in range(50)}
         with patch.object(news_bot.SETTINGS, "trade_universe_max", 5):
             news_bot.get_trade_candidates(universe=big_universe, top_n=3)
-        self.assertEqual(mock_analyze.call_count, 5)
+        self.assertEqual(mock_metrics.call_count, 5)
 
     @patch("news_bot.requests.get")
     def test_poll_telegram_commands_passes_long_poll_timeout(self, mock_get):
@@ -1538,6 +1530,75 @@ class CandidateUniverseTests(unittest.TestCase):
         labels = dict((symbol, label) for label, symbol in universe)
         self.assertEqual(labels["AAPL"], "Apple [USA Stock]")
         self.assertEqual(labels["EQNR.OL"], "Equinor [Norway Stock]")
+
+
+class TradeRenderingTests(unittest.TestCase):
+    def _qualifying(self, symbol, momentum, volume=1.6):
+        return news_bot.TradeMetrics(
+            symbol=symbol, session="2026-08-13", last_close=100.0,
+            day_change_pct=1.0, week_momentum_pct=momentum, volume_ratio=volume,
+            drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
+        )
+
+    def test_score_column_is_gone_and_session_present(self):
+        with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("Session", result)
+        self.assertIn("2026-08-13", result)
+        self.assertNotIn("Score", result)
+
+    def test_volume_confirmation_marker(self):
+        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
+            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0, volume=2.0)):
+                confirmed = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("BBB", 5.0, volume=0.5)):
+                unconfirmed = news_bot.get_trade_candidates(universe={"Beta": "BBB"}, top_n=1)
+        self.assertIn("2.00✓", confirmed)
+        self.assertIn("0.50", unconfirmed)
+        self.assertNotIn("0.50✓", unconfirmed)
+
+    def test_diagnostics_attribute_to_first_failing_gate(self):
+        rejected = news_bot.TradeMetrics(
+            symbol="AAA", session="2026-08-13", last_close=100.0,
+            day_change_pct=-1.0, week_momentum_pct=-1.0, volume_ratio=1.0,
+            drawdown_pct=1.0, atr_pct=1.0, above_ema20=False,
+        )
+        with patch("news_bot._compute_trade_metrics", return_value=rejected):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("Checked 1", result)
+        self.assertIn("qualified 0", result)
+        self.assertIn("trend 1", result)
+        # Attributed to `trend` only, though momentum_5d also failed.
+        self.assertNotIn("momentum_5d", result)
+
+    def test_diagnostic_counts_balance(self):
+        def side_effect(symbol):
+            if symbol == "AAA":
+                return self._qualifying("AAA", 5.0)
+            if symbol == "BBB":
+                return None
+            return news_bot.TradeMetrics(
+                symbol=symbol, session="2026-08-13", last_close=100.0,
+                day_change_pct=-1.0, week_momentum_pct=-1.0, volume_ratio=1.0,
+                drawdown_pct=1.0, atr_pct=1.0, above_ema20=False,
+            )
+
+        with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
+            result = news_bot.get_trade_candidates(
+                universe={"A": "AAA", "B": "BBB", "C": "CCC"}, top_n=3
+            )
+        self.assertIn("Checked 3", result)
+        self.assertIn("no data 1", result)
+        self.assertIn("qualified 1", result)
+        self.assertIn("trend 1", result)
+
+    def test_ranked_order_in_output(self):
+        def side_effect(symbol):
+            return self._qualifying(symbol, {"AAA": 1.0, "BBB": 9.0}[symbol])
+
+        with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
+            result = news_bot.get_trade_candidates(universe={"A": "AAA", "B": "BBB"}, top_n=2)
+        self.assertLess(result.index("BBB"), result.index("AAA"))
 
 
 if __name__ == "__main__":
