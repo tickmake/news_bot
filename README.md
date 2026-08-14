@@ -174,7 +174,7 @@ Outside Docker, run Ollama yourself and set
 `NEWS_RANKER_URL=http://localhost:11434`:
 
 ```bash
-ollama pull llama3.2:3b
+ollama pull qwen2.5:3b
 ```
 
 Note that `NEWS_FETCH_PRIORITY` now orders a single pooled candidate set
@@ -185,8 +185,8 @@ each send, which is what makes cross-outlet deduplication possible.
 |---|---|---|
 | `NEWS_RANKER_ENABLED` | `true` | Kill switch |
 | `NEWS_RANKER_URL` | `http://localhost:11434` | Ollama endpoint (compose sets `http://ollama:11434`) |
-| `NEWS_RANKER_MODEL` | `llama3.2:3b` | Ranking model; must be pulled into Ollama |
-| `NEWS_RANKER_MAX_CANDIDATES` | `20` | Shortlist size sent to the LLM |
+| `NEWS_RANKER_MODEL` | `qwen2.5:3b` | Ranking model; must be pulled into Ollama |
+| `NEWS_RANKER_MAX_CANDIDATES` | `14` | Shortlist size sent to the LLM |
 | `NEWS_RANKER_TIMEOUT_SECONDS` | `240` | Per-call timeout |
 | `RANKER_NETWORK` | bundled net | Network carrying Ollama |
 | `RANKER_NETWORK_EXTERNAL` | `false` | Set `true` to reuse another project's network |
@@ -202,21 +202,35 @@ Down-weighting is not exclusion — a low-weight headline still appears when
 nothing better is available.
 
 There is no per-briefing cost — the trade is hardware instead. Measured on a
-Raspberry Pi 5 (CPU only) against a warm `llama3.2:3b`:
+Raspberry Pi 5 (CPU only, 4 cores) with a warm model:
 
-| Candidates sent | Latency |
-|---|---|
-| 10 | ~51 s |
-| 20 | ~74 s |
-| 40 | ~150 s |
+| Candidates sent | `llama3.2:3b` | `qwen2.5:3b` |
+|---|---|---|
+| 10 | ~134 s | ~132 s |
+| 14 | ~193 s | ~107 s |
+| 20 | ~269 s | ~236 s |
 
-Hence the default shortlist of 20 and the 240 s timeout. Small models are the
-weak link on quality, not just speed: in testing, `llama3.2:3b` collapsed
-obvious repeats correctly but missed a genuine cross-outlet duplicate and
-paired two different central banks as the same story. If ranking quality
-matters more than keeping everything on one small box, point
-`NEWS_RANKER_URL` at a machine running a 7B+ model. GPU acceleration for the
-bundled service is a commented-out block in `docker-compose.yml`.
+An earlier version of this table reported far lower figures (20 candidates in
+~74 s). Those were timing a no-op: the response schema had no `minItems`, so
+an empty `selections` array satisfied it and the model returned
+`{"selections": []}` in about 4 seconds without ranking anything. The bot then
+silently fell through to `HeuristicSelector`. See `_ranker_response_schema`.
+
+Hence the default shortlist of **14** — at 20 candidates `llama3.2:3b` exceeds
+the 240 s timeout outright.
+
+The default model is `qwen2.5:3b` on measured dedup behaviour. Across runs at
+10, 14 and 20 candidates, `llama3.2:3b` ranked both "Fed holds rates steady"
+and "Federal Reserve keeps benchmark rate unchanged" as separate stories every
+time; `qwen2.5:3b` collapsed them every time. Cross-outlet paraphrase dedup is
+the whole reason this path exists — `HeuristicSelector` cannot do it — so that
+outweighs `qwen2.5:3b` being slightly looser about topic down-weighting.
+
+Both are still small models. If ranking quality matters more than keeping
+everything on one small box, point `NEWS_RANKER_URL` at a machine running a
+7B+ model; note that a 7B needs roughly 6 GB resident, which will not fit
+alongside other stacks on an 8 GB Pi. GPU acceleration for the bundled service
+is a commented-out block in `docker-compose.yml`.
 
 Run `/health` to see which path is active, the model, call latency, and the
 last ranker error.
