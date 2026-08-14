@@ -245,10 +245,13 @@ If these are empty, the bot relies fully on live screener data.
 
 ### Trade Risk Controls
 
-- `TRADE_MIN_SCORE`
+- `TRADE_MIN_SCORE` - **deprecated and ignored.** Candidates now pass mandatory
+  gates rather than reaching a score threshold. Setting it logs a warning at
+  startup.
 - `TRADE_MIN_WEEK_MOMENTUM_PCT`
 - `TRADE_MIN_DAY_CHANGE_PCT`
-- `TRADE_MIN_VOLUME_RATIO`
+- `TRADE_MIN_VOLUME_RATIO` - threshold for the `✓` volume-confirmation marker.
+  Volume does not admit or reject a candidate; it breaks ties in the ranking.
 - `TRADE_MAX_DRAWDOWN_PCT`
 - `TRADE_MAX_ATR_PCT`
 
@@ -260,6 +263,13 @@ Candidate analysis fetches per-symbol history from yfinance. These controls keep
 - `TRADE_FETCH_WORKERS` - parallel history fetch workers (default `6`)
 - `TRADE_HISTORY_CACHE_TTL_SECONDS` - per-symbol history cache duration (default `600`)
 - `TRADE_TOTAL_DEADLINE_SECONDS` - overall deadline for candidate analysis; partial results returned if exceeded (default `45`)
+
+Candidates must pass every gate: price above its 20-day EMA, 5-day and 1-day
+returns above their thresholds, and ATR and drawdown below their ceilings.
+Metrics are computed on each symbol's last completed session — an in-progress
+bar is never used, so at the 19:00 run markets that closed earlier that day
+still report their previous session. Configured watchlist symbols are analysed
+before screener movers.
 
 ## Scheduling
 

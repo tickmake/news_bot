@@ -2327,11 +2327,29 @@ def get_missing_required_config() -> Iterable[str]:
     return SETTINGS.missing_required()
 
 
+def _warn_deprecated_settings() -> None:
+    """Report settings that no longer do anything.
+
+    Reading the default off the model rather than hardcoding it keeps this
+    honest if the field's default ever changes. Ignoring a customised value
+    silently is the same failure that hid the truncated watchlist.
+    """
+    default_min_score = AppSettings.model_fields["trade_min_score"].default
+    if SETTINGS.trade_min_score != default_min_score:
+        LOGGER.warning(
+            "deprecated_setting name=TRADE_MIN_SCORE value=%s detail=ignored; "
+            "candidates now pass mandatory gates instead of a score threshold",
+            SETTINGS.trade_min_score,
+        )
+
+
 if __name__ == "__main__":
     missing_values = list(get_missing_required_config())
     if missing_values:
         print("Missing required environment variables: " + ", ".join(missing_values) + ".")
         raise SystemExit(1)
+
+    _warn_deprecated_settings()
 
     _prepare_telegram_long_polling()
 
