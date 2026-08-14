@@ -1937,3 +1937,33 @@ class LogColourTests(unittest.TestCase):
         self.assertIn(news_bot._ANSI["error"], error_line)
         # Info line must not contain the error colour
         self.assertNotIn(news_bot._ANSI["error"], info_line)
+
+    def test_infra_error_severity_colour_confined_to_level_tag(self):
+        """On INFRA lines, severity colour must not bleed into the message body."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
+        )
+        # Find the level tag close and extract everything after it
+        # Format for INFRA+ERROR: \033[2m...{timestamp}  INFRA  \033[1;31mERROR\033[0m\033[2m  message\033[0m
+        level_tag_close = f"{news_bot._ANSI['error']}ERROR\033[0m\033[2m"
+        parts = line.split(level_tag_close)
+        self.assertEqual(len(parts), 2, "Should have exactly one ERROR tag")
+        after_level = parts[1]
+        # Message body should have no error or warn colour codes
+        self.assertNotIn(news_bot._ANSI["error"], after_level)
+        self.assertNotIn(news_bot._ANSI["warn"], after_level)
+
+    def test_infra_warning_severity_colour_confined_to_level_tag(self):
+        """On INFRA lines, severity colour must not bleed into the message body."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning")
+        )
+        # Find the level tag close and extract everything after it
+        # Format for INFRA+WARNING: \033[2m...{timestamp}  INFRA  \033[33mWARN \033[0m\033[2m  message\033[0m
+        level_tag_close = f"{news_bot._ANSI['warn']}WARN \033[0m\033[2m"
+        parts = line.split(level_tag_close)
+        self.assertEqual(len(parts), 2, "Should have exactly one WARN tag")
+        after_level = parts[1]
+        # Message body should have no error or warn colour codes
+        self.assertNotIn(news_bot._ANSI["error"], after_level)
+        self.assertNotIn(news_bot._ANSI["warn"], after_level)
