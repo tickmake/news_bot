@@ -1744,6 +1744,10 @@ def _drop_in_progress_bar(history: Any) -> Any:
     already closed today still has its session discarded: this screen ranks
     symbols against each other, and letting some rows advance a session while
     others do not would compare momentum windows offset by a day.
+
+    If the index is tz-naive, there is no exchange timezone to fall back on,
+    so "today" is evaluated in the host's local date instead — the host's
+    `TZ` then silently determines which bar gets dropped.
     """
     if history is None or len(history) == 0:
         return history
@@ -2029,13 +2033,17 @@ def _render_gate_summary() -> str:
     return text.replace("<=", "≤").replace(">=", "≥").replace(">", "›")
 
 
-def _render_diagnostics(outcome: ScreenOutcome) -> List[str]:
+def _render_diagnostics(outcome: ScreenOutcome, top_n: int) -> List[str]:
     checked_text = f"Checked {outcome.checked}"
     if outcome.deadline_hit:
         checked_text += f" (deadline hit, analysed {outcome.analysed} of {outcome.checked})"
-    lines = [
-        f"{checked_text} · no data {outcome.no_data} · qualified {len(outcome.qualified)}"
-    ]
+    qualified_count = len(outcome.qualified)
+    qualified_text = f"qualified {qualified_count}"
+    if qualified_count > top_n:
+        # The table below renders only the top `top_n` rows; say so, or the
+        # footer count and the table's row count silently disagree.
+        qualified_text += f" (showing {top_n})"
+    lines = [f"{checked_text} · no data {outcome.no_data} · {qualified_text}"]
     present = [gate for gate in TRADE_GATES if outcome.failed_counts.get(gate)]
     if present:
         lines.append(
@@ -2057,7 +2065,8 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
         "⚠️ Short-Term Trade Candidates (Informational Only):",
         "Not investment advice. No guarantee of profit. Use strict risk management.",
         _render_gate_summary(),
-        "Metrics use each symbol's last completed session.",
+        "Metrics use each symbol's last completed session. "
+        f"Volx ✓ marks volume ≥{SETTINGS.trade_min_volume_ratio:.1f}x its 20-session average.",
     ]
 
     if outcome.qualified:
@@ -2088,7 +2097,7 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
     else:
         lines.append("No candidates qualified.")
 
-    lines.extend(_render_diagnostics(outcome))
+    lines.extend(_render_diagnostics(outcome, top_n))
     return "\n".join(lines) + "\n\n"
 
 

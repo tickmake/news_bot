@@ -5,6 +5,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -619,9 +620,17 @@ def _cand(title, url=None, hours_old=1.0, trusted=True, provider="rss"):
 
 
 def _history(closes, volumes=None, last_date=None, tz="America/New_York"):
-    """Build a yfinance-shaped OHLCV frame ending on `last_date`."""
+    """Build a yfinance-shaped OHLCV frame ending on `last_date`.
+
+    The default `last_date` is derived from the SAME timezone (`tz`) the
+    index gets stamped with below. Deriving it from the host's local
+    timezone instead (e.g. `datetime.now().date()`) would let the two
+    disagree: when the host clock is a calendar day ahead of `tz`, "host
+    yesterday" is actually `tz` TODAY, so `_drop_in_progress_bar` correctly
+    drops it and the fixture silently loses its last row.
+    """
     n = len(closes)
-    end = last_date or (datetime.now().date() - timedelta(days=1))
+    end = last_date or (datetime.now(ZoneInfo(tz)).date() - timedelta(days=1))
     idx = pd.date_range(end=pd.Timestamp(end), periods=n, freq="D", tz=tz)
     close = pd.Series([float(c) for c in closes], index=idx, dtype="float64")
     vols = volumes if volumes is not None else [1_000_000] * n
@@ -1359,6 +1368,13 @@ class TradeMetricsTests(unittest.TestCase):
         self.assertAlmostEqual(metrics.week_momentum_pct, 4.0, places=6)
         self.assertTrue(metrics.above_ema20)
         self.assertAlmostEqual(metrics.drawdown_pct, 0.0, places=6)
+        # Volume is uniform across the fixture (default 1_000_000/bar), so the
+        # last bar's volume equals its own 20-bar average.
+        self.assertAlmostEqual(metrics.volume_ratio, 1.0, places=6)
+        # True range is constant at 1% of close (High/Low = close * 1.005/0.995)
+        # for every bar except the flat->rising transition, which is why ATR%
+        # settles just above 1% rather than exactly at it.
+        self.assertAlmostEqual(metrics.atr_pct, 1.102335, places=5)
 
     def test_session_reflects_last_kept_bar(self):
         last = datetime.now().date() - timedelta(days=3)
@@ -1417,6 +1433,13 @@ class TradeGateTests(unittest.TestCase):
         )
         self.assertNotEqual(failed, [])
 
+    def test_day_change_of_exactly_zero_fails_momentum_1d(self):
+        """The gate uses strict `<=` against the default 0.0 threshold, so an
+        exactly-flat day must fail rather than pass on a boundary tie."""
+        with patch.object(news_bot.SETTINGS, "trade_min_day_change_pct", 0.0):
+            failed = news_bot._failed_gates(_metrics(day_change_pct=0.0))
+        self.assertIn("momentum_1d", failed)
+
     def test_high_volatility_is_rejected(self):
         with patch.object(news_bot.SETTINGS, "trade_max_atr_pct", 4.5):
             self.assertEqual(news_bot._failed_gates(_metrics(atr_pct=9.0)), ["volatility"])
@@ -1464,6 +1487,43 @@ class TradeRankingTests(unittest.TestCase):
             [m.symbol for m in sorted([b, a], key=news_bot._rank_key)],
             ["AAA", "BBB"],
         )
+
+
+class ScreenUniverseDeadlineTests(unittest.TestCase):
+    """Regression: `_screen_universe` checks the deadline AFTER consuming and
+    counting `future.result()`. Checking first would discard work that had
+    already finished by the time the loop got around to looking at it."""
+
+    def _qualifying(self, symbol):
+        return news_bot.TradeMetrics(
+            symbol=symbol, session="2026-08-13", last_close=100.0,
+            day_change_pct=1.0, week_momentum_pct=5.0, volume_ratio=1.6,
+            drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
+        )
+
+    def test_already_finished_result_survives_an_expired_deadline(self):
+        # time.time() is called once to set the baseline deadline, then once
+        # per loop iteration to check it. Returning a huge value from the
+        # second call onward simulates a deadline that has already expired
+        # by the time the (single) in-flight future finishes.
+        with patch.object(news_bot.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
+            news_bot.time, "time", side_effect=[0.0] + [1e12] * 20
+        ), patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            outcome, _labels = news_bot._screen_universe([("Alpha", "AAA")])
+
+        self.assertTrue(outcome.deadline_hit)
+        self.assertEqual(outcome.analysed, 1)
+        self.assertEqual([m.symbol for m in outcome.qualified], ["AAA"])
+
+    def test_deadline_hit_rendering_shows_analysed_of_checked(self):
+        with patch.object(news_bot.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
+            news_bot.time, "time", side_effect=[0.0] + [1e12] * 20
+        ), patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+
+        self.assertIn("AAA", result)
+        self.assertIn("qualified 1", result)
+        self.assertIn("(deadline hit, analysed 1 of 1)", result)
 
 
 class CandidateUniverseTests(unittest.TestCase):
@@ -1546,6 +1606,29 @@ class TradeRenderingTests(unittest.TestCase):
         self.assertIn("Session", result)
         self.assertIn("2026-08-13", result)
         self.assertNotIn("Score", result)
+
+    def test_volume_marker_threshold_is_disclosed(self):
+        """The ✓ marker needs a legend, or a reader has no way to know what
+        volume ratio it takes to earn one."""
+        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
+            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+                result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("1.2", result)
+
+    def test_qualified_footer_discloses_truncation(self):
+        universe = {f"Name{i}": f"SYM{i}" for i in range(7)}
+        with patch(
+            "news_bot._compute_trade_metrics",
+            side_effect=lambda symbol: self._qualifying(symbol, momentum=5.0),
+        ):
+            result = news_bot.get_trade_candidates(universe=universe, top_n=2)
+        self.assertIn("qualified 7 (showing 2)", result)
+
+    def test_qualified_footer_omits_showing_when_not_truncated(self):
+        with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("qualified 1", result)
+        self.assertNotIn("showing", result)
 
     def test_volume_confirmation_marker(self):
         with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
