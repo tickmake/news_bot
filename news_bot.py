@@ -1823,6 +1823,41 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
         return None
 
 
+# Evaluated in this order, so a rejected symbol attributes to its first
+# meaningful blocker in the diagnostic footer.
+TRADE_GATES: Tuple[str, ...] = (
+    "trend",
+    "momentum_5d",
+    "momentum_1d",
+    "volatility",
+    "drawdown",
+)
+
+
+def _failed_gates(metrics: TradeMetrics) -> List[str]:
+    """Gates this symbol fails. Empty means it qualifies.
+
+    Every gate is mandatory. The previous additive score let three risk
+    criteria substitute for the three momentum criteria, so a steadily
+    declining stock was admitted on low volatility and low drawdown alone.
+
+    Volume is deliberately absent: it confirms a move but its absence does not
+    disqualify one, so it ranks (see _rank_key) rather than admits.
+    """
+    failed: List[str] = []
+    if not metrics.above_ema20:
+        failed.append("trend")
+    if metrics.week_momentum_pct < SETTINGS.trade_min_week_momentum_pct:
+        failed.append("momentum_5d")
+    if metrics.day_change_pct <= SETTINGS.trade_min_day_change_pct:
+        failed.append("momentum_1d")
+    if metrics.atr_pct > SETTINGS.trade_max_atr_pct:
+        failed.append("volatility")
+    if metrics.drawdown_pct > SETTINGS.trade_max_drawdown_pct:
+        failed.append("drawdown")
+    return failed
+
+
 def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d") -> Any:
     """Fetch and cache yfinance OHLCV history to avoid repeated slow calls."""
     cache_key = f"{symbol}|{period}|{interval}"

@@ -1375,5 +1375,70 @@ class TradeMetricsTests(unittest.TestCase):
         self.assertEqual(metrics.session, last.strftime("%Y-%m-%d"))
 
 
+def _metrics(**overrides):
+    """A qualifying TradeMetrics, with fields overridden per test."""
+    base = dict(
+        symbol="AAA",
+        session="2026-08-13",
+        last_close=100.0,
+        day_change_pct=1.0,
+        week_momentum_pct=3.0,
+        volume_ratio=1.5,
+        drawdown_pct=2.0,
+        atr_pct=2.0,
+        above_ema20=True,
+    )
+    base.update(overrides)
+    return news_bot.TradeMetrics(**base)
+
+
+class TradeGateTests(unittest.TestCase):
+    def test_qualifying_metrics_fail_nothing(self):
+        self.assertEqual(news_bot._failed_gates(_metrics()), [])
+
+    def test_declining_stock_is_rejected(self):
+        failed = news_bot._failed_gates(
+            _metrics(above_ema20=False, week_momentum_pct=-0.26, day_change_pct=-0.05)
+        )
+        self.assertEqual(failed[0], "trend")
+        self.assertIn("momentum_5d", failed)
+        self.assertIn("momentum_1d", failed)
+
+    def test_flat_stock_is_rejected(self):
+        failed = news_bot._failed_gates(
+            _metrics(above_ema20=False, week_momentum_pct=0.0, day_change_pct=0.0)
+        )
+        self.assertTrue(failed)
+
+    def test_volume_spike_alone_cannot_admit(self):
+        """The primary defect: risk criteria plus volume used to reach the
+        passing score with negative momentum. Volume no longer admits at all."""
+        failed = news_bot._failed_gates(
+            _metrics(
+                above_ema20=False,
+                week_momentum_pct=-0.26,
+                day_change_pct=-0.05,
+                volume_ratio=2.73,   # capitulation-sized spike
+                drawdown_pct=0.99,   # safely near the 20d high
+                atr_pct=1.00,        # comfortably low volatility
+            )
+        )
+        self.assertNotEqual(failed, [])
+
+    def test_high_volatility_is_rejected(self):
+        with patch.object(news_bot.SETTINGS, "trade_max_atr_pct", 4.5):
+            self.assertEqual(news_bot._failed_gates(_metrics(atr_pct=9.0)), ["volatility"])
+
+    def test_deep_drawdown_is_rejected(self):
+        with patch.object(news_bot.SETTINGS, "trade_max_drawdown_pct", 8.0):
+            self.assertEqual(news_bot._failed_gates(_metrics(drawdown_pct=20.0)), ["drawdown"])
+
+    def test_gate_order_is_stable(self):
+        failed = news_bot._failed_gates(
+            _metrics(above_ema20=False, week_momentum_pct=-1.0, atr_pct=99.0)
+        )
+        self.assertEqual(failed, ["trend", "momentum_5d", "volatility"])
+
+
 if __name__ == "__main__":
     unittest.main()
