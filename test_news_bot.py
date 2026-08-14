@@ -1,9 +1,12 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+
+import pandas as pd
 
 import news_bot
 
@@ -620,6 +623,23 @@ def _cand(title, url=None, hours_old=1.0, trusted=True, provider="rss"):
         published_at=base.published_at,
         provider=base.provider,
         trusted=trusted,
+    )
+
+
+def _history(closes, volumes=None, last_date=None, tz="America/New_York"):
+    """Build a yfinance-shaped OHLCV frame ending on `last_date`."""
+    n = len(closes)
+    end = last_date or (datetime.now().date() - timedelta(days=1))
+    idx = pd.date_range(end=pd.Timestamp(end), periods=n, freq="D", tz=tz)
+    close = pd.Series([float(c) for c in closes], index=idx, dtype="float64")
+    vols = volumes if volumes is not None else [1_000_000] * n
+    return pd.DataFrame(
+        {
+            "Close": close,
+            "High": close * 1.005,
+            "Low": close * 0.995,
+            "Volume": pd.Series([float(v) for v in vols], index=idx, dtype="float64"),
+        }
     )
 
 
@@ -1308,6 +1328,51 @@ class HealthReportTests(unittest.TestCase):
         self.assertIn("Bot Health Check", report)
         self.assertIn("Last run status", report)
         self.assertIn("Timezone", report)
+
+
+class TradeMetricsTests(unittest.TestCase):
+    def tearDown(self):
+        news_bot.HISTORY_CACHE.clear()
+
+    def _cache(self, symbol, history):
+        news_bot.HISTORY_CACHE[f"{symbol}|3mo|1d"] = (time.time(), history)
+
+    def test_drops_bar_dated_today(self):
+        today = datetime.now(timezone.utc).date()
+        history = _history([100.0] * 40, last_date=today, tz="UTC")
+        trimmed = news_bot._drop_in_progress_bar(history)
+        self.assertEqual(len(trimmed), 39)
+        self.assertLess(trimmed.index[-1].date(), today)
+
+    def test_keeps_bar_dated_before_today(self):
+        yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+        history = _history([100.0] * 40, last_date=yesterday, tz="UTC")
+        trimmed = news_bot._drop_in_progress_bar(history)
+        self.assertEqual(len(trimmed), 40)
+
+    def test_returns_none_below_thirty_usable_bars(self):
+        self._cache("SHORT", _history([100.0] * 29))
+        self.assertIsNone(news_bot._compute_trade_metrics("SHORT"))
+
+    def test_metrics_computed_on_known_fixture(self):
+        closes = [100.0] * 35 + [100.0, 101.0, 102.0, 103.0, 104.0]
+        self._cache("RISE", _history(closes))
+        metrics = news_bot._compute_trade_metrics("RISE")
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.symbol, "RISE")
+        self.assertAlmostEqual(metrics.last_close, 104.0, places=4)
+        # 104 vs prior close 103
+        self.assertAlmostEqual(metrics.day_change_pct, 0.970873786, places=6)
+        # 104 vs the close five bars back (100.0)
+        self.assertAlmostEqual(metrics.week_momentum_pct, 4.0, places=6)
+        self.assertTrue(metrics.above_ema20)
+        self.assertAlmostEqual(metrics.drawdown_pct, 0.0, places=6)
+
+    def test_session_reflects_last_kept_bar(self):
+        last = datetime.now().date() - timedelta(days=3)
+        self._cache("SESS", _history([100.0] * 40, last_date=last))
+        metrics = news_bot._compute_trade_metrics("SESS")
+        self.assertEqual(metrics.session, last.strftime("%Y-%m-%d"))
 
 
 if __name__ == "__main__":

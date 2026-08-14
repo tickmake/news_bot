@@ -1721,6 +1721,108 @@ def _compute_atr_percent(history: Any) -> Optional[float]:
         return None
 
 
+@dataclass(frozen=True)
+class TradeMetrics:
+    """Measured facts about one symbol. Carries no pass/fail judgement."""
+
+    symbol: str
+    session: str
+    last_close: float
+    day_change_pct: float
+    week_momentum_pct: float
+    volume_ratio: float
+    drawdown_pct: float
+    atr_pct: float
+    above_ema20: bool
+
+
+def _drop_in_progress_bar(history: Any) -> Any:
+    """Drop the final row when it is dated today in the exchange's timezone.
+
+    yfinance returns a tz-aware DatetimeIndex in the exchange's own timezone, so
+    "today" is evaluated there rather than in the host's locale. A market that
+    already closed today still has its session discarded: this screen ranks
+    symbols against each other, and letting some rows advance a session while
+    others do not would compare momentum windows offset by a day.
+    """
+    if history is None or len(history) == 0:
+        return history
+    index = history.index
+    tz = getattr(index, "tz", None)
+    today = datetime.now(tz).date() if tz is not None else datetime.now().date()
+    if index[-1].date() == today:
+        return history.iloc[:-1]
+    return history
+
+
+def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
+    """Measure one symbol, or None when the data cannot support a measurement.
+
+    None means "no usable data" and nothing else. Whether a symbol qualifies is
+    _failed_gates' decision; keeping the two separate is what lets the caller
+    report why a run found nothing.
+    """
+    try:
+        history = _drop_in_progress_bar(_fetch_ticker_history(symbol))
+        close_series = history["Close"].dropna()
+        if len(close_series) < 30:
+            LOGGER.debug(
+                "metrics_skipped symbol=%s reason=insufficient_history bars=%s",
+                symbol,
+                len(close_series),
+            )
+            return None
+
+        last_close = float(close_series.iloc[-1])
+        prev_close = float(close_series.iloc[-2])
+        if prev_close == 0:
+            LOGGER.debug("metrics_skipped symbol=%s reason=zero_prev_close", symbol)
+            return None
+        day_change_pct = ((last_close - prev_close) / prev_close) * 100
+
+        # Safe unconditionally: the length guard above already rules out short series.
+        reference_close = float(close_series.iloc[-6])
+        if reference_close == 0:
+            LOGGER.debug("metrics_skipped symbol=%s reason=zero_reference_close", symbol)
+            return None
+        week_momentum_pct = ((last_close - reference_close) / reference_close) * 100
+
+        ema_20 = float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
+
+        volume_ratio = 1.0
+        if "Volume" in history:
+            volume_series = history["Volume"].dropna()
+            if len(volume_series) >= 20:
+                avg_volume_20 = float(volume_series.tail(20).mean())
+                if avg_volume_20 > 0:
+                    volume_ratio = float(volume_series.iloc[-1]) / avg_volume_20
+
+        rolling_high_20 = float(close_series.tail(20).max())
+        drawdown_pct = (
+            ((rolling_high_20 - last_close) / rolling_high_20) * 100 if rolling_high_20 else 0.0
+        )
+
+        atr_pct = _compute_atr_percent(history)
+        if atr_pct is None:
+            LOGGER.debug("metrics_skipped symbol=%s reason=atr_unavailable", symbol)
+            return None
+
+        return TradeMetrics(
+            symbol=symbol,
+            session=close_series.index[-1].strftime("%Y-%m-%d"),
+            last_close=last_close,
+            day_change_pct=day_change_pct,
+            week_momentum_pct=week_momentum_pct,
+            volume_ratio=volume_ratio,
+            drawdown_pct=drawdown_pct,
+            atr_pct=atr_pct,
+            above_ema20=last_close > ema_20,
+        )
+    except Exception as exc:
+        LOGGER.debug("metrics_failed symbol=%s detail=%s", symbol, exc)
+        return None
+
+
 def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d") -> Any:
     """Fetch and cache yfinance OHLCV history to avoid repeated slow calls."""
     cache_key = f"{symbol}|{period}|{interval}"
