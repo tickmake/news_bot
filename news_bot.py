@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -111,6 +112,58 @@ class BandedFormatter(logging.Formatter):
             line = f"{_ANSI['dim']}{line}{_ANSI['reset']}"
         return line
 
+_VALID_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+_LOGGING_CONFIGURED = False
+
+
+def _resolve_level(raw: str, fallback: int = logging.INFO) -> Tuple[int, Optional[str]]:
+    """Level number, plus the rejected value when the name was not recognised.
+
+    logging.getLevelName("BOGUS") returns the *string* "Level BOGUS" rather
+    than raising, so a typo'd level would sail through and configure nonsense.
+    """
+    text = (raw or "").strip().upper()
+    if text in _VALID_LEVELS:
+        return getattr(logging, text), None
+    return fallback, raw
+
+
+def _configure_logging() -> None:
+    """Install the banded handler on the root logger. Idempotent.
+
+    Must run after SETTINGS exists. Called twice -- module re-import, test
+    setup -- an unguarded version would duplicate every line.
+    """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+
+    app_level, rejected_app = _resolve_level(SETTINGS.log_level)
+    lib_level, rejected_lib = _resolve_level(SETTINGS.log_level_libraries, logging.WARNING)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(BandedFormatter(colour=SETTINGS.log_color))
+
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+
+    # Libraries inherit the root level; news_bot carries its own. Ancestor
+    # logger levels do not filter propagated records -- only the originating
+    # logger's effective level and the handler's level do -- so news_bot at
+    # DEBUG still reaches this handler with root at WARNING, while urllib3
+    # inherits WARNING and stays quiet.
+    root.setLevel(lib_level)
+    LOGGER.setLevel(app_level)
+
+    _LOGGING_CONFIGURED = True
+
+    if rejected_app is not None:
+        SYS_LOG.warning("log_level_invalid value=%s using=INFO", rejected_app)
+    if rejected_lib is not None:
+        SYS_LOG.warning("log_level_libraries_invalid value=%s using=WARNING", rejected_lib)
+
 DEFAULT_GLOBAL_NEWS_FEEDS = (
     "https://feeds.bbci.co.uk/news/world/rss.xml,"
     "https://www.cnbc.com/id/100727362/device/rss/rss.html,"
@@ -180,6 +233,9 @@ class AppSettings(BaseSettings):
     news_fetch_priority: str = "newsapi,freenews,rss"
     recipient_name: str = "Sunil"
     tz: str = "Europe/Oslo"
+    log_level: str = "INFO"
+    log_level_libraries: str = "WARNING"
+    log_color: bool = True
     request_timeout_seconds: int = 15
     telegram_message_max_chars: int = 3900
     state_file: str = ".news_bot_state.json"
@@ -265,6 +321,7 @@ class AppSettings(BaseSettings):
 
 
 SETTINGS = AppSettings()
+_configure_logging()
 LIVE_QUOTES_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 YAHOO_SCREENER_BACKOFF_UNTIL = 0.0
 FINNHUB_QUOTE_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}

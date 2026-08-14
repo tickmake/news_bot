@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import time
 import unittest
@@ -1967,3 +1968,68 @@ class LogColourTests(unittest.TestCase):
         # Message body should have no error or warn colour codes
         self.assertNotIn(news_bot._ANSI["error"], after_level)
         self.assertNotIn(news_bot._ANSI["warn"], after_level)
+
+
+class LogConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._root_handlers = list(logging.getLogger().handlers)
+        self._root_level = logging.getLogger().level
+        self._app_level = news_bot.LOGGER.level
+
+    def tearDown(self):
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        for handler in self._root_handlers:
+            root.addHandler(handler)
+        root.setLevel(self._root_level)
+        news_bot.LOGGER.setLevel(self._app_level)
+        news_bot._LOGGING_CONFIGURED = True
+
+    def _configure(self, **overrides):
+        settings = {"log_level": "INFO", "log_level_libraries": "WARNING", "log_color": False}
+        settings.update(overrides)
+        news_bot._LOGGING_CONFIGURED = False
+        with patch.multiple(news_bot.SETTINGS, **settings):
+            news_bot._configure_logging()
+
+    def test_resolve_level_accepts_known_names(self):
+        self.assertEqual(news_bot._resolve_level("DEBUG"), (logging.DEBUG, None))
+        self.assertEqual(news_bot._resolve_level("warning"), (logging.WARNING, None))
+
+    def test_resolve_level_reports_an_unknown_name(self):
+        """logging.getLevelName("BOGUS") returns the string "Level BOGUS"
+        rather than raising, so a typo would otherwise configure nonsense."""
+        level, rejected = news_bot._resolve_level("BOGUS")
+        self.assertEqual(level, logging.INFO)
+        self.assertEqual(rejected, "BOGUS")
+
+    def test_invalid_level_warns_and_names_the_ignored_value(self):
+        with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
+            self._configure(log_level="BOGUS")
+        self.assertTrue(any("log_level_invalid" in line for line in logs.output))
+        self.assertTrue(any("BOGUS" in line for line in logs.output))
+
+    def test_handler_writes_to_stdout_not_stderr(self):
+        """basicConfig defaults to stderr, so routine INFO arrived on the
+        error stream."""
+        self._configure()
+        handlers = logging.getLogger().handlers
+        self.assertEqual(len(handlers), 1)
+        self.assertIs(handlers[0].stream, sys.stdout)
+
+    def test_configuring_twice_installs_one_handler(self):
+        self._configure()
+        news_bot._configure_logging()  # second call, flag already set
+        self.assertEqual(len(logging.getLogger().handlers), 1)
+
+    def test_app_debug_does_not_unleash_library_debug(self):
+        """urllib3 emits a line per socket at DEBUG; the app must be able to
+        go verbose without that."""
+        self._configure(log_level="DEBUG", log_level_libraries="WARNING")
+        self.assertTrue(news_bot.SYS_LOG.isEnabledFor(logging.DEBUG))
+        self.assertFalse(logging.getLogger("urllib3.connectionpool").isEnabledFor(logging.DEBUG))
+
+    def test_library_level_can_be_lowered_on_its_own(self):
+        self._configure(log_level="INFO", log_level_libraries="DEBUG")
+        self.assertTrue(logging.getLogger("urllib3.connectionpool").isEnabledFor(logging.DEBUG))
