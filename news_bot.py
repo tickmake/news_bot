@@ -51,6 +51,16 @@ def _band_for(logger_name: str) -> str:
     return BAND_INFRA
 
 
+_ANSI: Dict[str, str] = {
+    "reset": "\033[0m",
+    "dim": "\033[2m",
+    "app": "\033[1;36m",    # bold cyan -- the lines you came to read
+    "sys": "\033[33m",      # yellow
+    "warn": "\033[33m",
+    "error": "\033[1;31m",  # bold red
+}
+
+
 class BandedFormatter(logging.Formatter):
     """One line as: timestamp  BAND   LEVEL  message.
 
@@ -78,7 +88,25 @@ class BandedFormatter(logging.Formatter):
         if record.exc_info:
             message = f"{message}\n{self.formatException(record.exc_info)}"
 
-        return f"{stamp}  {band:<5}  {level:<5}  {message}"
+        band_text = f"{band:<5}"
+        level_text = f"{level:<5}"
+        if self.colour:
+            if band == BAND_APP:
+                band_text = f"{_ANSI['app']}{band_text}{_ANSI['reset']}"
+            elif band == BAND_SYS:
+                band_text = f"{_ANSI['sys']}{band_text}{_ANSI['reset']}"
+            # Severity colours the level tag independently, so an ERROR stays
+            # obvious without losing its band.
+            if record.levelno >= logging.ERROR:
+                level_text = f"{_ANSI['error']}{level_text}{_ANSI['reset']}"
+            elif record.levelno == logging.WARNING:
+                level_text = f"{_ANSI['warn']}{level_text}{_ANSI['reset']}"
+
+        line = f"{stamp}  {band_text}  {level_text}  {message}"
+        if self.colour and band == BAND_INFRA:
+            # INFRA recedes rather than competing for attention.
+            line = f"{_ANSI['dim']}{line}{_ANSI['reset']}"
+        return line
 
 DEFAULT_GLOBAL_NEWS_FEEDS = (
     "https://feeds.bbci.co.uk/news/world/rss.xml,"

@@ -1849,3 +1849,57 @@ class LogBandTests(unittest.TestCase):
         library message."""
         line = news_bot.BandedFormatter(colour=False).format(_record("news_bot.app"))
         self.assertNotIn("event=", line)
+
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _strip_ansi(text):
+    return _ANSI_RE.sub("", text)
+
+
+class LogColourTests(unittest.TestCase):
+    def test_colour_off_emits_no_escapes(self):
+        line = news_bot.BandedFormatter(colour=False).format(_record("news_bot.app"))
+        self.assertNotIn("\033[", line)
+
+    def test_colour_on_emits_escapes(self):
+        line = news_bot.BandedFormatter(colour=True).format(_record("news_bot.app"))
+        self.assertIn("\033[", line)
+
+    def test_stripping_colour_reproduces_the_plain_line_exactly(self):
+        """The load-bearing invariant: grep, log shipping and any future
+        parsing must not depend on a display setting."""
+        cases = [
+            _record("news_bot.app", logging.INFO),
+            _record("news_bot.sys", logging.WARNING),
+            _record("news_bot.sys", logging.ERROR),
+            _record("apscheduler.scheduler", logging.INFO, msg="Scheduler started"),
+            _record("urllib3.connectionpool", logging.DEBUG),
+        ]
+        plain = news_bot.BandedFormatter(colour=False)
+        fancy = news_bot.BandedFormatter(colour=True)
+        for record in cases:
+            with self.subTest(name=record.name, level=record.levelno):
+                self.assertEqual(_strip_ansi(fancy.format(record)), plain.format(record))
+
+    def test_infra_lines_are_dimmed_whole(self):
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", msg="Scheduler started")
+        )
+        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+
+    def test_error_level_is_coloured_independently_of_band(self):
+        """An error must stay obvious without losing which band it came from."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("news_bot.app", logging.ERROR)
+        )
+        self.assertIn(news_bot._ANSI["error"], line)
+        self.assertIn(news_bot._ANSI["app"], line)
+
+    def test_message_body_is_never_coloured(self):
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("news_bot.app", logging.WARNING, msg="telegram_sent chunks=3")
+        )
+        self.assertIn(f"{news_bot._ANSI['reset']}  telegram_sent chunks=3", line)
