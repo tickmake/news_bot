@@ -47,7 +47,7 @@ services:
     command:
       - >
         until ollama list >/dev/null 2>&1; do echo "waiting for ollama"; sleep 3; done;
-        ollama pull '${NEWS_RANKER_MODEL:-llama3.2:3b}'
+        ollama pull '${NEWS_RANKER_MODEL:-qwen2.5:3b}'
     restart: "no"
 
   news-notifier:
@@ -76,11 +76,12 @@ services:
       # heuristic ranker, so this is never a hard dependency.
       - NEWS_RANKER_ENABLED=${NEWS_RANKER_ENABLED:-true}
       - NEWS_RANKER_URL=${NEWS_RANKER_URL:-http://ollama:11434}
-      - NEWS_RANKER_MODEL=${NEWS_RANKER_MODEL:-llama3.2:3b}
-      # Measured on a Raspberry Pi 5 with a warm llama3.2:3b: 20 candidates
-      # ~74s, 40 ~150s. Keep the shortlist small and the timeout generous.
+      - NEWS_RANKER_MODEL=${NEWS_RANKER_MODEL:-qwen2.5:3b}
+      # Measured on a Raspberry Pi 5 with a warm qwen2.5:3b: 14 candidates
+      # ~107s, 20 ~236s. llama3.2:3b needs ~193s at 14 and exceeds the 240s
+      # timeout at 20. Keep the shortlist small and the timeout generous.
       - NEWS_RANKER_TIMEOUT_SECONDS=${NEWS_RANKER_TIMEOUT_SECONDS:-240}
-      - NEWS_RANKER_MAX_CANDIDATES=${NEWS_RANKER_MAX_CANDIDATES:-20}
+      - NEWS_RANKER_MAX_CANDIDATES=${NEWS_RANKER_MAX_CANDIDATES:-14}
       # The fetch pool stays wide so cross-outlet dedup and the heuristic keep
       # their breadth; only the LLM sees the shortlist above.
       - NEWS_CANDIDATE_POOL_SIZE=${NEWS_CANDIDATE_POOL_SIZE:-60}
