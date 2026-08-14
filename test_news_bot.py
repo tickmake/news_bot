@@ -1876,6 +1876,8 @@ class LogColourTests(unittest.TestCase):
             _record("news_bot.sys", logging.ERROR),
             _record("apscheduler.scheduler", logging.INFO, msg="Scheduler started"),
             _record("urllib3.connectionpool", logging.DEBUG),
+            _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning"),
+            _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error"),
         ]
         plain = news_bot.BandedFormatter(colour=False)
         fancy = news_bot.BandedFormatter(colour=True)
@@ -1903,3 +1905,35 @@ class LogColourTests(unittest.TestCase):
             _record("news_bot.app", logging.WARNING, msg="telegram_sent chunks=3")
         )
         self.assertIn(f"{news_bot._ANSI['reset']}  telegram_sent chunks=3", line)
+
+    def test_infra_warning_renders_dim_whole(self):
+        """INFRA+WARNING must stay dimmed across the whole line."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning")
+        )
+        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+
+    def test_infra_error_renders_dim_whole(self):
+        """INFRA+ERROR must stay dimmed across the whole line."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
+        )
+        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+
+    def test_infra_error_distinguishable_from_info(self):
+        """INFRA+ERROR must be visually distinct from INFRA+INFO, even while dimmed."""
+        info_line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.INFO, msg="Scheduler started")
+        )
+        error_line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
+        )
+        # Both must be dimmed
+        self.assertTrue(info_line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(error_line.startswith(news_bot._ANSI["dim"]))
+        # Error line must contain the error colour
+        self.assertIn(news_bot._ANSI["error"], error_line)
+        # Info line must not contain the error colour
+        self.assertNotIn(news_bot._ANSI["error"], info_line)

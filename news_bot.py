@@ -91,6 +91,8 @@ class BandedFormatter(logging.Formatter):
         band_text = f"{band:<5}"
         level_text = f"{level:<5}"
         if self.colour:
+            ambient_reset = _ANSI["dim"] if band == BAND_INFRA else _ANSI["reset"]
+
             if band == BAND_APP:
                 band_text = f"{_ANSI['app']}{band_text}{_ANSI['reset']}"
             elif band == BAND_SYS:
@@ -98,9 +100,9 @@ class BandedFormatter(logging.Formatter):
             # Severity colours the level tag independently, so an ERROR stays
             # obvious without losing its band.
             if record.levelno >= logging.ERROR:
-                level_text = f"{_ANSI['error']}{level_text}{_ANSI['reset']}"
+                level_text = f"{_ANSI['error']}{level_text}{ambient_reset}"
             elif record.levelno == logging.WARNING:
-                level_text = f"{_ANSI['warn']}{level_text}{_ANSI['reset']}"
+                level_text = f"{_ANSI['warn']}{level_text}{ambient_reset}"
 
         line = f"{stamp}  {band_text}  {level_text}  {message}"
         if self.colour and band == BAND_INFRA:
