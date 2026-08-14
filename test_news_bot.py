@@ -1,9 +1,13 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 import news_bot
 
@@ -44,33 +48,25 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(parsed_empty, fallback)
         self.assertEqual(parsed_invalid, fallback)
 
-    @patch("news_bot._analyze_short_term_candidate")
-    def test_get_trade_candidates_formats_ranked_output(self, mock_analyze):
+    @patch("news_bot._compute_trade_metrics")
+    def test_get_trade_candidates_formats_ranked_output(self, mock_metrics):
         def side_effect(symbol):
             data = {
-                "AAA": {
-                    "score": 4.0,
-                    "last_close": 100.0,
-                    "day_change_pct": 1.2,
-                    "week_momentum_pct": 3.5,
-                    "volume_ratio": 1.6,
-                    "drawdown_pct": 2.1,
-                    "atr_pct": 1.4,
-                },
-                "BBB": {
-                    "score": 3.0,
-                    "last_close": 80.0,
-                    "day_change_pct": 0.4,
-                    "week_momentum_pct": 2.1,
-                    "volume_ratio": 1.3,
-                    "drawdown_pct": 3.0,
-                    "atr_pct": 2.0,
-                },
+                "AAA": news_bot.TradeMetrics(
+                    symbol="AAA", session="2026-08-13", last_close=100.0,
+                    day_change_pct=1.2, week_momentum_pct=3.5, volume_ratio=1.6,
+                    drawdown_pct=2.1, atr_pct=1.4, above_ema20=True,
+                ),
+                "BBB": news_bot.TradeMetrics(
+                    symbol="BBB", session="2026-08-13", last_close=80.0,
+                    day_change_pct=0.4, week_momentum_pct=2.1, volume_ratio=1.3,
+                    drawdown_pct=3.0, atr_pct=2.0, above_ema20=True,
+                ),
                 "CCC": None,
             }
             return data.get(symbol)
 
-        mock_analyze.side_effect = side_effect
+        mock_metrics.side_effect = side_effect
 
         result = news_bot.get_trade_candidates(
             universe={"Alpha": "AAA", "Beta": "BBB", "Gamma": "CCC"},
@@ -83,13 +79,13 @@ class NewsBotTests(unittest.TestCase):
         self.assertIn("Beta", result)
         self.assertIn("BBB", result)
         self.assertNotIn("Gamma", result)
-        self.assertIn("No guarantee of 1-2% daily profit", result)
+        self.assertIn("Not investment advice. No guarantee of profit.", result)
 
-    @patch("news_bot._analyze_short_term_candidate")
-    def test_get_trade_candidates_no_matches(self, mock_analyze):
-        mock_analyze.return_value = None
+    @patch("news_bot._compute_trade_metrics")
+    def test_get_trade_candidates_no_matches(self, mock_metrics):
+        mock_metrics.return_value = None
         result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=2)
-        self.assertIn("No candidates met the momentum criteria today.", result)
+        self.assertIn("No candidates qualified.", result)
 
     @patch("news_bot.requests.get")
     def test_get_global_news_success(self, mock_get):
@@ -312,13 +308,13 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(mock_ticker.call_count, 1)
         news_bot.HISTORY_CACHE.clear()
 
-    @patch("news_bot._analyze_short_term_candidate")
-    def test_get_trade_candidates_caps_universe(self, mock_analyze):
-        mock_analyze.return_value = None
+    @patch("news_bot._compute_trade_metrics")
+    def test_get_trade_candidates_caps_universe(self, mock_metrics):
+        mock_metrics.return_value = None
         big_universe = {f"Name{i}": f"SYM{i}" for i in range(50)}
         with patch.object(news_bot.SETTINGS, "trade_universe_max", 5):
             news_bot.get_trade_candidates(universe=big_universe, top_n=3)
-        self.assertEqual(mock_analyze.call_count, 5)
+        self.assertEqual(mock_metrics.call_count, 5)
 
     @patch("news_bot.requests.get")
     def test_poll_telegram_commands_passes_long_poll_timeout(self, mock_get):
@@ -620,6 +616,31 @@ def _cand(title, url=None, hours_old=1.0, trusted=True, provider="rss"):
         published_at=base.published_at,
         provider=base.provider,
         trusted=trusted,
+    )
+
+
+def _history(closes, volumes=None, last_date=None, tz="America/New_York"):
+    """Build a yfinance-shaped OHLCV frame ending on `last_date`.
+
+    The default `last_date` is derived from the SAME timezone (`tz`) the
+    index gets stamped with below. Deriving it from the host's local
+    timezone instead (e.g. `datetime.now().date()`) would let the two
+    disagree: when the host clock is a calendar day ahead of `tz`, "host
+    yesterday" is actually `tz` TODAY, so `_drop_in_progress_bar` correctly
+    drops it and the fixture silently loses its last row.
+    """
+    n = len(closes)
+    end = last_date or (datetime.now(ZoneInfo(tz)).date() - timedelta(days=1))
+    idx = pd.date_range(end=pd.Timestamp(end), periods=n, freq="D", tz=tz)
+    close = pd.Series([float(c) for c in closes], index=idx, dtype="float64")
+    vols = volumes if volumes is not None else [1_000_000] * n
+    return pd.DataFrame(
+        {
+            "Close": close,
+            "High": close * 1.005,
+            "Low": close * 0.995,
+            "Volume": pd.Series([float(v) for v in vols], index=idx, dtype="float64"),
+        }
     )
 
 
@@ -1308,6 +1329,374 @@ class HealthReportTests(unittest.TestCase):
         self.assertIn("Bot Health Check", report)
         self.assertIn("Last run status", report)
         self.assertIn("Timezone", report)
+
+
+class TradeMetricsTests(unittest.TestCase):
+    def tearDown(self):
+        news_bot.HISTORY_CACHE.clear()
+
+    def _cache(self, symbol, history):
+        news_bot.HISTORY_CACHE[f"{symbol}|3mo|1d"] = (time.time(), history)
+
+    def test_drops_bar_dated_today(self):
+        today = datetime.now(timezone.utc).date()
+        history = _history([100.0] * 40, last_date=today, tz="UTC")
+        trimmed = news_bot._drop_in_progress_bar(history)
+        self.assertEqual(len(trimmed), 39)
+        self.assertLess(trimmed.index[-1].date(), today)
+
+    def test_keeps_bar_dated_before_today(self):
+        yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+        history = _history([100.0] * 40, last_date=yesterday, tz="UTC")
+        trimmed = news_bot._drop_in_progress_bar(history)
+        self.assertEqual(len(trimmed), 40)
+
+    def test_returns_none_below_thirty_usable_bars(self):
+        self._cache("SHORT", _history([100.0] * 29))
+        self.assertIsNone(news_bot._compute_trade_metrics("SHORT"))
+
+    def test_metrics_computed_on_known_fixture(self):
+        closes = [100.0] * 35 + [100.0, 101.0, 102.0, 103.0, 104.0]
+        self._cache("RISE", _history(closes))
+        metrics = news_bot._compute_trade_metrics("RISE")
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.symbol, "RISE")
+        self.assertAlmostEqual(metrics.last_close, 104.0, places=4)
+        # 104 vs prior close 103
+        self.assertAlmostEqual(metrics.day_change_pct, 0.970873786, places=6)
+        # 104 vs the close five bars back (100.0)
+        self.assertAlmostEqual(metrics.week_momentum_pct, 4.0, places=6)
+        self.assertTrue(metrics.above_ema20)
+        self.assertAlmostEqual(metrics.drawdown_pct, 0.0, places=6)
+        # Volume is uniform across the fixture (default 1_000_000/bar), so the
+        # last bar's volume equals its own 20-bar average.
+        self.assertAlmostEqual(metrics.volume_ratio, 1.0, places=6)
+        # True range is constant at 1% of close (High/Low = close * 1.005/0.995)
+        # for every bar except the flat->rising transition, which is why ATR%
+        # settles just above 1% rather than exactly at it.
+        self.assertAlmostEqual(metrics.atr_pct, 1.102335, places=5)
+
+    def test_session_reflects_last_kept_bar(self):
+        last = datetime.now().date() - timedelta(days=3)
+        self._cache("SESS", _history([100.0] * 40, last_date=last))
+        metrics = news_bot._compute_trade_metrics("SESS")
+        self.assertEqual(metrics.session, last.strftime("%Y-%m-%d"))
+
+
+def _metrics(**overrides):
+    """A qualifying TradeMetrics, with fields overridden per test."""
+    base = dict(
+        symbol="AAA",
+        session="2026-08-13",
+        last_close=100.0,
+        day_change_pct=1.0,
+        week_momentum_pct=3.0,
+        volume_ratio=1.5,
+        drawdown_pct=2.0,
+        atr_pct=2.0,
+        above_ema20=True,
+    )
+    base.update(overrides)
+    return news_bot.TradeMetrics(**base)
+
+
+class TradeGateTests(unittest.TestCase):
+    def test_qualifying_metrics_fail_nothing(self):
+        self.assertEqual(news_bot._failed_gates(_metrics()), [])
+
+    def test_declining_stock_is_rejected(self):
+        failed = news_bot._failed_gates(
+            _metrics(above_ema20=False, week_momentum_pct=-0.26, day_change_pct=-0.05)
+        )
+        self.assertEqual(failed[0], "trend")
+        self.assertIn("momentum_5d", failed)
+        self.assertIn("momentum_1d", failed)
+
+    def test_flat_stock_is_rejected(self):
+        failed = news_bot._failed_gates(
+            _metrics(above_ema20=False, week_momentum_pct=0.0, day_change_pct=0.0)
+        )
+        self.assertTrue(failed)
+
+    def test_volume_spike_alone_cannot_admit(self):
+        """The primary defect: risk criteria plus volume used to reach the
+        passing score with negative momentum. Volume no longer admits at all."""
+        failed = news_bot._failed_gates(
+            _metrics(
+                above_ema20=False,
+                week_momentum_pct=-0.26,
+                day_change_pct=-0.05,
+                volume_ratio=2.73,   # capitulation-sized spike
+                drawdown_pct=0.99,   # safely near the 20d high
+                atr_pct=1.00,        # comfortably low volatility
+            )
+        )
+        self.assertNotEqual(failed, [])
+
+    def test_day_change_of_exactly_zero_fails_momentum_1d(self):
+        """The gate uses strict `<=` against the default 0.0 threshold, so an
+        exactly-flat day must fail rather than pass on a boundary tie."""
+        with patch.object(news_bot.SETTINGS, "trade_min_day_change_pct", 0.0):
+            failed = news_bot._failed_gates(_metrics(day_change_pct=0.0))
+        self.assertIn("momentum_1d", failed)
+
+    def test_high_volatility_is_rejected(self):
+        with patch.object(news_bot.SETTINGS, "trade_max_atr_pct", 4.5):
+            self.assertEqual(news_bot._failed_gates(_metrics(atr_pct=9.0)), ["volatility"])
+
+    def test_deep_drawdown_is_rejected(self):
+        with patch.object(news_bot.SETTINGS, "trade_max_drawdown_pct", 8.0):
+            self.assertEqual(news_bot._failed_gates(_metrics(drawdown_pct=20.0)), ["drawdown"])
+
+    def test_gate_order_is_stable(self):
+        failed = news_bot._failed_gates(
+            _metrics(above_ema20=False, week_momentum_pct=-1.0, atr_pct=99.0)
+        )
+        self.assertEqual(failed, ["trend", "momentum_5d", "volatility"])
+
+
+class TradeRankingTests(unittest.TestCase):
+    def test_orders_by_week_momentum_first(self):
+        low = _metrics(symbol="LOW", week_momentum_pct=1.0)
+        high = _metrics(symbol="HIGH", week_momentum_pct=9.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([low, high], key=news_bot._rank_key)],
+            ["HIGH", "LOW"],
+        )
+
+    def test_volume_breaks_momentum_ties(self):
+        quiet = _metrics(symbol="QUIET", week_momentum_pct=3.0, volume_ratio=1.0)
+        busy = _metrics(symbol="BUSY", week_momentum_pct=3.0, volume_ratio=2.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([quiet, busy], key=news_bot._rank_key)],
+            ["BUSY", "QUIET"],
+        )
+
+    def test_lower_atr_breaks_volume_ties(self):
+        calm = _metrics(symbol="CALM", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=1.0)
+        wild = _metrics(symbol="WILD", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=4.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([calm, wild], key=news_bot._rank_key)],
+            ["CALM", "WILD"],
+        )
+
+    def test_symbol_makes_full_ties_deterministic(self):
+        a = _metrics(symbol="AAA")
+        b = _metrics(symbol="BBB")
+        self.assertEqual(
+            [m.symbol for m in sorted([b, a], key=news_bot._rank_key)],
+            ["AAA", "BBB"],
+        )
+
+
+class ScreenUniverseDeadlineTests(unittest.TestCase):
+    """Regression: `_screen_universe` checks the deadline AFTER consuming and
+    counting `future.result()`. Checking first would discard work that had
+    already finished by the time the loop got around to looking at it."""
+
+    def _qualifying(self, symbol):
+        return news_bot.TradeMetrics(
+            symbol=symbol, session="2026-08-13", last_close=100.0,
+            day_change_pct=1.0, week_momentum_pct=5.0, volume_ratio=1.6,
+            drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
+        )
+
+    def test_already_finished_result_survives_an_expired_deadline(self):
+        # time.time() is called once to set the baseline deadline, then once
+        # per loop iteration to check it. Returning a huge value from the
+        # second call onward simulates a deadline that has already expired
+        # by the time the (single) in-flight future finishes.
+        with patch.object(news_bot.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
+            news_bot.time, "time", side_effect=[0.0] + [1e12] * 20
+        ), patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            outcome, _labels = news_bot._screen_universe([("Alpha", "AAA")])
+
+        self.assertTrue(outcome.deadline_hit)
+        self.assertEqual(outcome.analysed, 1)
+        self.assertEqual([m.symbol for m in outcome.qualified], ["AAA"])
+
+    def test_deadline_hit_rendering_shows_analysed_of_checked(self):
+        with patch.object(news_bot.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
+            news_bot.time, "time", side_effect=[0.0] + [1e12] * 20
+        ), patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+
+        self.assertIn("AAA", result)
+        self.assertIn("qualified 1", result)
+        self.assertIn("(deadline hit, analysed 1 of 1)", result)
+
+
+class CandidateUniverseTests(unittest.TestCase):
+    def setUp(self):
+        self._patches = [
+            patch.object(news_bot, "USA_STOCK_UNIVERSE", {"Apple": "AAPL"}),
+            patch.object(news_bot, "INDIA_STOCK_UNIVERSE", {"Infosys": "INFY.NS"}),
+            patch.object(news_bot, "NORWAY_STOCK_UNIVERSE", {"Equinor": "EQNR.OL"}),
+            patch.object(news_bot, "INDIA_MUTUAL_FUNDS", {}),
+            patch.object(news_bot, "NORWAY_MUTUAL_FUNDS", {}),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def test_watchlist_survives_healthy_screeners(self):
+        """Regression: the watchlist used to be appended after ~67 screener
+        names and then truncated away entirely."""
+        screener = {f"Mover {i}": f"SCR{i}" for i in range(67)}
+        with patch.object(news_bot, "_build_live_universe", return_value=screener):
+            universe = news_bot._build_candidate_universe(30)
+        symbols = [symbol for _, symbol in universe]
+        self.assertEqual(len(symbols), 30)
+        for expected in ("AAPL", "INFY.NS", "EQNR.OL"):
+            self.assertIn(expected, symbols)
+
+    def test_watchlist_entries_come_first(self):
+        screener = {f"Mover {i}": f"SCR{i}" for i in range(10)}
+        with patch.object(news_bot, "_build_live_universe", return_value=screener):
+            universe = news_bot._build_candidate_universe(10)
+        self.assertEqual(
+            [symbol for _, symbol in universe[:3]], ["AAPL", "INFY.NS", "EQNR.OL"]
+        )
+
+    def test_screener_not_called_when_watchlist_fills_budget(self):
+        with patch.object(news_bot, "_build_live_universe") as mock_live:
+            universe = news_bot._build_candidate_universe(3)
+        mock_live.assert_not_called()
+        self.assertEqual(len(universe), 3)
+
+    def test_oversized_watchlist_truncates_and_warns(self):
+        with patch.object(news_bot, "USA_STOCK_UNIVERSE", {f"N{i}": f"S{i}" for i in range(10)}):
+            with patch.object(news_bot, "_build_live_universe") as mock_live:
+                with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
+                    universe = news_bot._build_candidate_universe(4)
+        mock_live.assert_not_called()
+        self.assertEqual(len(universe), 4)
+        self.assertTrue(any("watchlist_truncated" in line for line in logs.output))
+
+    def test_symbol_in_both_appears_once_with_watchlist_label(self):
+        screener = {"Apple Inc Screener Name": "AAPL", "Other": "OTHR"}
+        with patch.object(news_bot, "_build_live_universe", return_value=screener):
+            universe = news_bot._build_candidate_universe(10)
+        apple_labels = [label for label, symbol in universe if symbol == "AAPL"]
+        self.assertEqual(len(apple_labels), 1)
+        self.assertIn("[USA Stock]", apple_labels[0])
+
+    def test_labels_carry_market_suffix(self):
+        with patch.object(news_bot, "_build_live_universe", return_value={}):
+            universe = news_bot._build_candidate_universe(10)
+        labels = dict((symbol, label) for label, symbol in universe)
+        self.assertEqual(labels["AAPL"], "Apple [USA Stock]")
+        self.assertEqual(labels["EQNR.OL"], "Equinor [Norway Stock]")
+
+
+class TradeRenderingTests(unittest.TestCase):
+    def _qualifying(self, symbol, momentum, volume=1.6):
+        return news_bot.TradeMetrics(
+            symbol=symbol, session="2026-08-13", last_close=100.0,
+            day_change_pct=1.0, week_momentum_pct=momentum, volume_ratio=volume,
+            drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
+        )
+
+    def test_score_column_is_gone_and_session_present(self):
+        with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("Session", result)
+        self.assertIn("2026-08-13", result)
+        self.assertNotIn("Score", result)
+
+    def test_volume_marker_threshold_is_disclosed(self):
+        """The ✓ marker needs a legend, or a reader has no way to know what
+        volume ratio it takes to earn one."""
+        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
+            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+                result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("1.2", result)
+
+    def test_qualified_footer_discloses_truncation(self):
+        universe = {f"Name{i}": f"SYM{i}" for i in range(7)}
+        with patch(
+            "news_bot._compute_trade_metrics",
+            side_effect=lambda symbol: self._qualifying(symbol, momentum=5.0),
+        ):
+            result = news_bot.get_trade_candidates(universe=universe, top_n=2)
+        self.assertIn("qualified 7 (showing 2)", result)
+
+    def test_qualified_footer_omits_showing_when_not_truncated(self):
+        with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("qualified 1", result)
+        self.assertNotIn("showing", result)
+
+    def test_volume_confirmation_marker(self):
+        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
+            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0, volume=2.0)):
+                confirmed = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("BBB", 5.0, volume=0.5)):
+                unconfirmed = news_bot.get_trade_candidates(universe={"Beta": "BBB"}, top_n=1)
+        self.assertIn("2.00✓", confirmed)
+        self.assertIn("0.50", unconfirmed)
+        self.assertNotIn("0.50✓", unconfirmed)
+
+    def test_diagnostics_attribute_to_first_failing_gate(self):
+        rejected = news_bot.TradeMetrics(
+            symbol="AAA", session="2026-08-13", last_close=100.0,
+            day_change_pct=-1.0, week_momentum_pct=-1.0, volume_ratio=1.0,
+            drawdown_pct=1.0, atr_pct=1.0, above_ema20=False,
+        )
+        with patch("news_bot._compute_trade_metrics", return_value=rejected):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("Checked 1", result)
+        self.assertIn("qualified 0", result)
+        self.assertIn("trend 1", result)
+        # Attributed to `trend` only, though momentum_5d also failed.
+        self.assertNotIn("momentum_5d", result)
+
+    def test_diagnostic_counts_balance(self):
+        def side_effect(symbol):
+            if symbol == "AAA":
+                return self._qualifying("AAA", 5.0)
+            if symbol == "BBB":
+                return None
+            return news_bot.TradeMetrics(
+                symbol=symbol, session="2026-08-13", last_close=100.0,
+                day_change_pct=-1.0, week_momentum_pct=-1.0, volume_ratio=1.0,
+                drawdown_pct=1.0, atr_pct=1.0, above_ema20=False,
+            )
+
+        with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
+            result = news_bot.get_trade_candidates(
+                universe={"A": "AAA", "B": "BBB", "C": "CCC"}, top_n=3
+            )
+        self.assertIn("Checked 3", result)
+        self.assertIn("no data 1", result)
+        self.assertIn("qualified 1", result)
+        self.assertIn("trend 1", result)
+
+    def test_ranked_order_in_output(self):
+        def side_effect(symbol):
+            return self._qualifying(symbol, {"AAA": 1.0, "BBB": 9.0}[symbol])
+
+        with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
+            result = news_bot.get_trade_candidates(universe={"A": "AAA", "B": "BBB"}, top_n=2)
+        self.assertLess(result.index("BBB"), result.index("AAA"))
+
+
+class DeprecatedSettingTests(unittest.TestCase):
+    def test_warns_when_trade_min_score_is_customised(self):
+        with patch.object(news_bot.SETTINGS, "trade_min_score", 5):
+            with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
+                news_bot._warn_deprecated_settings()
+        self.assertTrue(any("TRADE_MIN_SCORE" in line for line in logs.output))
+
+    def test_silent_at_default_value(self):
+        default = news_bot.AppSettings.model_fields["trade_min_score"].default
+        with patch.object(news_bot.SETTINGS, "trade_min_score", default):
+            with patch.object(news_bot.LOGGER, "warning") as mock_warn:
+                news_bot._warn_deprecated_settings()
+        mock_warn.assert_not_called()
 
 
 if __name__ == "__main__":

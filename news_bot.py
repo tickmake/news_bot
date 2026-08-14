@@ -1721,6 +1721,163 @@ def _compute_atr_percent(history: Any) -> Optional[float]:
         return None
 
 
+@dataclass(frozen=True)
+class TradeMetrics:
+    """Measured facts about one symbol. Carries no pass/fail judgement."""
+
+    symbol: str
+    session: str
+    last_close: float
+    day_change_pct: float
+    week_momentum_pct: float
+    volume_ratio: float
+    drawdown_pct: float
+    atr_pct: float
+    above_ema20: bool
+
+
+def _drop_in_progress_bar(history: Any) -> Any:
+    """Drop the final row when it is dated today in the exchange's timezone.
+
+    yfinance returns a tz-aware DatetimeIndex in the exchange's own timezone, so
+    "today" is evaluated there rather than in the host's locale. A market that
+    already closed today still has its session discarded: this screen ranks
+    symbols against each other, and letting some rows advance a session while
+    others do not would compare momentum windows offset by a day.
+
+    If the index is tz-naive, there is no exchange timezone to fall back on,
+    so "today" is evaluated in the host's local date instead — the host's
+    `TZ` then silently determines which bar gets dropped.
+    """
+    if history is None or len(history) == 0:
+        return history
+    index = history.index
+    tz = getattr(index, "tz", None)
+    today = datetime.now(tz).date() if tz is not None else datetime.now().date()
+    if index[-1].date() == today:
+        return history.iloc[:-1]
+    return history
+
+
+def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
+    """Measure one symbol, or None when the data cannot support a measurement.
+
+    None means "no usable data" and nothing else. Whether a symbol qualifies is
+    _failed_gates' decision; keeping the two separate is what lets the caller
+    report why a run found nothing.
+    """
+    try:
+        history = _drop_in_progress_bar(_fetch_ticker_history(symbol))
+        close_series = history["Close"].dropna()
+        if len(close_series) < 30:
+            LOGGER.debug(
+                "metrics_skipped symbol=%s reason=insufficient_history bars=%s",
+                symbol,
+                len(close_series),
+            )
+            return None
+
+        last_close = float(close_series.iloc[-1])
+        prev_close = float(close_series.iloc[-2])
+        if prev_close == 0:
+            LOGGER.debug("metrics_skipped symbol=%s reason=zero_prev_close", symbol)
+            return None
+        day_change_pct = ((last_close - prev_close) / prev_close) * 100
+
+        # Safe unconditionally: the length guard above already rules out short series.
+        reference_close = float(close_series.iloc[-6])
+        if reference_close == 0:
+            LOGGER.debug("metrics_skipped symbol=%s reason=zero_reference_close", symbol)
+            return None
+        week_momentum_pct = ((last_close - reference_close) / reference_close) * 100
+
+        ema_20 = float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
+
+        volume_ratio = 1.0
+        if "Volume" in history:
+            volume_series = history["Volume"].dropna()
+            if len(volume_series) >= 20:
+                avg_volume_20 = float(volume_series.tail(20).mean())
+                if avg_volume_20 > 0:
+                    volume_ratio = float(volume_series.iloc[-1]) / avg_volume_20
+
+        rolling_high_20 = float(close_series.tail(20).max())
+        drawdown_pct = (
+            ((rolling_high_20 - last_close) / rolling_high_20) * 100 if rolling_high_20 else 0.0
+        )
+
+        atr_pct = _compute_atr_percent(history)
+        if atr_pct is None:
+            LOGGER.debug("metrics_skipped symbol=%s reason=atr_unavailable", symbol)
+            return None
+
+        return TradeMetrics(
+            symbol=symbol,
+            session=close_series.index[-1].strftime("%Y-%m-%d"),
+            last_close=last_close,
+            day_change_pct=day_change_pct,
+            week_momentum_pct=week_momentum_pct,
+            volume_ratio=volume_ratio,
+            drawdown_pct=drawdown_pct,
+            atr_pct=atr_pct,
+            above_ema20=last_close > ema_20,
+        )
+    except Exception as exc:
+        LOGGER.debug("metrics_failed symbol=%s detail=%s", symbol, exc)
+        return None
+
+
+# Evaluated in this order, so a rejected symbol attributes to its first
+# meaningful blocker in the diagnostic footer.
+TRADE_GATES: Tuple[str, ...] = (
+    "trend",
+    "momentum_5d",
+    "momentum_1d",
+    "volatility",
+    "drawdown",
+)
+
+
+def _failed_gates(metrics: TradeMetrics) -> List[str]:
+    """Gates this symbol fails. Empty means it qualifies.
+
+    Every gate is mandatory. The previous additive score let three risk
+    criteria substitute for the three momentum criteria, so a steadily
+    declining stock was admitted on low volatility and low drawdown alone.
+
+    Volume is deliberately absent: it confirms a move but its absence does not
+    disqualify one, so it ranks (see _rank_key) rather than admits.
+    """
+    failed: List[str] = []
+    if not metrics.above_ema20:
+        failed.append("trend")
+    if metrics.week_momentum_pct < SETTINGS.trade_min_week_momentum_pct:
+        failed.append("momentum_5d")
+    if metrics.day_change_pct <= SETTINGS.trade_min_day_change_pct:
+        failed.append("momentum_1d")
+    if metrics.atr_pct > SETTINGS.trade_max_atr_pct:
+        failed.append("volatility")
+    if metrics.drawdown_pct > SETTINGS.trade_max_drawdown_pct:
+        failed.append("drawdown")
+    return failed
+
+
+def _rank_key(metrics: TradeMetrics) -> Tuple[float, float, float, str]:
+    """Ordering for qualifying candidates: momentum, then confirmation, then calm.
+
+    An ordinal rule rather than a weighted composite. Choosing weights needs
+    backtesting this codebase has no harness for, and arbitrary weights
+    presented as precision are worse than an explicit ordering. Symbol sorts
+    last so identical metrics always produce the same output.
+    """
+    return (
+        -metrics.week_momentum_pct,
+        -metrics.volume_ratio,
+        metrics.atr_pct,
+        metrics.symbol,
+    )
+
+
 def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d") -> Any:
     """Fetch and cache yfinance OHLCV history to avoid repeated slow calls."""
     cache_key = f"{symbol}|{period}|{interval}"
@@ -1742,151 +1899,205 @@ def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d"
     return history
 
 
-def _analyze_short_term_candidate(symbol: str) -> Optional[Dict[str, float]]:
-    try:
-        history = _fetch_ticker_history(symbol)
-        close_series = history["Close"].dropna()
-        if len(close_series) < 30:
-            return None
-        last_close = float(close_series.iloc[-1])
-        prev_close = float(close_series.iloc[-2])
-        if prev_close == 0:
-            return None
-        day_change_pct = ((last_close - prev_close) / prev_close) * 100
-        reference_close = float(close_series.iloc[-6]) if len(close_series) >= 6 else float(close_series.iloc[0])
-        if reference_close == 0:
-            return None
-        week_momentum_pct = ((last_close - reference_close) / reference_close) * 100
-        ema_20 = float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
-        trend_ok = last_close > ema_20
-
-        volume_ratio = 1.0
-        if "Volume" in history:
-            volume_series = history["Volume"].dropna()
-            if len(volume_series) >= 20:
-                avg_volume_20 = float(volume_series.tail(20).mean())
-                if avg_volume_20 > 0:
-                    volume_ratio = float(volume_series.iloc[-1]) / avg_volume_20
-
-        rolling_high_20 = float(close_series.tail(20).max())
-        drawdown_pct = ((rolling_high_20 - last_close) / rolling_high_20) * 100 if rolling_high_20 else 0.0
-        atr_pct = _compute_atr_percent(history)
-        if atr_pct is None:
-            return None
-
-        score = 0
-        if trend_ok:
-            score += 1
-        if week_momentum_pct >= SETTINGS.trade_min_week_momentum_pct:
-            score += 1
-        if day_change_pct > SETTINGS.trade_min_day_change_pct:
-            score += 1
-        if volume_ratio >= SETTINGS.trade_min_volume_ratio:
-            score += 1
-        if drawdown_pct <= SETTINGS.trade_max_drawdown_pct:
-            score += 1
-        if atr_pct <= SETTINGS.trade_max_atr_pct:
-            score += 1
-
-        if score < SETTINGS.trade_min_score:
-            return None
-
-        return {
-            "score": float(score),
-            "last_close": last_close,
-            "day_change_pct": day_change_pct,
-            "week_momentum_pct": week_momentum_pct,
-            "volume_ratio": volume_ratio,
-            "drawdown_pct": drawdown_pct,
-            "atr_pct": atr_pct,
-        }
-    except Exception as exc:
-        LOGGER.debug("candidate_analysis_failed symbol=%s detail=%s", symbol, exc)
-        return None
+def _configured_watchlist() -> List[Tuple[str, str]]:
+    """(label, symbol) pairs for every symbol configured via environment."""
+    entries: List[Tuple[str, str]] = []
+    for suffix, mapping in (
+        ("USA Stock", USA_STOCK_UNIVERSE),
+        ("India Stock", INDIA_STOCK_UNIVERSE),
+        ("Norway Stock", NORWAY_STOCK_UNIVERSE),
+        ("India Fund", INDIA_MUTUAL_FUNDS),
+        ("Norway Fund", NORWAY_MUTUAL_FUNDS),
+    ):
+        for name, symbol in mapping.items():
+            entries.append((f"{name} [{suffix}]", symbol))
+    return entries
 
 
-def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int = 5) -> str:
-    if universe is None:
-        universe = _build_live_universe(limit=45)
-        configured_universe = {
-            **{f"{name} [USA Stock]": sym for name, sym in USA_STOCK_UNIVERSE.items()},
-            **{f"{name} [India Stock]": sym for name, sym in INDIA_STOCK_UNIVERSE.items()},
-            **{f"{name} [Norway Stock]": sym for name, sym in NORWAY_STOCK_UNIVERSE.items()},
-            **{f"{name} [India Fund]": sym for name, sym in INDIA_MUTUAL_FUNDS.items()},
-            **{f"{name} [Norway Fund]": sym for name, sym in NORWAY_MUTUAL_FUNDS.items()},
-        }
-        for label, symbol in configured_universe.items():
-            if symbol not in universe.values():
-                universe[label] = symbol
+def _build_candidate_universe(max_symbols: int) -> List[Tuple[str, str]]:
+    """Configured watchlist first, screener discovery filling what remains.
 
-    # Cap the universe so a cold cache cannot trigger an unbounded number of
-    # slow yfinance calls and stall the briefing / a `/now` command.
-    universe_max = max(1, SETTINGS.trade_universe_max)
-    candidate_items = list(universe.items())[:universe_max]
+    The previous order appended the watchlist *after* ~67 screener names and
+    then truncated to the cap, so with healthy screeners no configured symbol
+    was ever analysed. Whichever side loses a slot now, it is reported.
 
-    scored: List[Tuple[float, float, float, str, str, Dict[str, float]]] = []
+    Screener names are discovery only: they decide which symbols are looked at,
+    never whether one qualifies. That decision belongs to _failed_gates, which
+    reads completed-session metrics.
+    """
+    selected: List[Tuple[str, str]] = []
+    seen: set = set()
+
+    for label, symbol in _configured_watchlist():
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        selected.append((label, symbol))
+
+    if len(selected) > max_symbols:
+        LOGGER.warning(
+            "watchlist_truncated configured=%s analysed=%s detail=raise TRADE_UNIVERSE_MAX to analyse all",
+            len(selected),
+            max_symbols,
+        )
+        return selected[:max_symbols]
+
+    # A full budget means no screener call at all.
+    if len(selected) >= max_symbols:
+        return selected
+
+    for label, symbol in _build_live_universe(limit=max_symbols).items():
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        selected.append((label, symbol))
+        if len(selected) >= max_symbols:
+            break
+    return selected
+
+
+@dataclass
+class ScreenOutcome:
+    """What one screening run saw. Rendered as the diagnostic footer.
+
+    Invariant: checked - no_data == len(qualified) + sum(failed_counts.values())
+    when the deadline did not truncate the run.
+    """
+
+    checked: int = 0
+    analysed: int = 0
+    no_data: int = 0
+    qualified: List[TradeMetrics] = field(default_factory=list)
+    failed_counts: Dict[str, int] = field(default_factory=dict)
+    deadline_hit: bool = False
+
+
+def _screen_universe(
+    candidate_items: List[Tuple[str, str]]
+) -> Tuple[ScreenOutcome, Dict[str, str]]:
+    outcome = ScreenOutcome(checked=len(candidate_items))
+    labels = {symbol: name for name, symbol in candidate_items}
     workers = max(1, min(SETTINGS.trade_fetch_workers, len(candidate_items) or 1))
     deadline = time.time() + max(5, SETTINGS.trade_total_deadline_seconds)
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_to_meta = {
-            pool.submit(_analyze_short_term_candidate, symbol): (name, symbol)
-            for name, symbol in candidate_items
+        future_to_symbol = {
+            pool.submit(_compute_trade_metrics, symbol): symbol
+            for _, symbol in candidate_items
         }
-        for future in as_completed(future_to_meta):
-            name, symbol = future_to_meta[future]
-            if time.time() >= deadline:
-                LOGGER.warning("trade_candidates_deadline_reached analysed=%s", len(scored))
-                for pending in future_to_meta:
-                    pending.cancel()
-                break
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
             try:
                 metrics = future.result()
             except Exception as exc:
                 LOGGER.debug("candidate_future_failed symbol=%s detail=%s", symbol, exc)
-                continue
-            if metrics:
-                scored.append((metrics["score"], metrics["week_momentum_pct"], metrics["day_change_pct"], name, symbol, metrics))
+                metrics = None
+
+            outcome.analysed += 1
+            if metrics is None:
+                outcome.no_data += 1
+            else:
+                failed = _failed_gates(metrics)
+                if failed:
+                    outcome.failed_counts[failed[0]] = (
+                        outcome.failed_counts.get(failed[0], 0) + 1
+                    )
+                else:
+                    outcome.qualified.append(metrics)
+
+            # Checked after the result is consumed: testing first discarded work
+            # that had already finished.
+            if time.time() >= deadline:
+                LOGGER.warning(
+                    "trade_candidates_deadline_reached analysed=%s of=%s",
+                    outcome.analysed,
+                    outcome.checked,
+                )
+                outcome.deadline_hit = True
+                for pending in future_to_symbol:
+                    pending.cancel()
+                break
+
+    outcome.qualified.sort(key=_rank_key)
+    return outcome, labels
+
+
+def _render_gate_summary() -> str:
+    text = (
+        f"Gates: trend>EMA20, "
+        f"5D>={SETTINGS.trade_min_week_momentum_pct:.1f}%, "
+        f"1D>{SETTINGS.trade_min_day_change_pct:.1f}%, "
+        f"DD<={SETTINGS.trade_max_drawdown_pct:.1f}%, "
+        f"ATR<={SETTINGS.trade_max_atr_pct:.1f}%"
+    )
+    return text.replace("<=", "≤").replace(">=", "≥").replace(">", "›")
+
+
+def _render_diagnostics(outcome: ScreenOutcome, top_n: int) -> List[str]:
+    checked_text = f"Checked {outcome.checked}"
+    if outcome.deadline_hit:
+        checked_text += f" (deadline hit, analysed {outcome.analysed} of {outcome.checked})"
+    qualified_count = len(outcome.qualified)
+    qualified_text = f"qualified {qualified_count}"
+    if qualified_count > top_n:
+        # The table below renders only the top `top_n` rows; say so, or the
+        # footer count and the table's row count silently disagree.
+        qualified_text += f" (showing {top_n})"
+    lines = [f"{checked_text} · no data {outcome.no_data} · {qualified_text}"]
+    present = [gate for gate in TRADE_GATES if outcome.failed_counts.get(gate)]
+    if present:
+        lines.append(
+            "Failed: " + ", ".join(f"{gate} {outcome.failed_counts[gate]}" for gate in present)
+        )
+    return lines
+
+
+def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int = 5) -> str:
+    universe_max = max(1, SETTINGS.trade_universe_max)
+    if universe is None:
+        candidate_items = _build_candidate_universe(universe_max)
+    else:
+        candidate_items = list(universe.items())[:universe_max]
+
+    outcome, labels = _screen_universe(candidate_items)
 
     lines = [
         "⚠️ Short-Term Trade Candidates (Informational Only):",
-        "No guarantee of 1-2% daily profit. Use strict risk management.",
-        (
-            f"Filters: score>={SETTINGS.trade_min_score}, "
-            f"5D>={SETTINGS.trade_min_week_momentum_pct:.1f}%, "
-            f"1D>{SETTINGS.trade_min_day_change_pct:.1f}%, "
-            f"Volx>={SETTINGS.trade_min_volume_ratio:.2f}, "
-            f"DD<={SETTINGS.trade_max_drawdown_pct:.1f}%, ATR<={SETTINGS.trade_max_atr_pct:.1f}%"
-        ),
+        "Not investment advice. No guarantee of profit. Use strict risk management.",
+        _render_gate_summary(),
+        "Metrics use each symbol's last completed session. "
+        f"Volx ✓ marks volume ≥{SETTINGS.trade_min_volume_ratio:.1f}x its 20-session average.",
     ]
-    lines[2] = lines[2].replace("<=", "≤").replace(">=", "≥").replace(">", "›")
-    if not scored:
-        lines.append("No candidates met the momentum criteria today.")
-        return "\n".join(lines) + "\n\n"
 
-    scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-    rows: List[List[str]] = []
-    for idx, (_, _, _, name, symbol, metrics) in enumerate(scored[:top_n], 1):
-        rows.append(
-            [
-                str(idx),
-                _truncate(name, 24),
-                symbol,
-                f"{metrics['last_close']:.2f}",
-                f"{metrics['day_change_pct']:+.2f}%",
-                f"{metrics['week_momentum_pct']:+.2f}%",
-                f"{metrics['volume_ratio']:.2f}",
-                f"{metrics['drawdown_pct']:.2f}%",
-                f"{metrics['atr_pct']:.2f}%",
-                str(int(metrics["score"])),
-            ]
+    if outcome.qualified:
+        rows: List[List[str]] = []
+        for idx, metrics in enumerate(outcome.qualified[:top_n], 1):
+            confirmed = "✓" if metrics.volume_ratio >= SETTINGS.trade_min_volume_ratio else ""
+            rows.append(
+                [
+                    str(idx),
+                    _truncate(labels.get(metrics.symbol, metrics.symbol), 24),
+                    metrics.symbol,
+                    metrics.session,
+                    f"{metrics.last_close:.2f}",
+                    f"{metrics.day_change_pct:+.2f}%",
+                    f"{metrics.week_momentum_pct:+.2f}%",
+                    f"{metrics.volume_ratio:.2f}{confirmed}",
+                    f"{metrics.drawdown_pct:.2f}%",
+                    f"{metrics.atr_pct:.2f}%",
+                ]
+            )
+        lines.append(
+            _render_pre_table(
+                "Candidates",
+                ["#", "Name", "Symbol", "Session", "Close", "1D", "5D", "Volx", "DD", "ATR"],
+                rows,
+            )
         )
-    lines.append(
-        _render_pre_table(
-            "Candidates",
-            ["#", "Name", "Symbol", "Close", "1D", "5D", "Volx", "DD", "ATR", "Score"],
-            rows,
-        )
-    )
+    else:
+        lines.append("No candidates qualified.")
+
+    lines.extend(_render_diagnostics(outcome, top_n))
     return "\n".join(lines) + "\n\n"
 
 
@@ -2125,11 +2336,29 @@ def get_missing_required_config() -> Iterable[str]:
     return SETTINGS.missing_required()
 
 
+def _warn_deprecated_settings() -> None:
+    """Report settings that no longer do anything.
+
+    Reading the default off the model rather than hardcoding it keeps this
+    honest if the field's default ever changes. Ignoring a customised value
+    silently is the same failure that hid the truncated watchlist.
+    """
+    default_min_score = AppSettings.model_fields["trade_min_score"].default
+    if SETTINGS.trade_min_score != default_min_score:
+        LOGGER.warning(
+            "deprecated_setting name=TRADE_MIN_SCORE value=%s detail=ignored; "
+            "candidates now pass mandatory gates instead of a score threshold",
+            SETTINGS.trade_min_score,
+        )
+
+
 if __name__ == "__main__":
     missing_values = list(get_missing_required_config())
     if missing_values:
         print("Missing required environment variables: " + ", ".join(missing_values) + ".")
         raise SystemExit(1)
+
+    _warn_deprecated_settings()
 
     _prepare_telegram_long_polling()
 
