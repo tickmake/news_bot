@@ -2055,34 +2055,94 @@ def _screen_universe(
     return outcome, labels
 
 
-def _render_gate_summary() -> str:
-    text = (
-        f"Gates: trend>EMA20, "
-        f"5D>={SETTINGS.trade_min_week_momentum_pct:.1f}%, "
-        f"1D>{SETTINGS.trade_min_day_change_pct:.1f}%, "
-        f"DD<={SETTINGS.trade_max_drawdown_pct:.1f}%, "
-        f"ATR<={SETTINGS.trade_max_atr_pct:.1f}%"
-    )
-    return text.replace("<=", "≤").replace(">=", "≥").replace(">", "›")
+# Plain-English rendering of each gate, for readers who are not going to
+# remember what ATR or EMA20 stand for while glancing at a phone.
+TRADE_GATE_LABELS: Dict[str, str] = {
+    "trend": "below their 20-day average",
+    "momentum_5d": "too weak over 5 days",
+    "momentum_1d": "fell on the day",
+    "volatility": "too volatile",
+    "drawdown": "too far below their 20-day high",
+}
 
 
-def _render_diagnostics(outcome: ScreenOutcome, top_n: int) -> List[str]:
-    checked_text = f"Checked {outcome.checked}"
-    if outcome.deadline_hit:
-        checked_text += f" (deadline hit, analysed {outcome.analysed} of {outcome.checked})"
-    qualified_count = len(outcome.qualified)
-    qualified_text = f"qualified {qualified_count}"
-    if qualified_count > top_n:
-        # The table below renders only the top `top_n` rows; say so, or the
-        # footer count and the table's row count silently disagree.
-        qualified_text += f" (showing {top_n})"
-    lines = [f"{checked_text} · no data {outcome.no_data} · {qualified_text}"]
-    present = [gate for gate in TRADE_GATES if outcome.failed_counts.get(gate)]
-    if present:
-        lines.append(
-            "Failed: " + ", ".join(f"{gate} {outcome.failed_counts[gate]}" for gate in present)
-        )
+def _render_candidate(index: int, metrics: TradeMetrics, name: str) -> List[str]:
+    """One candidate as a short block rather than a wide table row.
+
+    A ten-column <pre> table runs about 100 characters, which Telegram either
+    wraps into fragments or makes the reader scroll sideways on a phone.
+    Stacking the same numbers costs vertical space, which scrolls fine.
+    """
+    confirmed = " ✓" if metrics.volume_ratio >= SETTINGS.trade_min_volume_ratio else ""
+    return [
+        f"<b>{index}. {escape(name)}</b> · {escape(metrics.symbol)}",
+        f"    {metrics.last_close:,.2f}   {metrics.day_change_pct:+.2f}% today"
+        f"   {metrics.week_momentum_pct:+.2f}% over 5 days",
+        f"    volume {metrics.volume_ratio:.1f}× normal{confirmed}"
+        f" · {metrics.drawdown_pct:.1f}% below 20-day high"
+        f" · daily swing {metrics.atr_pct:.1f}%",
+        f"    <i>from the {escape(metrics.session)} close</i>",
+        "",
+    ]
+
+
+def _render_blockers(outcome: ScreenOutcome) -> List[str]:
+    """Why the rest did not qualify, most common reason first.
+
+    Ordering by count rather than by gate order puts the actionable number at
+    the top: if 10 of 30 were rejected as too volatile, TRADE_MAX_ATR_PCT is
+    the knob worth looking at.
+    """
+    rows = [
+        (TRADE_GATE_LABELS[gate], outcome.failed_counts[gate])
+        for gate in TRADE_GATES
+        if outcome.failed_counts.get(gate)
+    ]
+    rows.sort(key=lambda row: -row[1])
+    if outcome.no_data:
+        rows.append(("no usable price data", outcome.no_data))
+    if not rows:
+        return []
+
+    rejected = outcome.checked - len(outcome.qualified)
+    lines = [f"<b>Why the other {rejected} didn't qualify</b>"]
+    lines.extend(f"    {count:>2} · {label}" for label, count in rows)
+    lines.append("")
     return lines
+
+
+def _render_deadline_notice(outcome: ScreenOutcome) -> List[str]:
+    """Truncation notice, rendered independently of the blocker list.
+
+    It cannot live inside _render_blockers: that returns early when nothing
+    failed, so a run where every analysed symbol qualified would silently drop
+    the notice and report a smaller universe than was configured.
+    """
+    if not outcome.deadline_hit:
+        return []
+    return [
+        f"<i>Ran out of time — analysed {outcome.analysed} of "
+        f"{outcome.checked}.</i>",
+        "",
+    ]
+
+
+def _render_checks(any_qualified: bool) -> List[str]:
+    """The gates as prose. Without these the blocker counts are unactionable.
+
+    The heading is conditional because "every candidate passed all five" is a
+    false statement on a day when none did.
+    """
+    heading = "Every candidate passed all five" if any_qualified else "The five checks"
+    return [
+        f"<b>{heading}</b>",
+        "    price above its 20-day average",
+        f"    up at least {SETTINGS.trade_min_week_momentum_pct:.1f}% over 5 days",
+        f"    up more than {SETTINGS.trade_min_day_change_pct:.1f}% on the day",
+        f"    within {SETTINGS.trade_max_drawdown_pct:.1f}% of its 20-day high",
+        f"    daily swing under {SETTINGS.trade_max_atr_pct:.1f}%",
+        "",
+    ]
 
 
 def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int = 5) -> str:
@@ -2093,44 +2153,40 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
         candidate_items = list(universe.items())[:universe_max]
 
     outcome, labels = _screen_universe(candidate_items)
+    qualified_count = len(outcome.qualified)
+    shown = outcome.qualified[:top_n]
 
-    lines = [
-        "⚠️ Short-Term Trade Candidates (Informational Only):",
-        "Not investment advice. No guarantee of profit. Use strict risk management.",
-        _render_gate_summary(),
-        "Metrics use each symbol's last completed session. "
-        f"Volx ✓ marks volume ≥{SETTINGS.trade_min_volume_ratio:.1f}x its 20-session average.",
-    ]
-
-    if outcome.qualified:
-        rows: List[List[str]] = []
-        for idx, metrics in enumerate(outcome.qualified[:top_n], 1):
-            confirmed = "✓" if metrics.volume_ratio >= SETTINGS.trade_min_volume_ratio else ""
-            rows.append(
-                [
-                    str(idx),
-                    _truncate(labels.get(metrics.symbol, metrics.symbol), 24),
-                    metrics.symbol,
-                    metrics.session,
-                    f"{metrics.last_close:.2f}",
-                    f"{metrics.day_change_pct:+.2f}%",
-                    f"{metrics.week_momentum_pct:+.2f}%",
-                    f"{metrics.volume_ratio:.2f}{confirmed}",
-                    f"{metrics.drawdown_pct:.2f}%",
-                    f"{metrics.atr_pct:.2f}%",
-                ]
+    if qualified_count:
+        lines = [
+            f"📈 <b>Short-Term Trade Candidates — {qualified_count} of "
+            f"{outcome.checked} passed</b>",
+            "",
+        ]
+        for index, metrics in enumerate(shown, 1):
+            lines.extend(
+                _render_candidate(index, metrics, labels.get(metrics.symbol, metrics.symbol))
             )
-        lines.append(
-            _render_pre_table(
-                "Candidates",
-                ["#", "Name", "Symbol", "Session", "Close", "1D", "5D", "Volx", "DD", "ATR"],
-                rows,
+        if qualified_count > len(shown):
+            # Otherwise the header count and the number of blocks disagree.
+            lines.append(
+                f"<i>{qualified_count - len(shown)} more passed but are not shown.</i>"
             )
-        )
+            lines.append("")
     else:
-        lines.append("No candidates qualified.")
+        lines = [
+            "📉 <b>Short-Term Trade Candidates — none qualified today</b>",
+            "",
+            "No stock passed all five checks.",
+            "",
+        ]
 
-    lines.extend(_render_diagnostics(outcome, top_n))
+    lines.extend(_render_deadline_notice(outcome))
+    lines.extend(_render_blockers(outcome))
+    lines.extend(_render_checks(bool(qualified_count)))
+    # Split across two lines: a single 94-character sentence wraps awkwardly on
+    # a phone, and this is the one part that should stay legible.
+    lines.append("<i>Informational only. Not investment advice.</i>")
+    lines.append("<i>No guarantee of profit. Use strict risk management.</i>")
     return "\n".join(lines) + "\n\n"
 
 
