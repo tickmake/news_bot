@@ -2033,3 +2033,33 @@ class LogConfigTests(unittest.TestCase):
     def test_library_level_can_be_lowered_on_its_own(self):
         self._configure(log_level="INFO", log_level_libraries="DEBUG")
         self.assertTrue(logging.getLogger("urllib3.connectionpool").isEnabledFor(logging.DEBUG))
+
+
+class LogRoutingTests(unittest.TestCase):
+    def test_business_events_go_to_the_app_logger(self):
+        # Both credentials blanked so this can never reach the network, even
+        # if a real .env is present.
+        with patch.object(news_bot.SETTINGS, "telegram_token", ""), patch.object(
+            news_bot.SETTINGS, "telegram_chat_id", ""
+        ):
+            with self.assertLogs(news_bot.APP_LOG, level="WARNING") as logs:
+                sent = news_bot.send_telegram_message("x")
+        self.assertFalse(sent)
+        self.assertTrue(any("telegram_skipped" in line for line in logs.output))
+
+    def test_plumbing_events_go_to_the_sys_logger(self):
+        with self.assertLogs(news_bot.SYS_LOG, level="WARNING") as logs:
+            with patch.object(news_bot.SETTINGS, "news_topic_weights", "nonsense:1.0"):
+                news_bot._resolve_topic_weights()
+        self.assertTrue(any("topic_weight_unknown" in line for line in logs.output))
+
+    def test_no_call_site_uses_the_bare_parent_logger(self):
+        """Every emitter must pick a band explicitly.
+
+        Resolved via news_bot.__file__ rather than a relative path, so the
+        test does not depend on the working directory.
+        """
+        with open(news_bot.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        for level in ("debug", "info", "warning", "error"):
+            self.assertNotIn(f"LOGGER.{level}(", source)
