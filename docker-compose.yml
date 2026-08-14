@@ -70,6 +70,9 @@ services:
       - FREENEWS_API_URL=${FREENEWS_API_URL}
       - FINNHUB_API_URL=${FINNHUB_API_URL}
       - TZ=${TZ}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_LEVEL_LIBRARIES=${LOG_LEVEL_LIBRARIES:-WARNING}
+      - LOG_COLOR=${LOG_COLOR:-true}
       # News ranking. `ollama` resolves to whichever Ollama is on the ranker
       # network -- the bundled service or a pre-existing container of that
       # name. If it is unreachable the briefing still renders via the
@@ -89,6 +92,12 @@ services:
       - NEWS_DEDUP_WINDOW_DAYS=${NEWS_DEDUP_WINDOW_DAYS:-7}
       - NEWS_RECENT_TITLE_DAYS=${NEWS_RECENT_TITLE_DAYS:-3}
       - NEWS_TOPIC_WEIGHTS=${NEWS_TOPIC_WEIGHTS}
+    # json-file with no options grows without limit, and DEBUG accelerates it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   default:
