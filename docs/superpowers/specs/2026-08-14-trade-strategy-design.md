@@ -115,9 +115,35 @@ yfinance returns a tz-aware `DatetimeIndex` in the exchange's timezone, so this
 needs no trading calendars and no holiday table.
 
 Deliberately conservative: after a market closes, that session is still
-discarded and the prior one used. The cost is a day of freshness; the benefit is
-that every symbol is measured identically regardless of which market it trades
-on or when the briefing fires.
+discarded and the prior one used.
+
+A lighter alternative was considered and rejected — a timezone→close-time table,
+so a market that has already closed today keeps today's bar. It is cheaper than
+it sounds, since no holiday calendar is required (a holiday means no bar exists
+for today at all), and it fails safe on half-days.
+
+It is rejected because this is a **ranked list**. Under a close-time table the
+19:00 run would place Norwegian and Indian rows on today's session while US rows
+sit on yesterday's, then rank them against each other by 5D momentum — comparing
+windows offset by a day. Mixed vintages across rows in a ranked comparison is
+the same class of error as the partial-bar defect, and harder to notice. The
+simple rule keeps every row on "last session strictly before today".
+
+Residual variance remains: exchanges have different holiday calendars, so the
+prior session may be a different date per symbol. The per-row `Session` column
+makes that visible rather than hiding it behind a single header date.
+
+Where the cost lands:
+
+| Run | US | Norway | India | Freshness lost |
+|---|---|---|---|---|
+| 07:00 Oslo | prior session | prior session | prior session | none |
+| 19:00 Oslo | prior session | today's discarded | today's discarded | one session |
+
+At 07:00 Europe/Oslo, "last session before today" *is* the latest complete
+session for every market in the universe — US and Norway have not opened, India
+is mid-session — so the rule costs nothing on the morning run. Only the evening
+run gives up a session, and only for Norway and India.
 
 ### Universe composition
 
