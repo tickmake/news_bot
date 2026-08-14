@@ -1851,6 +1851,42 @@ class LogBandTests(unittest.TestCase):
         line = news_bot.BandedFormatter(colour=False).format(_record("news_bot.app"))
         self.assertNotIn("event=", line)
 
+    def test_standard_levels_render_their_own_tags(self):
+        """The four standard levels must render exactly as before the
+        threshold-ladder change: DEBUG, INFO, WARN, ERROR (CRITICAL->ERROR)."""
+        fmt = news_bot.BandedFormatter(colour=False)
+        self.assertIn("DEBUG", fmt.format(_record("news_bot.sys", logging.DEBUG)))
+        self.assertIn("INFO ", fmt.format(_record("news_bot.sys", logging.INFO)))
+        self.assertIn("WARN ", fmt.format(_record("news_bot.sys", logging.WARNING)))
+        self.assertIn("ERROR", fmt.format(_record("news_bot.sys", logging.ERROR)))
+        self.assertIn("ERROR", fmt.format(_record("news_bot.sys", logging.CRITICAL)))
+
+    def test_custom_level_between_error_and_critical_renders_error_tag(self):
+        """A record at level 45 sits between ERROR=40 and CRITICAL=50. The
+        tag must be ERROR so it matches the >= ERROR colour check -- not the
+        old dict-lookup fallback of "INFO", which would render as bold red
+        text reading "INFO"."""
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("news_bot.sys", 45)
+        )
+        self.assertIn("ERROR", line)
+        coloured = news_bot.BandedFormatter(colour=True).format(
+            _record("news_bot.sys", 45)
+        )
+        self.assertIn(news_bot._ANSI["error"], coloured)
+
+    def test_custom_level_between_info_and_warning_renders_info_tag(self):
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("news_bot.sys", 25)
+        )
+        self.assertIn("INFO ", line)
+
+    def test_custom_level_below_debug_floors_at_debug_tag(self):
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("news_bot.sys", 5)
+        )
+        self.assertIn("DEBUG", line)
+
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
@@ -2009,6 +2045,22 @@ class LogConfigTests(unittest.TestCase):
             self._configure(log_level="BOGUS")
         self.assertTrue(any("log_level_invalid" in line for line in logs.output))
         self.assertTrue(any("BOGUS" in line for line in logs.output))
+
+    def test_resolve_level_treats_empty_string_as_unset(self):
+        """LOG_LEVEL= with nothing after the `=` means "use the default",
+        not a typo -- it must not be reported as a rejected value."""
+        self.assertEqual(news_bot._resolve_level(""), (logging.INFO, None))
+
+    def test_resolve_level_treats_whitespace_only_as_unset(self):
+        self.assertEqual(news_bot._resolve_level("   "), (logging.INFO, None))
+
+    def test_empty_log_level_does_not_warn(self):
+        with self.assertLogs(news_bot.SYS_LOG, level="DEBUG") as logs:
+            self._configure(log_level="", log_level_libraries="WARNING")
+            # Emit a sentinel so assertLogs has something to capture even
+            # when, as expected, no log_level_invalid warning fires.
+            news_bot.SYS_LOG.debug("sentinel")
+        self.assertFalse(any("log_level_invalid" in line for line in logs.output))
 
     def test_handler_writes_to_stdout_not_stderr(self):
         """basicConfig defaults to stderr, so routine INFO arrived on the

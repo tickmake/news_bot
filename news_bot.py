@@ -34,13 +34,29 @@ BAND_APP = "APP"
 BAND_SYS = "SYS"
 BAND_INFRA = "INFRA"
 
-_LEVEL_TAGS: Dict[int, str] = {
-    logging.DEBUG: "DEBUG",
-    logging.INFO: "INFO",
-    logging.WARNING: "WARN",
-    logging.ERROR: "ERROR",
-    logging.CRITICAL: "ERROR",
-}
+_LEVEL_TAG_THRESHOLDS: Tuple[Tuple[int, str], ...] = (
+    (logging.DEBUG, "DEBUG"),
+    (logging.INFO, "INFO"),
+    (logging.WARNING, "WARN"),
+    (logging.ERROR, "ERROR"),
+)
+
+
+def _tag_for_level(levelno: int) -> str:
+    """The standard-level tag for a numeric level, via a threshold ladder.
+
+    Mirrors the boundaries the colour logic in BandedFormatter.format uses
+    (>= ERROR, == WARNING), so a non-standard level (e.g. a custom level 45
+    between ERROR=40 and CRITICAL=50) gets the tag of the nearest standard
+    level at or below it -- "ERROR" here -- rather than a fixed fallback that
+    could contradict the colour it's rendered in. Levels below DEBUG=10 floor
+    at "DEBUG", the lowest tag available.
+    """
+    tag = "DEBUG"
+    for threshold, name in _LEVEL_TAG_THRESHOLDS:
+        if levelno >= threshold:
+            tag = name
+    return tag
 
 
 def _band_for(logger_name: str) -> str:
@@ -77,7 +93,7 @@ class BandedFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         band = _band_for(record.name)
-        level = _LEVEL_TAGS.get(record.levelno, "INFO")
+        level = _tag_for_level(record.levelno)
         # Milliseconds cost four columns on every line and nothing here is
         # measured at that resolution; durations are logged as latency_ms=.
         stamp = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
@@ -100,10 +116,10 @@ class BandedFormatter(logging.Formatter):
             # obvious without losing its band. On INFRA lines, close severity
             # spans with reset+re-dim to prevent colour bleeding into the message.
             if record.levelno >= logging.ERROR:
-                closer = f"\033[0m\033[2m" if band == BAND_INFRA else _ANSI['reset']
+                closer = _ANSI['reset'] + _ANSI['dim'] if band == BAND_INFRA else _ANSI['reset']
                 level_text = f"{_ANSI['error']}{level_text}{closer}"
             elif record.levelno == logging.WARNING:
-                closer = f"\033[0m\033[2m" if band == BAND_INFRA else _ANSI['reset']
+                closer = _ANSI['reset'] + _ANSI['dim'] if band == BAND_INFRA else _ANSI['reset']
                 level_text = f"{_ANSI['warn']}{level_text}{closer}"
 
         line = f"{stamp}  {band_text}  {level_text}  {message}"
@@ -123,6 +139,10 @@ def _resolve_level(raw: str, fallback: int = logging.INFO) -> Tuple[int, Optiona
     than raising, so a typo'd level would sail through and configure nonsense.
     """
     text = (raw or "").strip().upper()
+    if not text:
+        # Unset/blank (e.g. `LOG_LEVEL=` with nothing after the `=`) means
+        # "use the default", not "a typo" -- do not warn about it.
+        return fallback, None
     if text in _VALID_LEVELS:
         return getattr(logging, text), None
     return fallback, raw
