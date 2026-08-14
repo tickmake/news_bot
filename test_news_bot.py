@@ -79,13 +79,14 @@ class NewsBotTests(unittest.TestCase):
         self.assertIn("Beta", result)
         self.assertIn("BBB", result)
         self.assertNotIn("Gamma", result)
-        self.assertIn("Not investment advice. No guarantee of profit.", result)
+        self.assertIn("Not investment advice.", result)
+        self.assertIn("No guarantee of profit.", result)
 
     @patch("news_bot._compute_trade_metrics")
     def test_get_trade_candidates_no_matches(self, mock_metrics):
         mock_metrics.return_value = None
         result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=2)
-        self.assertIn("No candidates qualified.", result)
+        self.assertIn("No stock passed all five checks.", result)
 
     @patch("news_bot.requests.get")
     def test_get_global_news_success(self, mock_get):
@@ -1560,8 +1561,8 @@ class ScreenUniverseDeadlineTests(unittest.TestCase):
             result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
 
         self.assertIn("AAA", result)
-        self.assertIn("qualified 1", result)
-        self.assertIn("(deadline hit, analysed 1 of 1)", result)
+        self.assertIn("1 of 1 passed", result)
+        self.assertIn("Ran out of time \u2014 analysed 1 of 1.", result)
 
 
 class CandidateUniverseTests(unittest.TestCase):
@@ -1638,35 +1639,37 @@ class TradeRenderingTests(unittest.TestCase):
             drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
         )
 
-    def test_score_column_is_gone_and_session_present(self):
+    def test_session_is_shown_per_candidate(self):
+        """Exchanges differ, so the session belongs on the row, not a header."""
         with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
             result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
-        self.assertIn("Session", result)
-        self.assertIn("2026-08-13", result)
+        self.assertIn("from the 2026-08-13 close", result)
         self.assertNotIn("Score", result)
 
-    def test_volume_marker_threshold_is_disclosed(self):
-        """The ✓ marker needs a legend, or a reader has no way to know what
-        volume ratio it takes to earn one."""
+    def test_thresholds_are_spelled_out(self):
+        """The blocker counts are unactionable without the thresholds."""
         with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
-            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
-                result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
-        self.assertIn("1.2", result)
+            with patch.object(news_bot.SETTINGS, "trade_max_atr_pct", 4.5):
+                with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+                    result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("daily swing under 4.5%", result)
+        self.assertIn("within", result)
 
-    def test_qualified_footer_discloses_truncation(self):
+    def test_header_discloses_truncation(self):
         universe = {f"Name{i}": f"SYM{i}" for i in range(7)}
         with patch(
             "news_bot._compute_trade_metrics",
             side_effect=lambda symbol: self._qualifying(symbol, momentum=5.0),
         ):
             result = news_bot.get_trade_candidates(universe=universe, top_n=2)
-        self.assertIn("qualified 7 (showing 2)", result)
+        self.assertIn("7 of 7 passed", result)
+        self.assertIn("5 more passed but are not shown", result)
 
-    def test_qualified_footer_omits_showing_when_not_truncated(self):
+    def test_no_truncation_notice_when_all_shown(self):
         with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
             result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
-        self.assertIn("qualified 1", result)
-        self.assertNotIn("showing", result)
+        self.assertIn("1 of 1 passed", result)
+        self.assertNotIn("not shown", result)
 
     def test_volume_confirmation_marker(self):
         with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
@@ -1674,11 +1677,11 @@ class TradeRenderingTests(unittest.TestCase):
                 confirmed = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
             with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("BBB", 5.0, volume=0.5)):
                 unconfirmed = news_bot.get_trade_candidates(universe={"Beta": "BBB"}, top_n=1)
-        self.assertIn("2.00✓", confirmed)
-        self.assertIn("0.50", unconfirmed)
-        self.assertNotIn("0.50✓", unconfirmed)
+        self.assertIn("volume 2.0\u00d7 normal \u2713", confirmed)
+        self.assertIn("volume 0.5\u00d7 normal", unconfirmed)
+        self.assertNotIn("\u2713", unconfirmed)
 
-    def test_diagnostics_attribute_to_first_failing_gate(self):
+    def test_blockers_use_plain_language_not_gate_names(self):
         rejected = news_bot.TradeMetrics(
             symbol="AAA", session="2026-08-13", last_close=100.0,
             day_change_pct=-1.0, week_momentum_pct=-1.0, volume_ratio=1.0,
@@ -1686,13 +1689,31 @@ class TradeRenderingTests(unittest.TestCase):
         )
         with patch("news_bot._compute_trade_metrics", return_value=rejected):
             result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
-        self.assertIn("Checked 1", result)
-        self.assertIn("qualified 0", result)
-        self.assertIn("trend 1", result)
-        # Attributed to `trend` only, though momentum_5d also failed.
-        self.assertNotIn("momentum_5d", result)
+        self.assertIn("none qualified today", result)
+        self.assertIn("1 \u00b7 below their 20-day average", result)
+        # Attributed to the first failing gate only, though momentum also failed.
+        self.assertNotIn("too weak over 5 days", result)
+        # Internal gate identifiers must never reach the reader.
+        for gate in news_bot.TRADE_GATES:
+            self.assertNotIn(gate, result)
 
-    def test_diagnostic_counts_balance(self):
+    def test_blockers_are_ordered_by_count(self):
+        """Most common reason first, so the tunable knob leads."""
+        def side_effect(symbol):
+            base = dict(session="2026-08-13", last_close=100.0, volume_ratio=1.0,
+                        drawdown_pct=1.0, above_ema20=True)
+            if symbol in ("A1", "A2", "A3"):   # volatility
+                return news_bot.TradeMetrics(symbol=symbol, day_change_pct=1.0,
+                    week_momentum_pct=5.0, atr_pct=99.0, **base)
+            return news_bot.TradeMetrics(symbol=symbol, day_change_pct=-1.0,   # momentum_1d
+                week_momentum_pct=5.0, atr_pct=1.0, **base)
+
+        universe = {n: n for n in ("A1", "A2", "A3", "B1")}
+        with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
+            result = news_bot.get_trade_candidates(universe=universe, top_n=5)
+        self.assertLess(result.index("too volatile"), result.index("fell on the day"))
+
+    def test_no_data_is_counted_among_the_blockers(self):
         def side_effect(symbol):
             if symbol == "AAA":
                 return self._qualifying("AAA", 5.0)
@@ -1708,10 +1729,9 @@ class TradeRenderingTests(unittest.TestCase):
             result = news_bot.get_trade_candidates(
                 universe={"A": "AAA", "B": "BBB", "C": "CCC"}, top_n=3
             )
-        self.assertIn("Checked 3", result)
-        self.assertIn("no data 1", result)
-        self.assertIn("qualified 1", result)
-        self.assertIn("trend 1", result)
+        self.assertIn("1 of 3 passed", result)
+        self.assertIn("Why the other 2 didn't qualify", result)
+        self.assertIn("1 \u00b7 no usable price data", result)
 
     def test_ranked_order_in_output(self):
         def side_effect(symbol):
@@ -1739,3 +1759,35 @@ class DeprecatedSettingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TradeChecksHeadingTests(unittest.TestCase):
+    """The checks heading must not claim candidates passed when none did."""
+
+    def _qualifying(self, symbol):
+        return news_bot.TradeMetrics(
+            symbol=symbol, session="2026-08-13", last_close=100.0,
+            day_change_pct=1.0, week_momentum_pct=5.0, volume_ratio=1.6,
+            drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
+        )
+
+    def test_heading_is_neutral_when_nothing_qualified(self):
+        with patch("news_bot._compute_trade_metrics", return_value=None):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("The five checks", result)
+        self.assertNotIn("Every candidate passed", result)
+
+    def test_heading_claims_passage_only_when_something_qualified(self):
+        with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("Every candidate passed all five", result)
+
+    def test_deadline_notice_survives_an_all_qualifying_run(self):
+        """It used to live inside the blocker list, which returns early when
+        nothing failed -- so a fully-qualifying truncated run lost the notice."""
+        with patch.object(news_bot.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
+            news_bot.time, "time", side_effect=[0.0] + [1e12] * 20
+        ), patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        self.assertIn("Ran out of time", result)
+        self.assertNotIn("didn't qualify", result)
