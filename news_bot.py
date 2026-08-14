@@ -23,10 +23,62 @@ import requests.exceptions
 import yfinance as yf
 
 LOGGER = logging.getLogger("news_bot")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s level=%(levelname)s event=%(message)s",
-)
+# Band is carried by logger name: BandedFormatter reads record.name. The
+# hierarchy is load-bearing -- existing tests assertLogs against `news_bot`
+# and keep working because child records propagate to it.
+APP_LOG = logging.getLogger("news_bot.app")
+SYS_LOG = logging.getLogger("news_bot.sys")
+
+BAND_APP = "APP"
+BAND_SYS = "SYS"
+BAND_INFRA = "INFRA"
+
+_LEVEL_TAGS: Dict[int, str] = {
+    logging.DEBUG: "DEBUG",
+    logging.INFO: "INFO",
+    logging.WARNING: "WARN",
+    logging.ERROR: "ERROR",
+    logging.CRITICAL: "ERROR",
+}
+
+
+def _band_for(logger_name: str) -> str:
+    """Which band a record belongs to, from its logger name."""
+    if logger_name == "news_bot.app" or logger_name.startswith("news_bot.app."):
+        return BAND_APP
+    if logger_name == "news_bot" or logger_name.startswith("news_bot."):
+        return BAND_SYS
+    return BAND_INFRA
+
+
+class BandedFormatter(logging.Formatter):
+    """One line as: timestamp  BAND   LEVEL  message.
+
+    Replaces the old "%(asctime)s level=%(levelname)s event=%(message)s".
+    That format ran through basicConfig on the *root* logger, so APScheduler
+    and yfinance messages were rendered as `event=...` too -- asserting they
+    were app events when they were not.
+    """
+
+    def __init__(self, colour: bool = True) -> None:
+        super().__init__()
+        self.colour = colour
+
+    def format(self, record: logging.LogRecord) -> str:
+        band = _band_for(record.name)
+        level = _LEVEL_TAGS.get(record.levelno, "INFO")
+        # Milliseconds cost four columns on every line and nothing here is
+        # measured at that resolution; durations are logged as latency_ms=.
+        stamp = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
+
+        message = record.getMessage()
+        if band == BAND_INFRA:
+            # "Scheduler started" says nothing about who said it.
+            message = f"{record.name} | {message}"
+        if record.exc_info:
+            message = f"{message}\n{self.formatException(record.exc_info)}"
+
+        return f"{stamp}  {band:<5}  {level:<5}  {message}"
 
 DEFAULT_GLOBAL_NEWS_FEEDS = (
     "https://feeds.bbci.co.uk/news/world/rss.xml,"

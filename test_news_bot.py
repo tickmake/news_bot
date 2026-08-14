@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -1791,3 +1793,59 @@ class TradeChecksHeadingTests(unittest.TestCase):
             result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("Ran out of time", result)
         self.assertNotIn("didn't qualify", result)
+
+def _record(name, level=logging.INFO, msg="hello world", args=None, exc_info=None):
+    """A LogRecord as the logging module would construct it."""
+    return logging.LogRecord(
+        name=name, level=level, pathname="news_bot.py", lineno=1,
+        msg=msg, args=args, exc_info=exc_info,
+    )
+
+
+class LogBandTests(unittest.TestCase):
+    def test_app_logger_resolves_to_app_band(self):
+        self.assertEqual(news_bot._band_for("news_bot.app"), "APP")
+
+    def test_sys_logger_resolves_to_sys_band(self):
+        self.assertEqual(news_bot._band_for("news_bot.sys"), "SYS")
+
+    def test_bare_parent_logger_resolves_to_sys_band(self):
+        """A missed call site should land somewhere sane, not be mistaken
+        for a third-party library."""
+        self.assertEqual(news_bot._band_for("news_bot"), "SYS")
+
+    def test_third_party_logger_resolves_to_infra_band(self):
+        self.assertEqual(news_bot._band_for("apscheduler.scheduler"), "INFRA")
+        self.assertEqual(news_bot._band_for("urllib3.connectionpool"), "INFRA")
+
+    def test_line_layout_is_two_spaces_between_padded_fields(self):
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("news_bot.app", msg="briefing_start at=x")
+        )
+        # timestamp(19) + 2 + band(5) + 2 + level(5) + 2 + message
+        self.assertRegex(
+            line,
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  APP    INFO   briefing_start at=x$",
+        )
+
+    def test_warning_renders_as_warn_and_critical_as_error(self):
+        fmt = news_bot.BandedFormatter(colour=False)
+        self.assertIn("WARN ", fmt.format(_record("news_bot.sys", logging.WARNING)))
+        self.assertIn("ERROR", fmt.format(_record("news_bot.sys", logging.CRITICAL)))
+
+    def test_infra_lines_carry_the_originating_logger_name(self):
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("apscheduler.scheduler", msg="Scheduler started")
+        )
+        self.assertIn("apscheduler.scheduler | Scheduler started", line)
+
+    def test_app_and_sys_lines_omit_the_logger_name(self):
+        fmt = news_bot.BandedFormatter(colour=False)
+        for name in ("news_bot.app", "news_bot.sys"):
+            self.assertNotIn(name, fmt.format(_record(name, msg="telegram_sent chunks=1")))
+
+    def test_event_prefix_is_gone(self):
+        """`event=` was only ever true for app records; it mislabelled every
+        library message."""
+        line = news_bot.BandedFormatter(colour=False).format(_record("news_bot.app"))
+        self.assertNotIn("event=", line)
