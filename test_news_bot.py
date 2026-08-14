@@ -916,9 +916,26 @@ class LlmSelectorTests(unittest.TestCase):
     def test_request_pins_the_json_schema_and_model(self):
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
         self._select(t)
-        self.assertEqual(t.body["format"], news_bot.RANKER_RESPONSE_SCHEMA)
+        # limit=2 against a 3-candidate pool, so the floor is 2.
+        self.assertEqual(t.body["format"], news_bot._ranker_response_schema(2))
         self.assertEqual(t.body["model"], news_bot.SETTINGS.news_ranker_model)
         self.assertFalse(t.body["stream"])
+
+    def test_request_floors_selections_so_the_model_cannot_answer_empty(self):
+        """Without a floor the model returns a schema-valid empty array.
+
+        Measured against the deployed llama3.2:3b: 3.9s for `{"selections": []}`
+        versus 143s and 8 usable selections once the floor was present.
+        """
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t, limit=2)
+        self.assertEqual(t.body["format"]["properties"]["selections"]["minItems"], 2)
+
+    def test_floor_is_capped_at_the_pool_size(self):
+        """A floor above the candidate count is unsatisfiable with distinct ids."""
+        t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
+        self._select(t, limit=10)  # setUp's pool holds 3
+        self.assertEqual(t.body["format"]["properties"]["selections"]["minItems"], 3)
 
     def test_pool_is_shortlisted_before_the_call(self):
         """Local inference times out on a full pool, so only the heuristic's
@@ -958,6 +975,27 @@ class LlmSelectorTests(unittest.TestCase):
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
         self._select(t)
         self.assertEqual(t.body["options"]["temperature"], 0)
+
+
+class RankerSchemaTests(unittest.TestCase):
+    def _selections(self, schema):
+        return schema["properties"]["selections"]
+
+    def test_floor_is_set_to_the_requested_minimum(self):
+        self.assertEqual(self._selections(news_bot._ranker_response_schema(8))["minItems"], 8)
+
+    def test_floor_is_never_below_one(self):
+        """A zero floor is the empty array again, which is the defect."""
+        self.assertEqual(self._selections(news_bot._ranker_response_schema(0))["minItems"], 1)
+
+    def test_builder_does_not_mutate_the_shared_base_schema(self):
+        news_bot._ranker_response_schema(5)
+        self.assertNotIn("minItems", self._selections(news_bot.RANKER_RESPONSE_SCHEMA))
+
+    def test_base_schema_alone_would_admit_an_empty_selection(self):
+        """Documents the defect: the unconstrained schema is what let the model
+        answer `{"selections": []}` in 3.9s instead of doing the ranking."""
+        self.assertNotIn("minItems", self._selections(news_bot.RANKER_RESPONSE_SCHEMA))
 
 
 class LlmSelectorFallthroughTests(unittest.TestCase):

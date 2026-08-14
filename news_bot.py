@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import logging
@@ -122,14 +123,26 @@ class AppSettings(BaseSettings):
     # Ollama-compatible endpoint. In docker-compose this is the bundled service;
     # point it at any other host to reuse an existing Ollama instance.
     news_ranker_url: str = "http://localhost:11434"
-    news_ranker_model: str = "llama3.2:3b"
-    # Local CPU inference is slow. Measured on the Raspberry Pi 5 target with a
-    # warm llama3.2:3b: 20 candidates ~74s, 40 ~150s.
+    # qwen2.5:3b over llama3.2:3b on measured dedup behaviour: benchmarked on
+    # the Pi 5 target across 10, 14 and 20 candidates, llama3.2:3b failed to
+    # collapse an obvious two-outlet duplicate ("Fed holds rates steady" and
+    # "Federal Reserve keeps benchmark rate unchanged") in every run, ranking
+    # both. qwen2.5:3b collapsed it in every run, and was faster. Cross-outlet
+    # paraphrase dedup is the reason this path exists at all — HeuristicSelector
+    # cannot do it — so that difference outweighs qwen's slightly weaker topic
+    # down-weighting.
+    news_ranker_model: str = "qwen2.5:3b"
     news_ranker_timeout_seconds: int = 240
     # The LLM re-ranks the heuristic's top N rather than the whole pool. The
     # pool stays large so cross-outlet dedup and the heuristic keep their
     # breadth, while the slow path sees a manageable, already-good shortlist.
-    news_ranker_max_candidates: int = 20
+    #
+    # Measured on the Pi 5 target with a warm model and a schema that actually
+    # forces work (see _ranker_response_schema): 20 candidates took 236-269s,
+    # at or over the 240s timeout; 14 took 107-193s. The previous "20 ~74s"
+    # note was taken while the model was short-circuiting to an empty array,
+    # so it timed a no-op. 14 leaves headroom on both models.
+    news_ranker_max_candidates: int = 14
     trade_min_score: int = 3
     trade_min_week_momentum_pct: float = 1.0
     trade_min_day_change_pct: float = 0.0
@@ -1099,6 +1112,24 @@ RANKER_RESPONSE_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _ranker_response_schema(min_selections: int) -> Dict[str, Any]:
+    """The response schema with a floor on how many selections must come back.
+
+    Without `minItems` an empty `selections` array satisfies the schema, and at
+    temperature 0 the model reliably takes that path: measured against the
+    deployed llama3.2:3b on a 15-candidate pool, the unconstrained call
+    answered `{"selections": []}` in 3.9s, while the same model with a floor
+    took 143s and returned 8 usable, in-range selections. The failure looked
+    like a weak model; it was the schema permitting the model to do nothing.
+
+    The caller caps the floor at the pool size — a floor larger than the number
+    of candidates cannot be satisfied with distinct valid ids.
+    """
+    schema = copy.deepcopy(RANKER_RESPONSE_SCHEMA)
+    schema["properties"]["selections"]["minItems"] = max(1, min_selections)
+    return schema
+
+
 class LlmSelector:
     """Ranks and deduplicates via one local-LLM call. Returns [] on any failure.
 
@@ -1192,8 +1223,10 @@ class LlmSelector:
                     ],
                     "stream": False,
                     # A JSON schema here constrains generation, so there is no
-                    # regex extraction and no retry-on-parse loop.
-                    "format": RANKER_RESPONSE_SCHEMA,
+                    # regex extraction and no retry-on-parse loop. The floor is
+                    # capped at the pool size: asking for more selections than
+                    # there are candidates is unsatisfiable.
+                    "format": _ranker_response_schema(min(limit, len(pool))),
                     "options": {"temperature": 0},
                 },
                 timeout=float(max(1, SETTINGS.news_ranker_timeout_seconds)),
