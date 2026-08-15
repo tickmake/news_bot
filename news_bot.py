@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -23,10 +24,165 @@ import requests.exceptions
 import yfinance as yf
 
 LOGGER = logging.getLogger("news_bot")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s level=%(levelname)s event=%(message)s",
+# Band is carried by logger name: BandedFormatter reads record.name. The
+# hierarchy is load-bearing -- existing tests assertLogs against `news_bot`
+# and keep working because child records propagate to it.
+APP_LOG = logging.getLogger("news_bot.app")
+SYS_LOG = logging.getLogger("news_bot.sys")
+
+BAND_APP = "APP"
+BAND_SYS = "SYS"
+BAND_INFRA = "INFRA"
+
+_LEVEL_TAG_THRESHOLDS: Tuple[Tuple[int, str], ...] = (
+    (logging.DEBUG, "DEBUG"),
+    (logging.INFO, "INFO"),
+    (logging.WARNING, "WARN"),
+    (logging.ERROR, "ERROR"),
 )
+
+
+def _tag_for_level(levelno: int) -> str:
+    """The standard-level tag for a numeric level, via a threshold ladder.
+
+    Mirrors the boundaries the colour logic in BandedFormatter.format uses
+    (>= ERROR, == WARNING), so a non-standard level (e.g. a custom level 45
+    between ERROR=40 and CRITICAL=50) gets the tag of the nearest standard
+    level at or below it -- "ERROR" here -- rather than a fixed fallback that
+    could contradict the colour it's rendered in. Levels below DEBUG=10 floor
+    at "DEBUG", the lowest tag available.
+    """
+    tag = "DEBUG"
+    for threshold, name in _LEVEL_TAG_THRESHOLDS:
+        if levelno >= threshold:
+            tag = name
+    return tag
+
+
+def _band_for(logger_name: str) -> str:
+    """Which band a record belongs to, from its logger name."""
+    if logger_name == "news_bot.app" or logger_name.startswith("news_bot.app."):
+        return BAND_APP
+    if logger_name == "news_bot" or logger_name.startswith("news_bot."):
+        return BAND_SYS
+    return BAND_INFRA
+
+
+_ANSI: Dict[str, str] = {
+    "reset": "\033[0m",
+    "dim": "\033[2m",
+    "app": "\033[1;36m",    # bold cyan -- the lines you came to read
+    "sys": "\033[33m",      # yellow
+    "warn": "\033[33m",
+    "error": "\033[1;31m",  # bold red
+}
+
+
+class BandedFormatter(logging.Formatter):
+    """One line as: timestamp  BAND   LEVEL  message.
+
+    Replaces the old "%(asctime)s level=%(levelname)s event=%(message)s".
+    That format ran through basicConfig on the *root* logger, so APScheduler
+    and yfinance messages were rendered as `event=...` too -- asserting they
+    were app events when they were not.
+    """
+
+    def __init__(self, colour: bool = True) -> None:
+        super().__init__()
+        self.colour = colour
+
+    def format(self, record: logging.LogRecord) -> str:
+        band = _band_for(record.name)
+        level = _tag_for_level(record.levelno)
+        # Milliseconds cost four columns on every line and nothing here is
+        # measured at that resolution; durations are logged as latency_ms=.
+        stamp = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
+
+        message = record.getMessage()
+        if band == BAND_INFRA:
+            # "Scheduler started" says nothing about who said it.
+            message = f"{record.name} | {message}"
+        if record.exc_info:
+            message = f"{message}\n{self.formatException(record.exc_info)}"
+
+        band_text = f"{band:<5}"
+        level_text = f"{level:<5}"
+        if self.colour:
+            if band == BAND_APP:
+                band_text = f"{_ANSI['app']}{band_text}{_ANSI['reset']}"
+            elif band == BAND_SYS:
+                band_text = f"{_ANSI['sys']}{band_text}{_ANSI['reset']}"
+            # Severity colours the level tag independently, so an ERROR stays
+            # obvious without losing its band. On INFRA lines, close severity
+            # spans with reset+re-dim to prevent colour bleeding into the message.
+            if record.levelno >= logging.ERROR:
+                closer = _ANSI['reset'] + _ANSI['dim'] if band == BAND_INFRA else _ANSI['reset']
+                level_text = f"{_ANSI['error']}{level_text}{closer}"
+            elif record.levelno == logging.WARNING:
+                closer = _ANSI['reset'] + _ANSI['dim'] if band == BAND_INFRA else _ANSI['reset']
+                level_text = f"{_ANSI['warn']}{level_text}{closer}"
+
+        line = f"{stamp}  {band_text}  {level_text}  {message}"
+        if self.colour and band == BAND_INFRA:
+            # INFRA recedes rather than competing for attention.
+            line = f"{_ANSI['dim']}{line}{_ANSI['reset']}"
+        return line
+
+_VALID_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+_LOGGING_CONFIGURED = False
+
+
+def _resolve_level(raw: str, fallback: int = logging.INFO) -> Tuple[int, Optional[str]]:
+    """Level number, plus the rejected value when the name was not recognised.
+
+    logging.getLevelName("BOGUS") returns the *string* "Level BOGUS" rather
+    than raising, so a typo'd level would sail through and configure nonsense.
+    """
+    text = (raw or "").strip().upper()
+    if not text:
+        # Unset/blank (e.g. `LOG_LEVEL=` with nothing after the `=`) means
+        # "use the default", not "a typo" -- do not warn about it.
+        return fallback, None
+    if text in _VALID_LEVELS:
+        return getattr(logging, text), None
+    return fallback, raw
+
+
+def _configure_logging() -> None:
+    """Install the banded handler on the root logger. Idempotent.
+
+    Must run after SETTINGS exists. Called twice -- module re-import, test
+    setup -- an unguarded version would duplicate every line.
+    """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+
+    app_level, rejected_app = _resolve_level(SETTINGS.log_level)
+    lib_level, rejected_lib = _resolve_level(SETTINGS.log_level_libraries, logging.WARNING)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(BandedFormatter(colour=SETTINGS.log_color))
+
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+
+    # Libraries inherit the root level; news_bot carries its own. Ancestor
+    # logger levels do not filter propagated records -- only the originating
+    # logger's effective level and the handler's level do -- so news_bot at
+    # DEBUG still reaches this handler with root at WARNING, while urllib3
+    # inherits WARNING and stays quiet.
+    root.setLevel(lib_level)
+    LOGGER.setLevel(app_level)
+
+    _LOGGING_CONFIGURED = True
+
+    if rejected_app is not None:
+        SYS_LOG.warning("log_level_invalid value=%s using=INFO", rejected_app)
+    if rejected_lib is not None:
+        SYS_LOG.warning("log_level_libraries_invalid value=%s using=WARNING", rejected_lib)
 
 DEFAULT_GLOBAL_NEWS_FEEDS = (
     "https://feeds.bbci.co.uk/news/world/rss.xml,"
@@ -97,6 +253,9 @@ class AppSettings(BaseSettings):
     news_fetch_priority: str = "newsapi,freenews,rss"
     recipient_name: str = "Sunil"
     tz: str = "Europe/Oslo"
+    log_level: str = "INFO"
+    log_level_libraries: str = "WARNING"
+    log_color: bool = True
     request_timeout_seconds: int = 15
     telegram_message_max_chars: int = 3900
     state_file: str = ".news_bot_state.json"
@@ -182,6 +341,7 @@ class AppSettings(BaseSettings):
 
 
 SETTINGS = AppSettings()
+_configure_logging()
 LIVE_QUOTES_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 YAHOO_SCREENER_BACKOFF_UNTIL = 0.0
 FINNHUB_QUOTE_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}
@@ -248,7 +408,7 @@ class AppState:
             if isinstance(loaded, dict):
                 self.data.update(loaded)
         except Exception as exc:
-            LOGGER.warning("state_load_failed detail=%s", exc)
+            SYS_LOG.warning("state_load_failed detail=%s", exc)
 
     def save(self) -> None:
         # Serialise under the lock and write atomically so overlapping
@@ -257,7 +417,7 @@ class AppState:
             try:
                 payload = json.dumps(self.data, indent=2, sort_keys=True)
             except Exception as exc:
-                LOGGER.warning("state_serialize_failed detail=%s", exc)
+                SYS_LOG.warning("state_serialize_failed detail=%s", exc)
                 return
             directory = os.path.dirname(os.path.abspath(self.path)) or "."
             try:
@@ -271,7 +431,7 @@ class AppState:
                         os.remove(tmp_path)
                     raise
             except Exception as exc:
-                LOGGER.warning("state_save_failed detail=%s", exc)
+                SYS_LOG.warning("state_save_failed detail=%s", exc)
 
     @staticmethod
     def _window_cutoff(window_days: int, today: Optional[str]) -> str:
@@ -386,10 +546,10 @@ def _with_retry(action: Callable[[], Any], label: str, retries: int = 3, backoff
         except Exception as exc:
             attempt += 1
             if attempt >= retries:
-                LOGGER.error("retry_exhausted op=%s attempts=%s detail=%s", label, attempt, exc)
+                SYS_LOG.error("retry_exhausted op=%s attempts=%s detail=%s", label, attempt, exc)
                 raise
             sleep_for = backoff_seconds * (2 ** (attempt - 1))
-            LOGGER.warning("retry op=%s attempt=%s sleep=%s detail=%s", label, attempt, sleep_for, exc)
+            SYS_LOG.warning("retry op=%s attempt=%s sleep=%s detail=%s", label, attempt, sleep_for, exc)
             time.sleep(sleep_for)
 
 
@@ -432,7 +592,7 @@ def _safe_domain(url: Optional[str]) -> str:
             domain = domain[4:]
         return domain
     except Exception as exc:
-        LOGGER.debug("domain_parse_failed url=%s detail=%s", url, exc)
+        SYS_LOG.debug("domain_parse_failed url=%s detail=%s", url, exc)
         return ""
 
 
@@ -553,7 +713,7 @@ def _telegram_post(chat_id: str, message: str) -> None:
 def send_telegram_message(message: str, chat_id: Optional[str] = None) -> bool:
     target_chat_id = chat_id or SETTINGS.telegram_chat_id
     if not SETTINGS.telegram_token or not target_chat_id:
-        LOGGER.warning("telegram_skipped missing_token_or_chat")
+        APP_LOG.warning("telegram_skipped missing_token_or_chat")
         return False
     try:
         chunks = _split_message_html(message, SETTINGS.telegram_message_max_chars)
@@ -563,10 +723,10 @@ def send_telegram_message(message: str, chat_id: Optional[str] = None) -> bool:
                 prefix = f"<b>Part {index}/{total}</b>\n"
                 chunk = prefix + chunk
             _telegram_post(target_chat_id, chunk)
-        LOGGER.info("telegram_sent chunks=%s", total)
+        APP_LOG.info("telegram_sent chunks=%s", total)
         return True
     except Exception as exc:
-        LOGGER.error("telegram_send_failed detail=%s", exc)
+        APP_LOG.error("telegram_send_failed detail=%s", exc)
         return False
 
 
@@ -712,7 +872,7 @@ def _fetch_rss_items(
         response.raise_for_status()
         return _parse_rss_items(response.text, max_items=max_items)
     except Exception as exc:
-        LOGGER.warning("rss_fetch_failed feed=%s detail=%s", feed_url, exc)
+        SYS_LOG.warning("rss_fetch_failed feed=%s detail=%s", feed_url, exc)
         return []
 
 
@@ -774,7 +934,7 @@ def _fetch_newsapi_items(
         response.raise_for_status()
         return _extract_articles_from_payload(response.json())
     except Exception as exc:
-        LOGGER.warning("newsapi_fetch_failed scope=%s detail=%s", scope, exc)
+        SYS_LOG.warning("newsapi_fetch_failed scope=%s detail=%s", scope, exc)
         return []
 
 
@@ -812,7 +972,7 @@ def _fetch_freenews_items(
         response.raise_for_status()
         return _extract_articles_from_payload(response.json())
     except Exception as exc:
-        LOGGER.warning("freenews_fetch_failed scope=%s detail=%s", scope, exc)
+        SYS_LOG.warning("freenews_fetch_failed scope=%s detail=%s", scope, exc)
         return []
 
 
@@ -960,12 +1120,12 @@ def _resolve_topic_weights() -> Dict[str, float]:
             continue
         name = name.strip().lower()
         if name not in weights:
-            LOGGER.warning("topic_weight_unknown category=%s", name)
+            SYS_LOG.warning("topic_weight_unknown category=%s", name)
             continue
         try:
             weights[name] = float(raw_value.strip())
         except ValueError:
-            LOGGER.warning("topic_weight_invalid category=%s value=%s", name, raw_value)
+            SYS_LOG.warning("topic_weight_invalid category=%s value=%s", name, raw_value)
     return weights
 
 
@@ -1242,7 +1402,7 @@ class LlmSelector:
         except Exception as exc:
             RANKER_STATUS["error"] = f"{type(exc).__name__}: {exc}"
             RANKER_STATUS["error_at"] = datetime.now().isoformat(timespec="seconds")
-            LOGGER.warning("ranker_failed section=%s detail=%s", section, exc)
+            APP_LOG.warning("ranker_failed section=%s detail=%s", section, exc)
             return []
 
         RANKER_STATUS["latency_ms"] = int((time.time() - started) * 1000)
@@ -1331,7 +1491,7 @@ def _collect_candidates(scope: str, feed_urls: List[str], pool_size: int) -> Lis
             else:
                 continue
         except Exception as exc:
-            LOGGER.warning("provider_failed provider=%s detail=%s", provider, exc)
+            SYS_LOG.warning("provider_failed provider=%s detail=%s", provider, exc)
             continue
         for title, url, published in items:
             raw.append((title, url, published, provider))
@@ -1391,7 +1551,7 @@ def _build_news_section(
         selections = HeuristicSelector(now=now).select(eligible, section_key, max_headlines)
 
     collapsed = sum(len(selection.duplicates) for selection in selections)
-    LOGGER.info(
+    APP_LOG.info(
         "news_select section=%s pool=%d eligible=%d selected=%d collapsed=%d path=%s latency_ms=%s",
         section_key,
         len(pool),
@@ -1502,13 +1662,13 @@ def _fetch_finnhub_quote(symbol: str) -> Optional[Dict[str, float]]:
         if status_code in (401, 403, 429):
             with CACHE_LOCK:
                 FINNHUB_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.finnhub_failure_cooldown_seconds)
-        LOGGER.warning("finnhub_quote_failed symbol=%s status=%s detail=%s", symbol, status_code, exc)
+        SYS_LOG.warning("finnhub_quote_failed symbol=%s status=%s detail=%s", symbol, status_code, exc)
     except Exception as exc:
         error_text = str(exc)
         if isinstance(exc, requests.exceptions.SSLError) or "UNEXPECTED_EOF_WHILE_READING" in error_text:
             with CACHE_LOCK:
                 FINNHUB_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.finnhub_failure_cooldown_seconds)
-        LOGGER.warning("finnhub_quote_failed symbol=%s detail=%s", symbol, error_text)
+        SYS_LOG.warning("finnhub_quote_failed symbol=%s detail=%s", symbol, error_text)
     return None
 
 
@@ -1539,7 +1699,7 @@ def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str,
     with CACHE_LOCK:
         backoff_until = YAHOO_SCREENER_BACKOFF_UNTIL
     if now_ts < backoff_until:
-        LOGGER.info("screener_temporarily_skipped scr_id=%s backoff_until=%s", scr_id, int(backoff_until))
+        SYS_LOG.info("screener_temporarily_skipped scr_id=%s backoff_until=%s", scr_id, int(backoff_until))
         return []
 
     timeout_seconds = max(2, min(SETTINGS.request_timeout_seconds, SETTINGS.screener_request_timeout_seconds))
@@ -1577,12 +1737,12 @@ def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str,
             with CACHE_LOCK:
                 YAHOO_SCREENER_BACKOFF_UNTIL = time.time() + max(30, SETTINGS.screener_failure_cooldown_seconds)
                 backoff_until = YAHOO_SCREENER_BACKOFF_UNTIL
-            LOGGER.warning(
+            SYS_LOG.warning(
                 "screener_ssl_backoff_active until=%s detail=%s",
                 int(backoff_until),
                 error_text,
             )
-        LOGGER.warning("screener_fetch_failed scr_id=%s detail=%s", scr_id, error_text)
+        SYS_LOG.warning("screener_fetch_failed scr_id=%s detail=%s", scr_id, error_text)
     return []
 
 
@@ -1750,7 +1910,7 @@ def _compute_atr_percent(history: Any) -> Optional[float]:
             return None
         return (atr / last_close) * 100
     except Exception as exc:
-        LOGGER.debug("atr_compute_failed detail=%s", exc)
+        SYS_LOG.debug("atr_compute_failed detail=%s", exc)
         return None
 
 
@@ -1803,7 +1963,7 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
         history = _drop_in_progress_bar(_fetch_ticker_history(symbol))
         close_series = history["Close"].dropna()
         if len(close_series) < 30:
-            LOGGER.debug(
+            SYS_LOG.debug(
                 "metrics_skipped symbol=%s reason=insufficient_history bars=%s",
                 symbol,
                 len(close_series),
@@ -1813,14 +1973,14 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
         last_close = float(close_series.iloc[-1])
         prev_close = float(close_series.iloc[-2])
         if prev_close == 0:
-            LOGGER.debug("metrics_skipped symbol=%s reason=zero_prev_close", symbol)
+            SYS_LOG.debug("metrics_skipped symbol=%s reason=zero_prev_close", symbol)
             return None
         day_change_pct = ((last_close - prev_close) / prev_close) * 100
 
         # Safe unconditionally: the length guard above already rules out short series.
         reference_close = float(close_series.iloc[-6])
         if reference_close == 0:
-            LOGGER.debug("metrics_skipped symbol=%s reason=zero_reference_close", symbol)
+            SYS_LOG.debug("metrics_skipped symbol=%s reason=zero_reference_close", symbol)
             return None
         week_momentum_pct = ((last_close - reference_close) / reference_close) * 100
 
@@ -1841,7 +2001,7 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
 
         atr_pct = _compute_atr_percent(history)
         if atr_pct is None:
-            LOGGER.debug("metrics_skipped symbol=%s reason=atr_unavailable", symbol)
+            SYS_LOG.debug("metrics_skipped symbol=%s reason=atr_unavailable", symbol)
             return None
 
         return TradeMetrics(
@@ -1856,7 +2016,7 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
             above_ema20=last_close > ema_20,
         )
     except Exception as exc:
-        LOGGER.debug("metrics_failed symbol=%s detail=%s", symbol, exc)
+        SYS_LOG.debug("metrics_failed symbol=%s detail=%s", symbol, exc)
         return None
 
 
@@ -1968,7 +2128,7 @@ def _build_candidate_universe(max_symbols: int) -> List[Tuple[str, str]]:
         selected.append((label, symbol))
 
     if len(selected) > max_symbols:
-        LOGGER.warning(
+        APP_LOG.warning(
             "watchlist_truncated configured=%s analysed=%s detail=raise TRADE_UNIVERSE_MAX to analyse all",
             len(selected),
             max_symbols,
@@ -2023,7 +2183,7 @@ def _screen_universe(
             try:
                 metrics = future.result()
             except Exception as exc:
-                LOGGER.debug("candidate_future_failed symbol=%s detail=%s", symbol, exc)
+                SYS_LOG.debug("candidate_future_failed symbol=%s detail=%s", symbol, exc)
                 metrics = None
 
             outcome.analysed += 1
@@ -2041,7 +2201,7 @@ def _screen_universe(
             # Checked after the result is consumed: testing first discarded work
             # that had already finished.
             if time.time() >= deadline:
-                LOGGER.warning(
+                APP_LOG.warning(
                     "trade_candidates_deadline_reached analysed=%s of=%s",
                     outcome.analysed,
                     outcome.checked,
@@ -2273,13 +2433,13 @@ def job_daily_briefing(force_hour: Optional[int] = None) -> bool:
     run_time = datetime.now()
     if force_hour is not None:
         run_time = run_time.replace(hour=force_hour, minute=0, second=0, microsecond=0)
-    LOGGER.info("briefing_start at=%s", run_time.isoformat())
+    APP_LOG.info("briefing_start at=%s", run_time.isoformat())
     briefing = compose_briefing(run_time)
     success = send_telegram_message(briefing.message)
     if success:
         _commit_briefing(briefing)
     else:
-        LOGGER.warning("briefing_send_failed headlines_not_marked=%d", len(briefing.pending))
+        APP_LOG.warning("briefing_send_failed headlines_not_marked=%d", len(briefing.pending))
     STATE.data["last_run_status"] = "success" if success else "failed"
     STATE.save()
     return success
@@ -2362,7 +2522,7 @@ def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
             chat_id = str(chat.get("id", SETTINGS.telegram_chat_id))
             text = message.get("text", "")
             if text.startswith("/"):
-                LOGGER.info("command_received cmd=%s chat_id=%s", text.split()[0], chat_id)
+                APP_LOG.info("command_received cmd=%s chat_id=%s", text.split()[0], chat_id)
                 _handle_command(text, chat_id)
             if update_id > STATE.telegram_update_offset:
                 STATE.telegram_update_offset = update_id
@@ -2370,7 +2530,7 @@ def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
             STATE.save()
         return True
     except Exception as exc:
-        LOGGER.error("command_poll_failed detail=%s", exc)
+        SYS_LOG.error("command_poll_failed detail=%s", exc)
         return False
 
 
@@ -2407,7 +2567,7 @@ def _prepare_telegram_long_polling() -> None:
         payload = webhook_info.json()
         webhook_url = ((payload.get("result") or {}).get("url") or "").strip()
         if webhook_url:
-            LOGGER.warning("telegram_webhook_detected removing_for_long_polling")
+            SYS_LOG.warning("telegram_webhook_detected removing_for_long_polling")
             _with_retry(
                 lambda: requests.post(
                     f"https://api.telegram.org/bot{SETTINGS.telegram_token}/deleteWebhook",
@@ -2418,7 +2578,7 @@ def _prepare_telegram_long_polling() -> None:
                 retries=2,
             )
     except Exception as exc:
-        LOGGER.warning("telegram_webhook_check_failed detail=%s", exc)
+        SYS_LOG.warning("telegram_webhook_check_failed detail=%s", exc)
 
 
 def get_missing_required_config() -> Iterable[str]:
@@ -2434,7 +2594,7 @@ def _warn_deprecated_settings() -> None:
     """
     default_min_score = AppSettings.model_fields["trade_min_score"].default
     if SETTINGS.trade_min_score != default_min_score:
-        LOGGER.warning(
+        SYS_LOG.warning(
             "deprecated_setting name=TRADE_MIN_SCORE value=%s detail=ignored; "
             "candidates now pass mandatory gates instead of a score threshold",
             SETTINGS.trade_min_score,

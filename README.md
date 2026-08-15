@@ -123,6 +123,53 @@ python news_bot.py
 - `FINNHUB_FAILURE_COOLDOWN_SECONDS` - cooldown on Finnhub failures/rate limits (default `180`)
 - `FINNHUB_MAX_SYMBOLS_PER_REFRESH` - max symbols per section refreshed via Finnhub (default `16`)
 
+### Logging
+
+Every line is tagged with one of three bands, so application output is
+distinguishable from infrastructure noise at a glance:
+
+```
+2026-08-14 19:12:03  APP    INFO   briefing_start at=2026-08-14T19:12:03
+2026-08-14 19:12:05  SYS    WARN   rss_fetch_failed feed=https://... detail=...
+2026-08-14 19:12:06  INFRA  INFO   apscheduler.scheduler | Scheduler started
+```
+
+- **APP** — what the bot exists to do: briefings composed, headlines
+  selected, messages sent, commands received.
+- **SYS** — the bot's own plumbing: retries, feed and screener failures,
+  state file I/O, cache backoff.
+- **INFRA** — third-party libraries (APScheduler, yfinance, urllib3),
+  carrying their originating logger name.
+
+Bands are colour-coded — APP bold cyan, SYS yellow, INFRA dimmed — and
+severity colours the level tag independently, so an error stays obvious
+without losing its band. The band tag is also written as text, so the
+distinction survives a viewer that does not render ANSI, and
+`docker logs > file`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | APP and SYS bands |
+| `LOG_LEVEL_LIBRARIES` | `WARNING` | INFRA band |
+| `LOG_COLOR` | `true` | ANSI escapes on/off |
+
+The two levels are separate because `LOG_LEVEL=DEBUG` would otherwise make
+urllib3 emit a line per socket. Setting `LOG_LEVEL=DEBUG` reveals per-symbol
+detail that is otherwise computed and discarded — including the reason behind
+each symbol counted in the trade screen's `no data` total:
+
+```
+SYS    DEBUG  metrics_skipped symbol=AAPL reason=insufficient_history bars=12
+```
+
+`LOG_COLOR` defaults to on rather than to TTY detection: a container has no
+TTY, so the usual `isatty()` check would disable colour exactly where it is
+wanted. Set `LOG_COLOR=false` when piping logs to a file or a parser.
+
+Container logs are capped at 3 files of 10 MB by the `logging:` block in
+`docker-compose.yml`. Applying a change to it needs a redeploy, not just a
+restart.
+
 ### News ranking
 
 The bot ranks headlines rather than taking whatever the feeds list first.

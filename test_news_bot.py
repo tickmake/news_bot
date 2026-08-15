@@ -1,5 +1,8 @@
 import json
+import logging
 import os
+import re
+import sys
 import tempfile
 import time
 import unittest
@@ -1791,3 +1794,324 @@ class TradeChecksHeadingTests(unittest.TestCase):
             result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("Ran out of time", result)
         self.assertNotIn("didn't qualify", result)
+
+def _record(name, level=logging.INFO, msg="hello world", args=None, exc_info=None):
+    """A LogRecord as the logging module would construct it."""
+    return logging.LogRecord(
+        name=name, level=level, pathname="news_bot.py", lineno=1,
+        msg=msg, args=args, exc_info=exc_info,
+    )
+
+
+class LogBandTests(unittest.TestCase):
+    def test_app_logger_resolves_to_app_band(self):
+        self.assertEqual(news_bot._band_for("news_bot.app"), "APP")
+
+    def test_sys_logger_resolves_to_sys_band(self):
+        self.assertEqual(news_bot._band_for("news_bot.sys"), "SYS")
+
+    def test_bare_parent_logger_resolves_to_sys_band(self):
+        """A missed call site should land somewhere sane, not be mistaken
+        for a third-party library."""
+        self.assertEqual(news_bot._band_for("news_bot"), "SYS")
+
+    def test_third_party_logger_resolves_to_infra_band(self):
+        self.assertEqual(news_bot._band_for("apscheduler.scheduler"), "INFRA")
+        self.assertEqual(news_bot._band_for("urllib3.connectionpool"), "INFRA")
+
+    def test_line_layout_is_two_spaces_between_padded_fields(self):
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("news_bot.app", msg="briefing_start at=x")
+        )
+        # timestamp(19) + 2 + band(5) + 2 + level(5) + 2 + message
+        self.assertRegex(
+            line,
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  APP    INFO   briefing_start at=x$",
+        )
+
+    def test_warning_renders_as_warn_and_critical_as_error(self):
+        fmt = news_bot.BandedFormatter(colour=False)
+        self.assertIn("WARN ", fmt.format(_record("news_bot.sys", logging.WARNING)))
+        self.assertIn("ERROR", fmt.format(_record("news_bot.sys", logging.CRITICAL)))
+
+    def test_infra_lines_carry_the_originating_logger_name(self):
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("apscheduler.scheduler", msg="Scheduler started")
+        )
+        self.assertIn("apscheduler.scheduler | Scheduler started", line)
+
+    def test_app_and_sys_lines_omit_the_logger_name(self):
+        fmt = news_bot.BandedFormatter(colour=False)
+        for name in ("news_bot.app", "news_bot.sys"):
+            self.assertNotIn(name, fmt.format(_record(name, msg="telegram_sent chunks=1")))
+
+    def test_event_prefix_is_gone(self):
+        """`event=` was only ever true for app records; it mislabelled every
+        library message."""
+        line = news_bot.BandedFormatter(colour=False).format(_record("news_bot.app"))
+        self.assertNotIn("event=", line)
+
+    def test_standard_levels_render_their_own_tags(self):
+        """The four standard levels must render exactly as before the
+        threshold-ladder change: DEBUG, INFO, WARN, ERROR (CRITICAL->ERROR)."""
+        fmt = news_bot.BandedFormatter(colour=False)
+        self.assertIn("DEBUG", fmt.format(_record("news_bot.sys", logging.DEBUG)))
+        self.assertIn("INFO ", fmt.format(_record("news_bot.sys", logging.INFO)))
+        self.assertIn("WARN ", fmt.format(_record("news_bot.sys", logging.WARNING)))
+        self.assertIn("ERROR", fmt.format(_record("news_bot.sys", logging.ERROR)))
+        self.assertIn("ERROR", fmt.format(_record("news_bot.sys", logging.CRITICAL)))
+
+    def test_custom_level_between_error_and_critical_renders_error_tag(self):
+        """A record at level 45 sits between ERROR=40 and CRITICAL=50. The
+        tag must be ERROR so it matches the >= ERROR colour check -- not the
+        old dict-lookup fallback of "INFO", which would render as bold red
+        text reading "INFO"."""
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("news_bot.sys", 45)
+        )
+        self.assertIn("ERROR", line)
+        coloured = news_bot.BandedFormatter(colour=True).format(
+            _record("news_bot.sys", 45)
+        )
+        self.assertIn(news_bot._ANSI["error"], coloured)
+
+    def test_custom_level_between_info_and_warning_renders_info_tag(self):
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("news_bot.sys", 25)
+        )
+        self.assertIn("INFO ", line)
+
+    def test_custom_level_below_debug_floors_at_debug_tag(self):
+        line = news_bot.BandedFormatter(colour=False).format(
+            _record("news_bot.sys", 5)
+        )
+        self.assertIn("DEBUG", line)
+
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _strip_ansi(text):
+    return _ANSI_RE.sub("", text)
+
+
+class LogColourTests(unittest.TestCase):
+    def test_colour_off_emits_no_escapes(self):
+        line = news_bot.BandedFormatter(colour=False).format(_record("news_bot.app"))
+        self.assertNotIn("\033[", line)
+
+    def test_colour_on_emits_escapes(self):
+        line = news_bot.BandedFormatter(colour=True).format(_record("news_bot.app"))
+        self.assertIn("\033[", line)
+
+    def test_stripping_colour_reproduces_the_plain_line_exactly(self):
+        """The load-bearing invariant: grep, log shipping and any future
+        parsing must not depend on a display setting."""
+        cases = [
+            _record("news_bot.app", logging.INFO),
+            _record("news_bot.sys", logging.WARNING),
+            _record("news_bot.sys", logging.ERROR),
+            _record("apscheduler.scheduler", logging.INFO, msg="Scheduler started"),
+            _record("urllib3.connectionpool", logging.DEBUG),
+            _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning"),
+            _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error"),
+        ]
+        plain = news_bot.BandedFormatter(colour=False)
+        fancy = news_bot.BandedFormatter(colour=True)
+        for record in cases:
+            with self.subTest(name=record.name, level=record.levelno):
+                self.assertEqual(_strip_ansi(fancy.format(record)), plain.format(record))
+
+    def test_infra_lines_are_dimmed_whole(self):
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", msg="Scheduler started")
+        )
+        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+
+    def test_error_level_is_coloured_independently_of_band(self):
+        """An error must stay obvious without losing which band it came from."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("news_bot.app", logging.ERROR)
+        )
+        self.assertIn(news_bot._ANSI["error"], line)
+        self.assertIn(news_bot._ANSI["app"], line)
+
+    def test_message_body_is_never_coloured(self):
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("news_bot.app", logging.WARNING, msg="telegram_sent chunks=3")
+        )
+        self.assertIn(f"{news_bot._ANSI['reset']}  telegram_sent chunks=3", line)
+
+    def test_infra_warning_renders_dim_whole(self):
+        """INFRA+WARNING must stay dimmed across the whole line."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning")
+        )
+        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+
+    def test_infra_error_renders_dim_whole(self):
+        """INFRA+ERROR must stay dimmed across the whole line."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
+        )
+        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+
+    def test_infra_error_distinguishable_from_info(self):
+        """INFRA+ERROR must be visually distinct from INFRA+INFO, even while dimmed."""
+        info_line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.INFO, msg="Scheduler started")
+        )
+        error_line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
+        )
+        # Both must be dimmed
+        self.assertTrue(info_line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(error_line.startswith(news_bot._ANSI["dim"]))
+        # Error line must contain the error colour
+        self.assertIn(news_bot._ANSI["error"], error_line)
+        # Info line must not contain the error colour
+        self.assertNotIn(news_bot._ANSI["error"], info_line)
+
+    def test_infra_error_severity_colour_confined_to_level_tag(self):
+        """On INFRA lines, severity colour must not bleed into the message body."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
+        )
+        # Find the level tag close and extract everything after it
+        # Format for INFRA+ERROR: \033[2m...{timestamp}  INFRA  \033[1;31mERROR\033[0m\033[2m  message\033[0m
+        level_tag_close = f"{news_bot._ANSI['error']}ERROR\033[0m\033[2m"
+        parts = line.split(level_tag_close)
+        self.assertEqual(len(parts), 2, "Should have exactly one ERROR tag")
+        after_level = parts[1]
+        # Message body should have no error or warn colour codes
+        self.assertNotIn(news_bot._ANSI["error"], after_level)
+        self.assertNotIn(news_bot._ANSI["warn"], after_level)
+
+    def test_infra_warning_severity_colour_confined_to_level_tag(self):
+        """On INFRA lines, severity colour must not bleed into the message body."""
+        line = news_bot.BandedFormatter(colour=True).format(
+            _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning")
+        )
+        # Find the level tag close and extract everything after it
+        # Format for INFRA+WARNING: \033[2m...{timestamp}  INFRA  \033[33mWARN \033[0m\033[2m  message\033[0m
+        level_tag_close = f"{news_bot._ANSI['warn']}WARN \033[0m\033[2m"
+        parts = line.split(level_tag_close)
+        self.assertEqual(len(parts), 2, "Should have exactly one WARN tag")
+        after_level = parts[1]
+        # Message body should have no error or warn colour codes
+        self.assertNotIn(news_bot._ANSI["error"], after_level)
+        self.assertNotIn(news_bot._ANSI["warn"], after_level)
+
+
+class LogConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._root_handlers = list(logging.getLogger().handlers)
+        self._root_level = logging.getLogger().level
+        self._app_level = news_bot.LOGGER.level
+
+    def tearDown(self):
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        for handler in self._root_handlers:
+            root.addHandler(handler)
+        root.setLevel(self._root_level)
+        news_bot.LOGGER.setLevel(self._app_level)
+        news_bot._LOGGING_CONFIGURED = True
+
+    def _configure(self, **overrides):
+        settings = {"log_level": "INFO", "log_level_libraries": "WARNING", "log_color": False}
+        settings.update(overrides)
+        news_bot._LOGGING_CONFIGURED = False
+        with patch.multiple(news_bot.SETTINGS, **settings):
+            news_bot._configure_logging()
+
+    def test_resolve_level_accepts_known_names(self):
+        self.assertEqual(news_bot._resolve_level("DEBUG"), (logging.DEBUG, None))
+        self.assertEqual(news_bot._resolve_level("warning"), (logging.WARNING, None))
+
+    def test_resolve_level_reports_an_unknown_name(self):
+        """logging.getLevelName("BOGUS") returns the string "Level BOGUS"
+        rather than raising, so a typo would otherwise configure nonsense."""
+        level, rejected = news_bot._resolve_level("BOGUS")
+        self.assertEqual(level, logging.INFO)
+        self.assertEqual(rejected, "BOGUS")
+
+    def test_invalid_level_warns_and_names_the_ignored_value(self):
+        with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
+            self._configure(log_level="BOGUS")
+        self.assertTrue(any("log_level_invalid" in line for line in logs.output))
+        self.assertTrue(any("BOGUS" in line for line in logs.output))
+
+    def test_resolve_level_treats_empty_string_as_unset(self):
+        """LOG_LEVEL= with nothing after the `=` means "use the default",
+        not a typo -- it must not be reported as a rejected value."""
+        self.assertEqual(news_bot._resolve_level(""), (logging.INFO, None))
+
+    def test_resolve_level_treats_whitespace_only_as_unset(self):
+        self.assertEqual(news_bot._resolve_level("   "), (logging.INFO, None))
+
+    def test_empty_log_level_does_not_warn(self):
+        with self.assertLogs(news_bot.SYS_LOG, level="DEBUG") as logs:
+            self._configure(log_level="", log_level_libraries="WARNING")
+            # Emit a sentinel so assertLogs has something to capture even
+            # when, as expected, no log_level_invalid warning fires.
+            news_bot.SYS_LOG.debug("sentinel")
+        self.assertFalse(any("log_level_invalid" in line for line in logs.output))
+
+    def test_handler_writes_to_stdout_not_stderr(self):
+        """basicConfig defaults to stderr, so routine INFO arrived on the
+        error stream."""
+        self._configure()
+        handlers = logging.getLogger().handlers
+        self.assertEqual(len(handlers), 1)
+        self.assertIs(handlers[0].stream, sys.stdout)
+
+    def test_configuring_twice_installs_one_handler(self):
+        self._configure()
+        news_bot._configure_logging()  # second call, flag already set
+        self.assertEqual(len(logging.getLogger().handlers), 1)
+
+    def test_app_debug_does_not_unleash_library_debug(self):
+        """urllib3 emits a line per socket at DEBUG; the app must be able to
+        go verbose without that."""
+        self._configure(log_level="DEBUG", log_level_libraries="WARNING")
+        self.assertTrue(news_bot.SYS_LOG.isEnabledFor(logging.DEBUG))
+        self.assertFalse(logging.getLogger("urllib3.connectionpool").isEnabledFor(logging.DEBUG))
+
+    def test_library_level_can_be_lowered_on_its_own(self):
+        self._configure(log_level="INFO", log_level_libraries="DEBUG")
+        self.assertTrue(logging.getLogger("urllib3.connectionpool").isEnabledFor(logging.DEBUG))
+
+
+class LogRoutingTests(unittest.TestCase):
+    def test_business_events_go_to_the_app_logger(self):
+        # Both credentials blanked so this can never reach the network, even
+        # if a real .env is present.
+        with patch.object(news_bot.SETTINGS, "telegram_token", ""), patch.object(
+            news_bot.SETTINGS, "telegram_chat_id", ""
+        ):
+            with self.assertLogs(news_bot.APP_LOG, level="WARNING") as logs:
+                sent = news_bot.send_telegram_message("x")
+        self.assertFalse(sent)
+        self.assertTrue(any("telegram_skipped" in line for line in logs.output))
+
+    def test_plumbing_events_go_to_the_sys_logger(self):
+        with self.assertLogs(news_bot.SYS_LOG, level="WARNING") as logs:
+            with patch.object(news_bot.SETTINGS, "news_topic_weights", "nonsense:1.0"):
+                news_bot._resolve_topic_weights()
+        self.assertTrue(any("topic_weight_unknown" in line for line in logs.output))
+
+    def test_no_call_site_uses_the_bare_parent_logger(self):
+        """Every emitter must pick a band explicitly.
+
+        Resolved via news_bot.__file__ rather than a relative path, so the
+        test does not depend on the working directory.
+        """
+        with open(news_bot.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        for level in ("debug", "info", "warning", "error"):
+            self.assertNotIn(f"LOGGER.{level}(", source)
