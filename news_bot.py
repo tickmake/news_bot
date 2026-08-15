@@ -329,6 +329,7 @@ class AppSettings(BaseSettings):
     usa_stock_universe: Optional[str] = None
     india_stock_universe: Optional[str] = None
     norway_stock_universe: Optional[str] = None
+    eu_stock_universe: Optional[str] = None
     india_mutual_funds: Optional[str] = None
     norway_mutual_funds: Optional[str] = None
 
@@ -380,9 +381,33 @@ def _parse_instrument_env(raw_value: Optional[str], fallback: Dict[str, str]) ->
     return parsed or dict(fallback)
 
 
+# Unlike the other configured universes below, EU stocks ship with a
+# non-empty default: Yahoo's predefined screener endpoint (see
+# _fetch_predefined_screener_quotes) is hardcoded to US-market data regardless
+# of region/lang params, so EU names can only ever reach the trade screen via
+# this configured list -- an empty default would silently mean "no EU
+# coverage" exactly like the bug this was added to fix.
+DEFAULT_EU_STOCK_UNIVERSE: Dict[str, str] = {
+    "SAP": "SAP.DE",
+    "Siemens": "SIE.DE",
+    "Allianz": "ALV.DE",
+    "ASML Holding": "ASML.AS",
+    "LVMH": "MC.PA",
+    "TotalEnergies": "TTE.PA",
+    "L'Oreal": "OR.PA",
+    "Sanofi": "SAN.PA",
+    "Airbus": "AIR.PA",
+    "Enel": "ENEL.MI",
+    "Intesa Sanpaolo": "ISP.MI",
+    "Iberdrola": "IBE.MC",
+    "Inditex": "ITX.MC",
+    "Anheuser-Busch InBev": "ABI.BR",
+}
+
 USA_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.usa_stock_universe, {})
 INDIA_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.india_stock_universe, {})
 NORWAY_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.norway_stock_universe, {})
+EU_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.eu_stock_universe, DEFAULT_EU_STOCK_UNIVERSE)
 INDIA_MUTUAL_FUNDS = _parse_instrument_env(SETTINGS.india_mutual_funds, {})
 NORWAY_MUTUAL_FUNDS = _parse_instrument_env(SETTINGS.norway_mutual_funds, {})
 
@@ -2156,6 +2181,7 @@ def _configured_watchlist() -> List[Tuple[str, str]]:
         ("USA Stock", USA_STOCK_UNIVERSE),
         ("India Stock", INDIA_STOCK_UNIVERSE),
         ("Norway Stock", NORWAY_STOCK_UNIVERSE),
+        ("EU Stock", EU_STOCK_UNIVERSE),
         ("India Fund", INDIA_MUTUAL_FUNDS),
         ("Norway Fund", NORWAY_MUTUAL_FUNDS),
     ):

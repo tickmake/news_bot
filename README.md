@@ -291,6 +291,7 @@ Supported variables:
 - `USA_STOCK_UNIVERSE`
 - `INDIA_STOCK_UNIVERSE`
 - `NORWAY_STOCK_UNIVERSE`
+- `EU_STOCK_UNIVERSE`
 - `INDIA_MUTUAL_FUNDS`
 - `NORWAY_MUTUAL_FUNDS`
 
@@ -299,10 +300,18 @@ Example:
 ```bash
 USA_STOCK_UNIVERSE="Apple:AAPL,Microsoft:MSFT,NVIDIA:NVDA"
 INDIA_STOCK_UNIVERSE="Reliance:RELIANCE.NS,TCS:TCS.NS"
+EU_STOCK_UNIVERSE="SAP:SAP.DE,LVMH:MC.PA,ASML Holding:ASML.AS"
 INDIA_MUTUAL_FUNDS="Nifty BeES:NIFTYBEES.NS,Gold BeES:GOLDBEES.NS"
 ```
 
-If these are empty, the bot relies fully on live screener data.
+If these are empty, the bot relies fully on live screener data -- except
+`EU_STOCK_UNIVERSE`, which ships with a default list of large-cap eurozone
+names (SAP, ASML, LVMH, and others). Yahoo's live screener endpoint is
+hardcoded to US-market data regardless of region/lang parameters, so EU
+symbols can only reach the trade screen through this configured list. Set
+`EU_STOCK_UNIVERSE` to your own `Label:SYMBOL` entries to replace the
+default (an unset or empty value falls back to it, same as the other
+universe variables above).
 
 ### Trade Risk Controls
 
