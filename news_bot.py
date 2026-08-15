@@ -1837,15 +1837,72 @@ def _rank_quotes_by_change(quotes: List[Dict[str, Any]], top_n: int) -> List[Dic
     return [quote for _, quote in ranked[:top_n]]
 
 
+def _collect_stock_quotes_by_screener(
+    scr_ids: List[str], count_per_screener: int
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Per-screener stock quotes, each list kept in the screener's own order.
+
+    _collect_live_quotes merges every screener into one flat, deduped pool,
+    which loses which screener a symbol came from. Candidate discovery needs
+    that origin preserved so slots can be allocated fairly across screeners
+    (see _build_live_universe) instead of by a global rank that a high-%-swing
+    screener like day_gainers would always win.
+    """
+    by_screener: Dict[str, List[Dict[str, Any]]] = {}
+    seen: set = set()
+    for scr_id in scr_ids:
+        rows = []
+        for quote in _fetch_predefined_screener_quotes(scr_id, count=count_per_screener):
+            if not _is_stock_quote(quote):
+                continue
+            symbol = (quote.get("symbol") or "").strip()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            rows.append(quote)
+        by_screener[scr_id] = rows
+    return by_screener
+
+
+def _round_robin_merge(lists: List[List[Dict[str, Any]]], limit: int) -> List[Dict[str, Any]]:
+    """Interleave several ranked lists instead of concatenating them.
+
+    One slot from each list per round, so no single source can fill the
+    entire cap before the others contribute anything.
+    """
+    merged: List[Dict[str, Any]] = []
+    index = 0
+    while len(merged) < limit and any(index < len(lst) for lst in lists):
+        for lst in lists:
+            if index < len(lst):
+                merged.append(lst[index])
+                if len(merged) >= limit:
+                    break
+        index += 1
+    return merged
+
+
 def _build_live_universe(limit: int = 40) -> Dict[str, str]:
-    # Only names/symbols are needed here, so rank on the screener-reported
-    # change and skip Finnhub enrichment (those refreshed prices are discarded).
-    dynamic_quotes = _collect_live_quotes(STOCK_SCREENERS + FUND_SCREENERS, count_per_screener=SETTINGS.screener_quote_limit)
-    stocks = [quote for quote in dynamic_quotes if _is_stock_quote(quote)]
-    funds = [quote for quote in dynamic_quotes if _is_fund_quote(quote)]
-    selected = _rank_quotes_by_change(stocks, limit) + _rank_quotes_by_change(funds, max(10, limit // 2))
+    """Candidate discovery for the trade screen.
+
+    Stock slots are allocated round-robin across STOCK_SCREENERS rather than
+    by a global %-change rank: a momentum screener like day_gainers reports
+    far larger swings than a calmer source like undervalued_large_caps, so
+    ranking the merged pool by change let day_gainers/most_actives fill every
+    slot before calmer screeners contributed a single symbol -- leaving the
+    trade screen's volatility gate with nothing that could ever pass it.
+    """
+    stock_by_screener = _collect_stock_quotes_by_screener(
+        STOCK_SCREENERS, count_per_screener=SETTINGS.screener_quote_limit
+    )
+    selected_stocks = _round_robin_merge(list(stock_by_screener.values()), limit)
+
+    fund_quotes = _collect_live_quotes(FUND_SCREENERS, count_per_screener=SETTINGS.screener_quote_limit)
+    funds = [quote for quote in fund_quotes if _is_fund_quote(quote)]
+    selected_funds = _rank_quotes_by_change(funds, max(10, limit // 2))
+
     universe: Dict[str, str] = {}
-    for quote in selected:
+    for quote in selected_stocks + selected_funds:
         symbol = str(quote.get("symbol") or "").strip()
         name = _truncate(_quote_name(quote), 28)
         if symbol and symbol not in universe.values():
