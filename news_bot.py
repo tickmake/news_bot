@@ -3,6 +3,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -11,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from html import escape
+from html import escape, unescape
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 from urllib.parse import urlparse
 import defusedxml.ElementTree as ET
@@ -241,6 +243,8 @@ class AppSettings(BaseSettings):
 
     telegram_token: str = ""
     telegram_chat_id: str = ""
+    slack_webhook_url: str = ""
+    slack_message_max_chars: int = 3900
     news_api_key: str = ""
     freenews_api_key: str = ""
     # Backward-compatible env support for older typo'd variable name.
@@ -312,6 +316,11 @@ class AppSettings(BaseSettings):
     trade_fetch_workers: int = 6
     trade_history_cache_ttl_seconds: int = 600
     trade_total_deadline_seconds: int = 45
+    trade_history_db_file: str = ".news_bot_trade_history.db"
+    trade_history_retention_days: int = 14
+    trade_outcome_lookback_days: int = 5
+    ticker_info_cache_ttl_seconds: int = 21600
+    ticker_analysis_summary_max_chars: int = 500
     command_long_poll_timeout_seconds: int = 25
     global_news_feeds: str = DEFAULT_GLOBAL_NEWS_FEEDS
     business_news_feeds: str = DEFAULT_BUSINESS_NEWS_FEEDS
@@ -348,6 +357,7 @@ YAHOO_SCREENER_BACKOFF_UNTIL = 0.0
 FINNHUB_QUOTE_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}
 FINNHUB_BACKOFF_UNTIL = 0.0
 HISTORY_CACHE: Dict[str, Tuple[float, Any]] = {}
+TICKER_INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 # Last-known ranker state, surfaced by /health.
 RANKER_STATUS: Dict[str, Any] = {
@@ -360,6 +370,7 @@ RANKER_STATUS: Dict[str, Any] = {
 # Guards shared mutable state against overlapping scheduler/poller threads.
 STATE_LOCK = threading.RLock()
 CACHE_LOCK = threading.RLock()
+TRADE_HISTORY_LOCK = threading.RLock()
 
 
 def _parse_instrument_env(raw_value: Optional[str], fallback: Dict[str, str]) -> Dict[str, str]:
@@ -753,6 +764,79 @@ def send_telegram_message(message: str, chat_id: Optional[str] = None) -> bool:
     except Exception as exc:
         APP_LOG.error("telegram_send_failed detail=%s", exc)
         return False
+
+
+# Telegram HTML tags actually emitted elsewhere in this module (see
+# `escape`/`_render_candidate` etc.) mapped to Slack's mrkdwn equivalents.
+# Order matters: <a href> must run before the generic tag stripper below.
+_SLACK_LINK_RE = re.compile(r'<a href="([^"]*)">(.*?)</a>', re.DOTALL)
+_SLACK_BOLD_RE = re.compile(r"<b>(.*?)</b>", re.DOTALL)
+_SLACK_ITALIC_RE = re.compile(r"<i>(.*?)</i>", re.DOTALL)
+_SLACK_PRE_RE = re.compile(r"<pre>(.*?)</pre>", re.DOTALL)
+_SLACK_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _html_to_slack_text(message: str) -> str:
+    """Best-effort conversion of this bot's Telegram HTML to Slack mrkdwn.
+
+    Telegram messages here only ever use <a>, <b>, <i> and <pre> (see the
+    grep-verified tag set); anything else is stripped rather than risking a
+    stray literal "<...>" in Slack. HTML entities (produced by `escape()` for
+    Telegram) are unescaped back to plain text since Slack mrkdwn is not HTML.
+
+    Links are converted to a NUL-delimited placeholder first and rendered
+    into Slack's own "<url|text>" syntax only after the generic tag stripper
+    runs -- otherwise that angle-bracketed output would itself look like an
+    unknown tag and get stripped.
+    """
+    text = _SLACK_LINK_RE.sub(lambda m: f"\x00{m.group(1)}\x00{m.group(2)}\x00", message)
+    text = _SLACK_PRE_RE.sub(lambda m: f"```{m.group(1)}```", text)
+    text = _SLACK_BOLD_RE.sub(r"*\1*", text)
+    text = _SLACK_ITALIC_RE.sub(r"_\1_", text)
+    text = _SLACK_TAG_RE.sub("", text)
+    text = re.sub(r"\x00([^\x00]*)\x00([^\x00]*)\x00", r"<\1|\2>", text)
+    return unescape(text)
+
+
+def _slack_post(text: str) -> None:
+    def _send() -> requests.Response:
+        return requests.post(
+            SETTINGS.slack_webhook_url,
+            json={"text": text},
+            timeout=SETTINGS.request_timeout_seconds,
+        )
+
+    response = _with_retry(_send, "slack_send")
+    response.raise_for_status()
+
+
+def send_slack_message(message: str) -> bool:
+    if not SETTINGS.slack_webhook_url:
+        return False
+    try:
+        slack_text = _html_to_slack_text(message)
+        chunks = _split_message_html(slack_text, SETTINGS.slack_message_max_chars)
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, 1):
+            if total > 1:
+                chunk = f"*Part {index}/{total}*\n{chunk}"
+            _slack_post(chunk)
+        APP_LOG.info("slack_sent chunks=%s", total)
+        return True
+    except Exception as exc:
+        APP_LOG.error("slack_send_failed detail=%s", exc)
+        return False
+
+
+def _broadcast_message(message: str, chat_id: Optional[str] = None) -> bool:
+    """Send to Telegram (the source of truth for delivery/dedup logic) and,
+    if configured, mirror the same content to Slack as a best-effort extra
+    channel -- a Slack failure never affects the Telegram-derived return
+    value callers rely on for headline dedup bookkeeping."""
+    telegram_ok = send_telegram_message(message, chat_id=chat_id)
+    if SETTINGS.slack_webhook_url:
+        send_slack_message(message)
+    return telegram_ok
 
 
 def build_daily_intro(now: Optional[datetime] = None) -> str:
@@ -1935,8 +2019,11 @@ def _build_live_universe(limit: int = 40) -> Dict[str, str]:
     return universe
 
 
-def get_business_and_stocks() -> Tuple[str, List[Selection]]:
-    biz_str, biz_selections = _build_news_section(
+def _business_news_section() -> Tuple[str, List[Selection]]:
+    """Business headlines only -- no live quotes. Split out from
+    `get_business_and_stocks` so `/news` can send pure news without the
+    live market tables that aren't news at all."""
+    return _build_news_section(
         section_key="business_news",
         scope="business",
         title="💼 Top Business Stories:",
@@ -1944,8 +2031,11 @@ def get_business_and_stocks() -> Tuple[str, List[Selection]]:
         empty_message="No fresh business headlines available right now.",
         max_headlines=8,
     )
-    biz_str = biz_str.strip()
 
+
+def _live_market_snapshot() -> str:
+    """Live stock/fund quote tables only -- no headlines. The counterpart to
+    `_business_news_section`, split out for the same reason."""
     quotes = _collect_live_quotes(STOCK_SCREENERS + FUND_SCREENERS, count_per_screener=SETTINGS.screener_quote_limit)
     stock_quotes = [quote for quote in quotes if _is_stock_quote(quote)]
     fund_quotes = [quote for quote in quotes if _is_fund_quote(quote)]
@@ -1964,9 +2054,12 @@ def get_business_and_stocks() -> Tuple[str, List[Selection]]:
     else:
         fund_section.append("Data temporarily unavailable")
 
-    stock_str = "\n".join(stock_section)
-    fund_str = "\n".join(fund_section)
-    return f"{biz_str}\n\n{stock_str}\n\n{fund_str}", biz_selections
+    return "\n".join(stock_section) + "\n\n" + "\n".join(fund_section)
+
+
+def get_business_and_stocks() -> Tuple[str, List[Selection]]:
+    biz_str, biz_selections = _business_news_section()
+    return f"{biz_str.strip()}\n\n{_live_market_snapshot()}", biz_selections
 
 
 def _compute_atr_percent(history: Any) -> Optional[float]:
@@ -1996,6 +2089,56 @@ def _compute_atr_percent(history: Any) -> Optional[float]:
         return None
 
 
+def _compute_rsi_14(close_series: Any) -> Optional[float]:
+    """14-period RSI using a simple (not Wilder-smoothed) average of gains and
+    losses, matching the plain 14-bar averaging `_compute_atr_percent` already
+    uses above -- one averaging convention for the whole module rather than
+    two silently different ones.
+    """
+    try:
+        if len(close_series) < 15:
+            return None
+        deltas = close_series.diff().dropna()
+        if len(deltas) < 14:
+            return None
+        gains = deltas.clip(lower=0.0)
+        losses = -deltas.clip(upper=0.0)
+        avg_gain = float(gains.tail(14).mean())
+        avg_loss = float(losses.tail(14).mean())
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+    except Exception as exc:
+        SYS_LOG.debug("rsi_compute_failed detail=%s", exc)
+        return None
+
+
+def _compute_volume_trend(volume_series: Any) -> str:
+    """Recent 5-session average volume vs. the 15 sessions before that.
+
+    A coarse direction only -- "rising"/"falling"/"flat" -- not a signal on
+    its own; it feeds the candidate's supply/demand read alongside the
+    volume-ratio tie-breaker that already exists in `_rank_key`.
+    """
+    try:
+        if len(volume_series) < 20:
+            return "flat"
+        recent_avg = float(volume_series.tail(5).mean())
+        prior_avg = float(volume_series.tail(20).head(15).mean())
+        if prior_avg <= 0:
+            return "flat"
+        change = (recent_avg - prior_avg) / prior_avg
+        if change >= 0.15:
+            return "rising"
+        if change <= -0.15:
+            return "falling"
+        return "flat"
+    except Exception as exc:
+        SYS_LOG.debug("volume_trend_compute_failed detail=%s", exc)
+        return "flat"
+
+
 @dataclass(frozen=True)
 class TradeMetrics:
     """Measured facts about one symbol. Carries no pass/fail judgement."""
@@ -2009,6 +2152,14 @@ class TradeMetrics:
     drawdown_pct: float
     atr_pct: float
     above_ema20: bool
+    # Added for swing/day-trade signal enrichment. Defaulted so the many
+    # existing call sites that build a TradeMetrics without these (mostly
+    # tests) keep working unchanged.
+    ema20: float = 0.0
+    rsi_14: Optional[float] = None
+    support_level: float = 0.0
+    resistance_level: float = 0.0
+    volume_trend: str = "flat"
 
 
 def _drop_in_progress_bar(history: Any) -> Any:
@@ -2069,22 +2220,29 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
         ema_20 = float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
 
         volume_ratio = 1.0
+        volume_trend = "flat"
         if "Volume" in history:
             volume_series = history["Volume"].dropna()
             if len(volume_series) >= 20:
                 avg_volume_20 = float(volume_series.tail(20).mean())
                 if avg_volume_20 > 0:
                     volume_ratio = float(volume_series.iloc[-1]) / avg_volume_20
+            volume_trend = _compute_volume_trend(volume_series)
 
-        rolling_high_20 = float(close_series.tail(20).max())
+        resistance_level = float(close_series.tail(20).max())
+        support_level = float(close_series.tail(20).min())
         drawdown_pct = (
-            ((rolling_high_20 - last_close) / rolling_high_20) * 100 if rolling_high_20 else 0.0
+            ((resistance_level - last_close) / resistance_level) * 100
+            if resistance_level
+            else 0.0
         )
 
         atr_pct = _compute_atr_percent(history)
         if atr_pct is None:
             SYS_LOG.debug("metrics_skipped symbol=%s reason=atr_unavailable", symbol)
             return None
+
+        rsi_14 = _compute_rsi_14(close_series)
 
         return TradeMetrics(
             symbol=symbol,
@@ -2096,6 +2254,11 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
             drawdown_pct=drawdown_pct,
             atr_pct=atr_pct,
             above_ema20=last_close > ema_20,
+            ema20=ema_20,
+            rsi_14=rsi_14,
+            support_level=support_level,
+            resistance_level=resistance_level,
+            volume_trend=volume_trend,
         )
     except Exception as exc:
         SYS_LOG.debug("metrics_failed symbol=%s detail=%s", symbol, exc)
@@ -2137,20 +2300,250 @@ def _failed_gates(metrics: TradeMetrics) -> List[str]:
     return failed
 
 
-def _rank_key(metrics: TradeMetrics) -> Tuple[float, float, float, str]:
-    """Ordering for qualifying candidates: momentum, then confirmation, then calm.
+def _rank_key(metrics: TradeMetrics) -> Tuple[float, float, int, float, str]:
+    """Ordering for qualifying candidates: momentum, then confirmation,
+    then consistency, then calm.
 
     An ordinal rule rather than a weighted composite. Choosing weights needs
     backtesting this codebase has no harness for, and arbitrary weights
     presented as precision are worse than an explicit ordering. Symbol sorts
     last so identical metrics always produce the same output.
+
+    The qualifying streak (how many recent sessions running, today included,
+    this symbol has passed every gate) sits after volume and before ATR: it
+    is a read of the bot's own history for this symbol, one tier weaker a
+    signal than today's directly measured volume confirmation, but still
+    more informative than volatility alone for breaking a tie.
     """
     return (
         -metrics.week_momentum_pct,
         -metrics.volume_ratio,
+        -TRADE_HISTORY.recent_qualifying_streak(metrics.symbol),
         metrics.atr_pct,
         metrics.symbol,
     )
+
+
+class TradeHistoryStore:
+    """Remembers what the screener measured each session, for every symbol it
+    looked at -- not just the ones that qualified.
+
+    Nothing before this persisted between runs: `_compute_trade_metrics`
+    recomputes from a fresh yfinance pull every time, so there was no way to
+    see a streak of qualifying days or check whether a past qualifying day
+    actually paid off. One row per (symbol, session_date); a same-day rerun
+    (e.g. /now after the scheduled run) overwrites its row rather than
+    duplicating it, so re-running never inflates a streak.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def _connection(self) -> sqlite3.Connection:
+        # Every access already goes through TRADE_HISTORY_LOCK (record/prune/
+        # history all take it), so one shared connection with
+        # check_same_thread=False is safe and avoids opening -- and leaking,
+        # since a ThreadPoolExecutor's workers are never explicitly torn
+        # down -- a new connection per screener worker thread.
+        if self._conn is None:
+            conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_metrics_history (
+                    symbol TEXT NOT NULL,
+                    session_date TEXT NOT NULL,
+                    last_close REAL NOT NULL,
+                    day_change_pct REAL NOT NULL,
+                    week_momentum_pct REAL NOT NULL,
+                    volume_ratio REAL NOT NULL,
+                    drawdown_pct REAL NOT NULL,
+                    atr_pct REAL NOT NULL,
+                    above_ema20 INTEGER NOT NULL,
+                    qualified INTEGER NOT NULL,
+                    failed_gate TEXT,
+                    recorded_at TEXT NOT NULL,
+                    PRIMARY KEY (symbol, session_date)
+                )
+                """
+            )
+            conn.commit()
+            self._conn = conn
+        return self._conn
+
+    def record(self, metrics: "TradeMetrics", qualified: bool, failed_gate: Optional[str]) -> None:
+        with TRADE_HISTORY_LOCK:
+            try:
+                conn = self._connection()
+                conn.execute(
+                    """
+                    INSERT INTO trade_metrics_history (
+                        symbol, session_date, last_close, day_change_pct,
+                        week_momentum_pct, volume_ratio, drawdown_pct, atr_pct,
+                        above_ema20, qualified, failed_gate, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, session_date) DO UPDATE SET
+                        last_close=excluded.last_close,
+                        day_change_pct=excluded.day_change_pct,
+                        week_momentum_pct=excluded.week_momentum_pct,
+                        volume_ratio=excluded.volume_ratio,
+                        drawdown_pct=excluded.drawdown_pct,
+                        atr_pct=excluded.atr_pct,
+                        above_ema20=excluded.above_ema20,
+                        qualified=excluded.qualified,
+                        failed_gate=excluded.failed_gate,
+                        recorded_at=excluded.recorded_at
+                    """,
+                    (
+                        metrics.symbol,
+                        metrics.session,
+                        metrics.last_close,
+                        metrics.day_change_pct,
+                        metrics.week_momentum_pct,
+                        metrics.volume_ratio,
+                        metrics.drawdown_pct,
+                        metrics.atr_pct,
+                        int(metrics.above_ema20),
+                        int(qualified),
+                        failed_gate,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+            except Exception as exc:
+                SYS_LOG.warning("trade_history_record_failed symbol=%s detail=%s", metrics.symbol, exc)
+
+    def prune(self, retention_days: int, today: Optional[str] = None) -> None:
+        anchor_text = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            anchor = datetime.strptime(anchor_text, "%Y-%m-%d")
+        except ValueError:
+            anchor = datetime.now(timezone.utc)
+        cutoff = (anchor - timedelta(days=max(0, retention_days - 1))).strftime("%Y-%m-%d")
+        with TRADE_HISTORY_LOCK:
+            try:
+                conn = self._connection()
+                conn.execute(
+                    "DELETE FROM trade_metrics_history WHERE session_date < ?", (cutoff,)
+                )
+                conn.commit()
+            except Exception as exc:
+                SYS_LOG.warning("trade_history_prune_failed detail=%s", exc)
+
+    def history(self, symbol: str, days: int = 14, today: Optional[str] = None) -> List[sqlite3.Row]:
+        anchor_text = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            anchor = datetime.strptime(anchor_text, "%Y-%m-%d")
+        except ValueError:
+            anchor = datetime.now(timezone.utc)
+        cutoff = (anchor - timedelta(days=days)).strftime("%Y-%m-%d")
+        with TRADE_HISTORY_LOCK:
+            try:
+                conn = self._connection()
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT * FROM trade_metrics_history
+                    WHERE symbol = ? AND session_date >= ?
+                    ORDER BY session_date ASC
+                    """,
+                    (symbol, cutoff),
+                ).fetchall()
+                conn.row_factory = None
+                return list(rows)
+            except Exception as exc:
+                SYS_LOG.warning("trade_history_read_failed symbol=%s detail=%s", symbol, exc)
+                return []
+
+    def recent_qualifying_streak(
+        self, symbol: str, days: int = 14, today: Optional[str] = None
+    ) -> int:
+        """Consecutive most-recent sessions (working backward) that qualified."""
+        rows = self.history(symbol, days=days, today=today)
+        streak = 0
+        for row in reversed(rows):
+            if not row["qualified"]:
+                break
+            streak += 1
+        return streak
+
+    def close(self) -> None:
+        with TRADE_HISTORY_LOCK:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+    def symbols_with_history(self) -> List[str]:
+        with TRADE_HISTORY_LOCK:
+            try:
+                conn = self._connection()
+                rows = conn.execute("SELECT DISTINCT symbol FROM trade_metrics_history").fetchall()
+                return [row[0] for row in rows]
+            except Exception as exc:
+                SYS_LOG.warning("trade_history_symbols_failed detail=%s", exc)
+                return []
+
+    def qualifying_outcomes(
+        self, lookback_days: int, today: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Pair each symbol's qualifying session from around `lookback_days`
+        ago with its most recently recorded session, and measure the price
+        move between the two.
+
+        This is deliberately a read over already-recorded history rather
+        than a fresh yfinance fetch: it answers "did the screener's own past
+        picks pay off", using only what the screener itself measured at the
+        time. It is necessarily best-effort -- a symbol only produces an
+        outcome here if it was screened both on its qualifying day and again
+        near `today`, which holds reliably for configured watchlist symbols
+        and only sometimes for ad hoc screener movers that come and go from
+        the universe day to day.
+        """
+        anchor_text = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            anchor = datetime.strptime(anchor_text, "%Y-%m-%d")
+        except ValueError:
+            anchor = datetime.now(timezone.utc)
+        target_date = (anchor - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        outcomes: List[Dict[str, Any]] = []
+        for symbol in self.symbols_with_history():
+            rows = self.history(symbol, days=max(lookback_days + 30, 30), today=anchor_text)
+            if len(rows) < 2:
+                continue
+            # Rows are ascending by session_date; the qualifying anchor is the
+            # latest qualifying row at or before the lookback target -- the
+            # closest available match to "qualified lookback_days ago" once
+            # weekends/holidays are accounted for.
+            anchor_row = None
+            for row in rows:
+                if row["session_date"] > target_date:
+                    break
+                if row["qualified"]:
+                    anchor_row = row
+            if anchor_row is None:
+                continue
+            latest_row = rows[-1]
+            if latest_row["session_date"] <= anchor_row["session_date"]:
+                continue
+            entry_close = anchor_row["last_close"]
+            if not entry_close:
+                continue
+            forward_return_pct = ((latest_row["last_close"] - entry_close) / entry_close) * 100
+            outcomes.append(
+                {
+                    "symbol": symbol,
+                    "qualified_on": anchor_row["session_date"],
+                    "evaluated_on": latest_row["session_date"],
+                    "entry_close": entry_close,
+                    "latest_close": latest_row["last_close"],
+                    "forward_return_pct": forward_return_pct,
+                }
+            )
+        return outcomes
+
+
+TRADE_HISTORY = TradeHistoryStore(SETTINGS.trade_history_db_file)
 
 
 def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d") -> Any:
@@ -2172,6 +2565,39 @@ def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d"
     with CACHE_LOCK:
         HISTORY_CACHE[cache_key] = (time.time(), history)
     return history
+
+
+def _fetch_ticker_fundamentals(symbol: str) -> Dict[str, Any]:
+    """Fetch and cache yfinance's `.info` snapshot (company profile,
+    valuation, margins, balance-sheet ratios).
+
+    Fundamentals move far slower than price, so this gets its own longer TTL
+    (`TICKER_INFO_CACHE_TTL_SECONDS`, default 6h) separate from the price
+    history cache above. A failed or partial fetch degrades to an empty
+    dict rather than raising -- `build_ticker_analysis` renders every field
+    as "not available" via `.get(...)` on a missing key either way.
+    """
+    cache_key = f"info|{symbol}"
+    now_ts = time.time()
+    ttl = max(300, SETTINGS.ticker_info_cache_ttl_seconds)
+    with CACHE_LOCK:
+        cached = TICKER_INFO_CACHE.get(cache_key)
+        if cached:
+            cached_at, info = cached
+            if now_ts - cached_at <= ttl:
+                return info
+    try:
+        info = _with_retry(
+            lambda: yf.Ticker(symbol).info, f"yf_info_{symbol}", retries=2
+        )
+        if not isinstance(info, dict):
+            info = {}
+    except Exception as exc:
+        SYS_LOG.debug("ticker_info_fetch_failed symbol=%s detail=%s", symbol, exc)
+        info = {}
+    with CACHE_LOCK:
+        TICKER_INFO_CACHE[cache_key] = (time.time(), info)
+    return info
 
 
 def _configured_watchlist() -> List[Tuple[str, str]]:
@@ -2280,6 +2706,7 @@ def _screen_universe(
                     )
                 else:
                     outcome.qualified.append(metrics)
+                TRADE_HISTORY.record(metrics, qualified=not failed, failed_gate=(failed[0] if failed else None))
 
             # Checked after the result is consumed: testing first discarded work
             # that had already finished.
@@ -2295,6 +2722,7 @@ def _screen_universe(
                 break
 
     outcome.qualified.sort(key=_rank_key)
+    TRADE_HISTORY.prune(SETTINGS.trade_history_retention_days)
     return outcome, labels
 
 
@@ -2309,6 +2737,34 @@ TRADE_GATE_LABELS: Dict[str, str] = {
 }
 
 
+def _rsi_label(rsi: Optional[float]) -> str:
+    if rsi is None:
+        return "n/a"
+    if rsi >= 70:
+        return f"{rsi:.0f} (overbought)"
+    if rsi <= 30:
+        return f"{rsi:.0f} (oversold)"
+    return f"{rsi:.0f}"
+
+
+def _entry_exit_sketch(metrics: TradeMetrics) -> str:
+    """A plain-technical entry/exit sketch from the recent 20-session range.
+
+    Not a standalone signal -- it reads alongside the rest of the block and
+    the "informational only" footer in `get_trade_candidates`. Reward/risk
+    is measured against the same 20-session support/resistance the drawdown
+    gate already uses, so it does not introduce a second notion of range.
+    """
+    reward = metrics.resistance_level - metrics.last_close
+    risk = metrics.last_close - metrics.support_level
+    reward_risk = f"{reward / risk:.1f}:1" if risk > 0 else "n/a"
+    return (
+        f"    zone {metrics.support_level:,.2f}–{metrics.ema20:,.2f}"
+        f" · invalidation below {metrics.support_level:,.2f}"
+        f" · reward:risk {reward_risk}"
+    )
+
+
 def _render_candidate(index: int, metrics: TradeMetrics, name: str) -> List[str]:
     """One candidate as a short block rather than a wide table row.
 
@@ -2317,13 +2773,20 @@ def _render_candidate(index: int, metrics: TradeMetrics, name: str) -> List[str]
     Stacking the same numbers costs vertical space, which scrolls fine.
     """
     confirmed = " ✓" if metrics.volume_ratio >= SETTINGS.trade_min_volume_ratio else ""
+    # Today's own row was already recorded by `_screen_universe` before
+    # ranking runs, so a streak of 1 just means "qualified today" -- only
+    # worth a note once it says something about the days before today too.
+    streak = TRADE_HISTORY.recent_qualifying_streak(metrics.symbol)
+    streak_note = f" · {streak}-session streak" if streak >= 2 else ""
     return [
         f"<b>{index}. {escape(name)}</b> · {escape(metrics.symbol)}",
         f"    {metrics.last_close:,.2f}   {metrics.day_change_pct:+.2f}% today"
-        f"   {metrics.week_momentum_pct:+.2f}% over 5 days",
+        f"   {metrics.week_momentum_pct:+.2f}% over 5 days{streak_note}",
         f"    volume {metrics.volume_ratio:.1f}× normal{confirmed}"
         f" · {metrics.drawdown_pct:.1f}% below 20-day high"
         f" · daily swing {metrics.atr_pct:.1f}%",
+        f"    RSI {_rsi_label(metrics.rsi_14)} · volume {metrics.volume_trend}",
+        _entry_exit_sketch(metrics),
         f"    <i>from the {escape(metrics.session)} close</i>",
         "",
     ]
@@ -2433,6 +2896,274 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
     return "\n".join(lines) + "\n\n"
 
 
+def _summarize_trade_outcomes(lookback_days: Optional[int] = None) -> Dict[str, Any]:
+    lookback_days = lookback_days if lookback_days is not None else SETTINGS.trade_outcome_lookback_days
+    outcomes = TRADE_HISTORY.qualifying_outcomes(lookback_days)
+    if not outcomes:
+        return {"lookback_days": lookback_days, "count": 0, "hit_rate_pct": None,
+                "avg_forward_return_pct": None, "outcomes": []}
+    wins = sum(1 for outcome in outcomes if outcome["forward_return_pct"] > 0)
+    avg_return = sum(outcome["forward_return_pct"] for outcome in outcomes) / len(outcomes)
+    return {
+        "lookback_days": lookback_days,
+        "count": len(outcomes),
+        "hit_rate_pct": (wins / len(outcomes)) * 100,
+        "avg_forward_return_pct": avg_return,
+        "outcomes": outcomes,
+    }
+
+
+def build_trade_performance_report(lookback_days: Optional[int] = None) -> str:
+    """Whether the screener's own past picks actually paid off.
+
+    Computed on demand from `TRADE_HISTORY` -- a local SQLite read, no
+    yfinance calls -- rather than by a separate scheduled job, since there is
+    nothing to pre-materialize: the screener already records every session's
+    outcome as it runs, so this only ever reads what is already there.
+    """
+    summary = _summarize_trade_outcomes(lookback_days)
+    lines = [
+        "<b>📊 Trade Screener Performance</b>",
+        f"<i>Qualifying picks, evaluated ~{summary['lookback_days']} sessions later</i>",
+        "",
+    ]
+    if summary["count"] == 0:
+        lines.append(
+            "No outcomes to evaluate yet. This needs a symbol that qualified at least "
+            f"{summary['lookback_days']} sessions ago and has been screened again since -- "
+            "reliable for configured watchlist symbols, sparse for ad hoc screener movers "
+            "that come and go from the universe day to day."
+        )
+        lines.append("")
+        return "\n".join(lines) + "\n\n"
+
+    lines.append(
+        f"{summary['count']} outcome(s) · hit rate {summary['hit_rate_pct']:.0f}%"
+        f" · avg forward return {summary['avg_forward_return_pct']:+.2f}%"
+    )
+    lines.append("")
+    ranked = sorted(summary["outcomes"], key=lambda outcome: -outcome["forward_return_pct"])
+    for outcome in ranked[:10]:
+        lines.append(
+            f"    {outcome['symbol']:<8} {outcome['forward_return_pct']:+.2f}%"
+            f"  ({outcome['qualified_on']} → {outcome['evaluated_on']})"
+        )
+    if len(ranked) > 10:
+        lines.append(f"    <i>{len(ranked) - 10} more not shown.</i>")
+    lines.append("")
+    lines.append(
+        "<i>Informational only. Small sample sizes are not statistically meaningful, "
+        "and this reflects the current gate thresholds, not a guarantee they will keep working.</i>"
+    )
+    return "\n".join(lines) + "\n\n"
+
+
+def _fmt_num(value: Any, digits: int = 2) -> str:
+    parsed = _as_float(value)
+    return "n/a" if parsed is None else f"{parsed:,.{digits}f}"
+
+
+def _fmt_pct(value: Any, digits: int = 1) -> str:
+    """`value` is yfinance's usual fractional form (0.23 for 23%)."""
+    parsed = _as_float(value)
+    return "n/a" if parsed is None else f"{parsed * 100:.{digits}f}%"
+
+
+def _fmt_large(value: Any) -> str:
+    """A large dollar figure with a magnitude suffix, e.g. 12.30B."""
+    parsed = _as_float(value)
+    if parsed is None:
+        return "n/a"
+    for threshold, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if abs(parsed) >= threshold:
+            return f"{parsed / threshold:,.2f}{suffix}"
+    return f"{parsed:,.0f}"
+
+
+def _beta_read(beta: Optional[float]) -> str:
+    if beta is None:
+        return ""
+    if beta > 1.2:
+        return " (more volatile than the market)"
+    if beta < 0.8:
+        return " (less volatile than the market)"
+    return " (roughly market-like volatility)"
+
+
+def build_ticker_analysis(raw_symbol: str) -> str:
+    """An on-demand, single-ticker report following as much of the
+    requester's "elite analyst" framework as this bot can honestly support
+    from data it actually has: yfinance price history (reusing the same
+    `_compute_trade_metrics`/`_entry_exit_sketch` the automated screener
+    uses) and yfinance's `.info` snapshot for fundamentals and valuation.
+
+    Sections the framework asks for that this bot has no real data source
+    for -- macro series, options positioning, institutional 13F flow,
+    insider transaction feeds -- are named as unavailable, never invented.
+    yfinance's fundamentals are frequently incomplete for smaller or
+    non-US tickers, so every field degrades to "n/a" rather than raising.
+    """
+    symbol = raw_symbol.strip().upper()
+    if not symbol:
+        return "Usage: /analyze TICKER (e.g. /analyze AAPL)\n"
+
+    metrics = _compute_trade_metrics(symbol)
+    info = _fetch_ticker_fundamentals(symbol)
+    name = info.get("longName") or info.get("shortName") or symbol
+
+    lines: List[str] = [f"<b>📊 {escape(name)} ({escape(symbol)})</b>", ""]
+
+    # 1. Company
+    lines.append("<b>Company</b>")
+    summary = info.get("longBusinessSummary")
+    lines.append(_truncate(summary, SETTINGS.ticker_analysis_summary_max_chars) if summary
+                 else "Business summary not available.")
+    profile_bits = [info.get(key) for key in ("sector", "industry", "country") if info.get(key)]
+    if profile_bits:
+        lines.append(" · ".join(profile_bits))
+    employees = _as_float(info.get("fullTimeEmployees"))
+    if employees:
+        lines.append(f"Employees: {employees:,.0f}")
+    lines.append("")
+
+    # 2. Price & technicals (reuses the automated screener's own math)
+    lines.append("<b>Price &amp; Technicals</b>")
+    if metrics:
+        trend_note = "above" if metrics.above_ema20 else "below"
+        lines.append(
+            f"Last close {metrics.last_close:,.2f} ({metrics.day_change_pct:+.2f}% today, "
+            f"{metrics.week_momentum_pct:+.2f}% over 5 days), {trend_note} its 20-day EMA "
+            f"({metrics.ema20:,.2f})."
+        )
+        lines.append(
+            f"RSI {_rsi_label(metrics.rsi_14)} · volume {metrics.volume_trend} "
+            f"({metrics.volume_ratio:.1f}× normal) · daily swing (ATR) {metrics.atr_pct:.1f}%"
+            f" · {metrics.drawdown_pct:.1f}% below its 20-day high."
+        )
+        lines.append(_entry_exit_sketch(metrics).strip())
+    else:
+        lines.append("Not enough price history available from yfinance for this symbol.")
+    lines.append("")
+
+    # 3. Valuation
+    lines.append("<b>Valuation</b>")
+    lines.append(
+        f"P/E {_fmt_num(info.get('trailingPE'))} (fwd {_fmt_num(info.get('forwardPE'))})"
+        f" · PEG {_fmt_num(info.get('pegRatio') or info.get('trailingPegRatio'))}"
+        f" · P/S {_fmt_num(info.get('priceToSalesTrailing12Months'))}"
+        f" · P/B {_fmt_num(info.get('priceToBook'))}"
+        f" · EV/EBITDA {_fmt_num(info.get('enterpriseToEbitda'))}"
+    )
+    lines.append(f"Dividend yield {_fmt_pct(info.get('dividendYield'))}")
+    low_52 = _as_float(info.get("fiftyTwoWeekLow"))
+    high_52 = _as_float(info.get("fiftyTwoWeekHigh"))
+    if metrics and low_52 is not None and high_52 is not None and high_52 > low_52:
+        position_pct = (metrics.last_close - low_52) / (high_52 - low_52) * 100
+        lines.append(
+            f"Trading at {position_pct:.0f}% of its 52-week range ({low_52:,.2f}–{high_52:,.2f})."
+        )
+    lines.append(
+        "<i>No historical multiple series or peer set is available in this bot — the "
+        "52-week range above is the only own-history comparison possible.</i>"
+    )
+    lines.append("")
+
+    # 4. Profitability
+    lines.append("<b>Profitability</b>")
+    lines.append(
+        f"Gross margin {_fmt_pct(info.get('grossMargins'))}"
+        f" · Operating margin {_fmt_pct(info.get('operatingMargins'))}"
+        f" · Net margin {_fmt_pct(info.get('profitMargins'))}"
+    )
+    lines.append(
+        f"ROE {_fmt_pct(info.get('returnOnEquity'))} · ROA {_fmt_pct(info.get('returnOnAssets'))}"
+    )
+    lines.append("")
+
+    # 5. Balance sheet
+    lines.append("<b>Balance Sheet</b>")
+    lines.append(
+        f"Cash {_fmt_large(info.get('totalCash'))} · Debt {_fmt_large(info.get('totalDebt'))}"
+        f" · Debt/Equity {_fmt_num(info.get('debtToEquity'))}"
+        " (as reported by the data provider; conventions vary by ticker)"
+    )
+    lines.append(
+        f"Current ratio {_fmt_num(info.get('currentRatio'))}"
+        f" · Quick ratio {_fmt_num(info.get('quickRatio'))}"
+    )
+    lines.append("")
+
+    # 6. Cash flow
+    lines.append("<b>Cash Flow</b>")
+    fcf = _as_float(info.get("freeCashflow"))
+    net_income = _as_float(info.get("netIncomeToCommon"))
+    lines.append(
+        f"Free cash flow {_fmt_large(fcf)} · Operating cash flow {_fmt_large(info.get('operatingCashflow'))}"
+        f" · Net income {_fmt_large(net_income)}"
+    )
+    if fcf is not None and net_income and net_income > 0 and fcf < net_income * 0.5:
+        lines.append(
+            "<i>Free cash flow is materially below reported net income — worth checking why "
+            "(working capital, capex, one-time items) before trusting earnings alone.</i>"
+        )
+    lines.append("")
+
+    # 7. Risk read (beta + what the price/fundamentals data already flags)
+    lines.append("<b>Risk</b>")
+    beta = _as_float(info.get("beta"))
+    lines.append(f"Beta {_fmt_num(beta)}{_beta_read(beta)}")
+    debt_to_equity = _as_float(info.get("debtToEquity"))
+    risk_flags = []
+    if debt_to_equity is not None and debt_to_equity > 150:
+        risk_flags.append("elevated debt/equity")
+    if metrics and metrics.rsi_14 is not None and metrics.rsi_14 >= 70:
+        risk_flags.append("RSI overbought")
+    if metrics and metrics.atr_pct > 4.0:
+        risk_flags.append("high daily volatility")
+    if fcf is not None and fcf < 0:
+        risk_flags.append("negative free cash flow")
+    lines.append("Flags: " + (", ".join(risk_flags) if risk_flags else "none from the data available"))
+    lines.append("")
+
+    # 8. Bull / base / bear -- technical read only; no fundamentals-driven
+    # scenario is attempted without a peer set or historical multiple series.
+    lines.append("<b>Bull / Base / Bear (technical read only)</b>")
+    if metrics:
+        lines.append(
+            f"<b>Bull:</b> holds above its 20-day EMA ({metrics.ema20:,.2f}) and clears "
+            f"{metrics.resistance_level:,.2f} on rising volume."
+        )
+        lines.append(
+            f"<b>Base:</b> continues to range between {metrics.support_level:,.2f} and "
+            f"{metrics.resistance_level:,.2f}."
+        )
+        lines.append(
+            f"<b>Bear:</b> a daily close below {metrics.support_level:,.2f} invalidates this "
+            "setup and opens further downside."
+        )
+    else:
+        lines.append("Not enough price history to sketch scenarios.")
+    lines.append(
+        "<i>Ranges implied by the last 20 sessions' price action, not predictions — they say "
+        "nothing about fundamentals, macro, or news risk.</i>"
+    )
+    lines.append("")
+
+    # 9. Explicit gaps, per the framework's own rule against inventing numbers.
+    lines.append("<b>Not available in this bot</b>")
+    lines.append(
+        "Macro series (rates, inflation, GDP), options positioning, institutional 13F flow, "
+        "and insider transaction feeds have no data source configured here — not fabricated, "
+        "just absent."
+    )
+    lines.append("")
+    lines.append(
+        "<i>Informational only. Not investment advice. Data via yfinance; fundamentals fields "
+        "are frequently incomplete for smaller or non-US tickers.</i>"
+    )
+    return "\n".join(lines) + "\n\n"
+
+
 def build_health_report() -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     latency = RANKER_STATUS.get("latency_ms")
@@ -2444,6 +3175,7 @@ def build_health_report() -> str:
         f"Ranker path: {RANKER_STATUS.get('path', 'unknown')}",
         f"Ranker model: {SETTINGS.news_ranker_model}",
         f"Ranker latency: {latency if latency is not None else 'n/a'} ms",
+        f"Slack mirror: {'configured' if SETTINGS.slack_webhook_url else 'not configured'}",
     ]
     if RANKER_STATUS.get("error"):
         lines.append(
@@ -2518,7 +3250,7 @@ def job_daily_briefing(force_hour: Optional[int] = None) -> bool:
         run_time = run_time.replace(hour=force_hour, minute=0, second=0, microsecond=0)
     APP_LOG.info("briefing_start at=%s", run_time.isoformat())
     briefing = compose_briefing(run_time)
-    success = send_telegram_message(briefing.message)
+    success = _broadcast_message(briefing.message)
     if success:
         _commit_briefing(briefing)
     else:
@@ -2534,7 +3266,7 @@ def job_health_ping() -> bool:
     date_key = datetime.today().strftime("%Y-%m-%d")
     if STATE.data.get("last_health_ping_date") == date_key:
         return True
-    success = send_telegram_message(build_health_report(), chat_id=SETTINGS.health_ping_chat_id or SETTINGS.telegram_chat_id)
+    success = _broadcast_message(build_health_report(), chat_id=SETTINGS.health_ping_chat_id or SETTINGS.telegram_chat_id)
     if success:
         STATE.data["last_health_ping_date"] = date_key
         STATE.save()
@@ -2547,32 +3279,53 @@ def _command_help_text() -> str:
         "/now - Send full briefing now\n"
         "/morning - Send morning-style briefing now\n"
         "/evening - Send evening-style briefing now\n"
+        "/news - Send only news headlines (no live quotes or trade candidates)\n"
+        "/recommendations - Send only the trade screener's candidate picks\n"
         "/watchlist - Send market + trade candidate sections\n"
+        "/analyze TICKER - Send a deep-dive report for one symbol (e.g. /analyze AAPL)\n"
+        "/performance - Send how the trade screener's past picks have done\n"
         "/health - Send bot health report\n"
     )
 
 
 def _send_briefing(now: datetime, chat_id: str) -> None:
     briefing = compose_briefing(now)
-    if send_telegram_message(briefing.message, chat_id=chat_id):
+    if _broadcast_message(briefing.message, chat_id=chat_id):
         _commit_briefing(briefing)
 
 
 def _handle_command(command: str, chat_id: str) -> None:
-    normalized = command.strip().split()[0].lower()
+    parts = command.strip().split(maxsplit=1)
+    normalized = parts[0].lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
     if normalized == "/now":
         _send_briefing(datetime.now(), chat_id)
     elif normalized == "/morning":
         _send_briefing(datetime.now().replace(hour=7, minute=0, second=0, microsecond=0), chat_id)
     elif normalized == "/evening":
         _send_briefing(datetime.now().replace(hour=19, minute=0, second=0, microsecond=0), chat_id)
+    elif normalized == "/news":
+        norway_text, _norway_selections = get_norwegian_morning_news()
+        global_text, _global_selections = get_global_news()
+        business_text, _business_selections = _business_news_section()
+        payload = (norway_text + global_text + business_text).strip()
+        _broadcast_message(payload, chat_id=chat_id)
+    elif normalized == "/recommendations":
+        _broadcast_message(get_trade_candidates(), chat_id=chat_id)
     elif normalized == "/watchlist":
         payload = get_business_and_stocks()[0] + "\n\n" + get_trade_candidates()
-        send_telegram_message(payload, chat_id=chat_id)
+        _broadcast_message(payload, chat_id=chat_id)
+    elif normalized == "/analyze":
+        if not argument:
+            _broadcast_message("Usage: /analyze TICKER (e.g. /analyze AAPL)", chat_id=chat_id)
+        else:
+            _broadcast_message(build_ticker_analysis(argument), chat_id=chat_id)
+    elif normalized == "/performance":
+        _broadcast_message(build_trade_performance_report(), chat_id=chat_id)
     elif normalized == "/health":
-        send_telegram_message(build_health_report(), chat_id=chat_id)
+        _broadcast_message(build_health_report(), chat_id=chat_id)
     else:
-        send_telegram_message(_command_help_text(), chat_id=chat_id)
+        _broadcast_message(_command_help_text(), chat_id=chat_id)
 
 
 def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:

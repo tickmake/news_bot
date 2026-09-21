@@ -15,6 +15,24 @@ import pandas as pd
 import news_bot
 
 
+def setUpModule():
+    # `_screen_universe` records to the module-level TRADE_HISTORY on every
+    # call, real sqlite writes included, regardless of whether an individual
+    # test mocks `_compute_trade_metrics`. Point it at a throwaway file for
+    # the whole test run so tests never touch (or depend on) a real
+    # `.news_bot_trade_history.db` in the working directory.
+    global _ORIGINAL_TRADE_HISTORY
+    _ORIGINAL_TRADE_HISTORY = news_bot.TRADE_HISTORY
+    news_bot.TRADE_HISTORY = news_bot.TradeHistoryStore(
+        os.path.join(tempfile.mkdtemp(), "test_trade_history.db")
+    )
+
+
+def tearDownModule():
+    news_bot.TRADE_HISTORY.close()
+    news_bot.TRADE_HISTORY = _ORIGINAL_TRADE_HISTORY
+
+
 class NewsBotTests(unittest.TestCase):
     def test_daily_pick_is_deterministic_for_context_and_day(self):
         picked_1 = news_bot._daily_pick(["a", "b", "c"], "ctx", "2026-06-01")
@@ -261,6 +279,79 @@ class NewsBotTests(unittest.TestCase):
         chunks = news_bot._split_message_html(text, 200)
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk) <= 200 for chunk in chunks))
+
+
+class SlackIntegrationTests(unittest.TestCase):
+    def test_html_to_slack_text_converts_known_tags(self):
+        html = (
+            '<b>Bold</b> and <i>italic</i> and <a href="https://x.example">link</a> '
+            "and &amp; entity and <pre>code block</pre>"
+        )
+        text = news_bot._html_to_slack_text(html)
+        self.assertIn("*Bold*", text)
+        self.assertIn("_italic_", text)
+        self.assertIn("<https://x.example|link>", text)
+        self.assertIn("& entity", text)
+        self.assertIn("```code block```", text)
+        self.assertNotIn("<b>", text)
+        self.assertNotIn("<i>", text)
+
+    def test_html_to_slack_text_strips_unknown_tags(self):
+        text = news_bot._html_to_slack_text("<div>hi</div>")
+        self.assertEqual(text, "hi")
+
+    @patch("news_bot.requests.post")
+    def test_send_slack_message_success(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_post.return_value = mock_response
+
+        with patch.object(news_bot.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"):
+            ok = news_bot.send_slack_message("<b>hello</b>")
+
+        self.assertTrue(ok)
+        sent_payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent_payload["text"], "*hello*")
+        self.assertEqual(mock_post.call_args[0][0], "https://hooks.slack.example/x")
+
+    def test_send_slack_message_missing_config(self):
+        with patch.object(news_bot.SETTINGS, "slack_webhook_url", ""):
+            ok = news_bot.send_slack_message("hello")
+        self.assertFalse(ok)
+
+    @patch("news_bot.time.sleep")
+    @patch("news_bot.requests.post")
+    def test_send_slack_message_failure_is_caught(self, mock_post, mock_sleep):
+        mock_post.side_effect = news_bot.requests.exceptions.ConnectionError("down")
+        with patch.object(news_bot.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"):
+            ok = news_bot.send_slack_message("hello")
+        self.assertFalse(ok)
+
+    def test_broadcast_message_skips_slack_when_not_configured(self):
+        with patch.object(news_bot.SETTINGS, "slack_webhook_url", ""), patch.object(
+            news_bot, "send_telegram_message", return_value=True
+        ) as mock_telegram, patch.object(news_bot, "send_slack_message") as mock_slack:
+            ok = news_bot._broadcast_message("hi", chat_id="123")
+        self.assertTrue(ok)
+        mock_telegram.assert_called_once_with("hi", chat_id="123")
+        mock_slack.assert_not_called()
+
+    def test_broadcast_message_mirrors_to_slack_when_configured(self):
+        with patch.object(news_bot.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"), \
+             patch.object(news_bot, "send_telegram_message", return_value=True), \
+             patch.object(news_bot, "send_slack_message") as mock_slack:
+            ok = news_bot._broadcast_message("hi", chat_id="123")
+        self.assertTrue(ok)
+        mock_slack.assert_called_once_with("hi")
+
+    def test_broadcast_message_returns_telegram_result_even_if_slack_fails(self):
+        """Slack is a best-effort mirror; its failure must not affect the
+        Telegram-derived return value that gates headline-dedup commits."""
+        with patch.object(news_bot.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"), \
+             patch.object(news_bot, "send_telegram_message", return_value=True), \
+             patch.object(news_bot, "send_slack_message", return_value=False):
+            ok = news_bot._broadcast_message("hi")
+        self.assertTrue(ok)
 
     def test_source_allowed_blocks_explicit_blocklist(self):
         with patch.object(news_bot, "BLOCKED_DOMAINS", ["bad.com"]), patch.object(
@@ -1424,6 +1515,15 @@ class TradeMetricsTests(unittest.TestCase):
         metrics = news_bot._compute_trade_metrics("SESS")
         self.assertEqual(metrics.session, last.strftime("%Y-%m-%d"))
 
+    def test_enrichment_fields_are_populated(self):
+        closes = [100.0] * 35 + [100.0, 101.0, 102.0, 103.0, 104.0]
+        self._cache("ENR", _history(closes))
+        metrics = news_bot._compute_trade_metrics("ENR")
+        self.assertGreater(metrics.ema20, 0.0)
+        self.assertIsNotNone(metrics.rsi_14)
+        self.assertGreaterEqual(metrics.resistance_level, metrics.support_level)
+        self.assertIn(metrics.volume_trend, ("rising", "falling", "flat"))
+
 
 def _metrics(**overrides):
     """A qualifying TradeMetrics, with fields overridden per test."""
@@ -1529,6 +1629,344 @@ class TradeRankingTests(unittest.TestCase):
             [m.symbol for m in sorted([b, a], key=news_bot._rank_key)],
             ["AAA", "BBB"],
         )
+
+    def test_qualifying_streak_breaks_ties_before_atr(self):
+        """A symbol with a running qualifying streak should outrank a calmer
+        one on an otherwise-tied momentum/volume read -- streak sits ahead of
+        ATR in `_rank_key`, so this only holds if streak beats a *lower* ATR
+        on the other side."""
+        today = datetime.now(timezone.utc)
+        yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        news_bot.TRADE_HISTORY.record(
+            _metrics(symbol="STREAKY", session=yesterday, week_momentum_pct=3.0,
+                     volume_ratio=1.5, atr_pct=4.0),
+            qualified=True, failed_gate=None,
+        )
+        news_bot.TRADE_HISTORY.record(
+            _metrics(symbol="STREAKY", session=today.strftime("%Y-%m-%d"),
+                     week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=4.0),
+            qualified=True, failed_gate=None,
+        )
+        calm_no_streak = _metrics(symbol="CALMNOSTREAK", week_momentum_pct=3.0,
+                                   volume_ratio=1.5, atr_pct=1.0)
+        streaky_but_wilder = _metrics(symbol="STREAKY", week_momentum_pct=3.0,
+                                       volume_ratio=1.5, atr_pct=4.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([calm_no_streak, streaky_but_wilder], key=news_bot._rank_key)],
+            ["STREAKY", "CALMNOSTREAK"],
+        )
+
+    def test_no_streak_falls_back_to_atr(self):
+        calm = _metrics(symbol="CALM2", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=1.0)
+        wild = _metrics(symbol="WILD2", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=4.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([calm, wild], key=news_bot._rank_key)],
+            ["CALM2", "WILD2"],
+        )
+
+
+class SignalEnrichmentTests(unittest.TestCase):
+    def test_rsi_is_100_when_no_losses(self):
+        closes = pd.Series([100.0 + i for i in range(20)])
+        self.assertEqual(news_bot._compute_rsi_14(closes), 100.0)
+
+    def test_rsi_is_0_when_no_gains(self):
+        closes = pd.Series([120.0 - i for i in range(20)])
+        self.assertEqual(news_bot._compute_rsi_14(closes), 0.0)
+
+    def test_rsi_none_below_minimum_bars(self):
+        self.assertIsNone(news_bot._compute_rsi_14(pd.Series([100.0] * 14)))
+
+    def test_volume_trend_rising(self):
+        volumes = pd.Series([1_000_000.0] * 15 + [2_000_000.0] * 5)
+        self.assertEqual(news_bot._compute_volume_trend(volumes), "rising")
+
+    def test_volume_trend_falling(self):
+        volumes = pd.Series([2_000_000.0] * 15 + [1_000_000.0] * 5)
+        self.assertEqual(news_bot._compute_volume_trend(volumes), "falling")
+
+    def test_volume_trend_flat_when_unchanged(self):
+        volumes = pd.Series([1_000_000.0] * 20)
+        self.assertEqual(news_bot._compute_volume_trend(volumes), "flat")
+
+    def test_volume_trend_flat_below_minimum_bars(self):
+        self.assertEqual(news_bot._compute_volume_trend(pd.Series([1_000_000.0] * 10)), "flat")
+
+    def test_rsi_label_flags_overbought_and_oversold(self):
+        self.assertIn("overbought", news_bot._rsi_label(75.0))
+        self.assertIn("oversold", news_bot._rsi_label(20.0))
+        self.assertNotIn("bought", news_bot._rsi_label(50.0))
+        self.assertEqual(news_bot._rsi_label(None), "n/a")
+
+    def test_entry_exit_sketch_computes_reward_risk(self):
+        metrics = _metrics(last_close=100.0, support_level=90.0, resistance_level=120.0, ema20=95.0)
+        sketch = news_bot._entry_exit_sketch(metrics)
+        self.assertIn("90.00", sketch)
+        self.assertIn("95.00", sketch)
+        # reward 20 (120-100), risk 10 (100-90) -> 2.0:1
+        self.assertIn("2.0:1", sketch)
+
+    def test_entry_exit_sketch_handles_zero_risk(self):
+        metrics = _metrics(last_close=90.0, support_level=90.0, resistance_level=120.0, ema20=95.0)
+        sketch = news_bot._entry_exit_sketch(metrics)
+        self.assertIn("n/a", sketch)
+
+
+class TradeHistoryStoreTests(unittest.TestCase):
+    def _store(self):
+        store = news_bot.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "history.db"))
+        self.addCleanup(store.close)
+        return store
+
+    def test_records_and_reads_back_a_row(self):
+        store = self._store()
+        store.record(_metrics(symbol="AAA", session="2026-08-10"), qualified=True, failed_gate=None)
+        rows = store.history("AAA", days=30, today="2026-08-13")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_date"], "2026-08-10")
+        self.assertEqual(rows[0]["qualified"], 1)
+        self.assertIsNone(rows[0]["failed_gate"])
+
+    def test_rerun_on_same_session_overwrites_not_duplicates(self):
+        store = self._store()
+        store.record(_metrics(symbol="AAA", session="2026-08-10", day_change_pct=1.0), qualified=True, failed_gate=None)
+        store.record(_metrics(symbol="AAA", session="2026-08-10", day_change_pct=2.0), qualified=False, failed_gate="momentum_1d")
+        rows = store.history("AAA", days=30, today="2026-08-13")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["day_change_pct"], 2.0)
+        self.assertEqual(rows[0]["qualified"], 0)
+        self.assertEqual(rows[0]["failed_gate"], "momentum_1d")
+
+    def test_prune_drops_rows_older_than_retention(self):
+        store = self._store()
+        store.record(_metrics(symbol="AAA", session="2026-08-01"), qualified=True, failed_gate=None)
+        store.record(_metrics(symbol="AAA", session="2026-08-13"), qualified=True, failed_gate=None)
+        store.prune(retention_days=7, today="2026-08-13")
+        rows = store.history("AAA", days=30, today="2026-08-13")
+        self.assertEqual([row["session_date"] for row in rows], ["2026-08-13"])
+
+    def test_recent_qualifying_streak_counts_back_from_latest(self):
+        store = self._store()
+        store.record(_metrics(symbol="AAA", session="2026-08-08"), qualified=False, failed_gate="trend")
+        store.record(_metrics(symbol="AAA", session="2026-08-09"), qualified=True, failed_gate=None)
+        store.record(_metrics(symbol="AAA", session="2026-08-10"), qualified=True, failed_gate=None)
+        store.record(_metrics(symbol="AAA", session="2026-08-11"), qualified=True, failed_gate=None)
+        self.assertEqual(
+            store.recent_qualifying_streak("AAA", days=30, today="2026-08-13"), 3
+        )
+
+    def test_streak_is_zero_when_latest_session_failed(self):
+        store = self._store()
+        store.record(_metrics(symbol="AAA", session="2026-08-10"), qualified=True, failed_gate=None)
+        store.record(_metrics(symbol="AAA", session="2026-08-11"), qualified=False, failed_gate="drawdown")
+        self.assertEqual(
+            store.recent_qualifying_streak("AAA", days=30, today="2026-08-13"), 0
+        )
+
+    def test_history_is_scoped_per_symbol(self):
+        store = self._store()
+        store.record(_metrics(symbol="AAA", session="2026-08-10"), qualified=True, failed_gate=None)
+        store.record(_metrics(symbol="BBB", session="2026-08-10"), qualified=True, failed_gate=None)
+        self.assertEqual(len(store.history("AAA", days=30, today="2026-08-13")), 1)
+        self.assertEqual(len(store.history("BBB", days=30, today="2026-08-13")), 1)
+        self.assertEqual(len(store.history("CCC", days=30, today="2026-08-13")), 0)
+
+    def test_qualifying_outcomes_computes_forward_return(self):
+        store = self._store()
+        store.record(
+            _metrics(symbol="OUT1", session="2026-01-01", last_close=100.0),
+            qualified=True, failed_gate=None,
+        )
+        store.record(
+            _metrics(symbol="OUT1", session="2026-01-10", last_close=110.0),
+            qualified=False, failed_gate="drawdown",
+        )
+        outcomes = store.qualifying_outcomes(lookback_days=5, today="2026-01-10")
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["symbol"], "OUT1")
+        self.assertEqual(outcomes[0]["qualified_on"], "2026-01-01")
+        self.assertEqual(outcomes[0]["evaluated_on"], "2026-01-10")
+        self.assertAlmostEqual(outcomes[0]["forward_return_pct"], 10.0)
+
+    def test_qualifying_outcomes_skips_symbol_with_no_prior_qualifying_row(self):
+        store = self._store()
+        store.record(
+            _metrics(symbol="OUT2", session="2026-01-01", last_close=100.0),
+            qualified=False, failed_gate="trend",
+        )
+        store.record(
+            _metrics(symbol="OUT2", session="2026-01-10", last_close=110.0),
+            qualified=False, failed_gate="drawdown",
+        )
+        self.assertEqual(store.qualifying_outcomes(lookback_days=5, today="2026-01-10"), [])
+
+    def test_qualifying_outcomes_skips_symbol_with_no_later_session(self):
+        store = self._store()
+        store.record(
+            _metrics(symbol="OUT3", session="2026-01-01", last_close=100.0),
+            qualified=True, failed_gate=None,
+        )
+        self.assertEqual(store.qualifying_outcomes(lookback_days=5, today="2026-01-10"), [])
+
+
+class TradeOutcomeSummaryTests(unittest.TestCase):
+    def test_summarize_aggregates_hit_rate_and_average(self):
+        fake_outcomes = [
+            {"symbol": "A", "forward_return_pct": 10.0, "qualified_on": "x", "evaluated_on": "y"},
+            {"symbol": "B", "forward_return_pct": -2.0, "qualified_on": "x", "evaluated_on": "y"},
+        ]
+        with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=fake_outcomes):
+            summary = news_bot._summarize_trade_outcomes(lookback_days=5)
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["hit_rate_pct"], 50.0)
+        self.assertAlmostEqual(summary["avg_forward_return_pct"], 4.0)
+
+    def test_summarize_handles_no_outcomes(self):
+        with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=[]):
+            summary = news_bot._summarize_trade_outcomes(lookback_days=5)
+        self.assertEqual(summary["count"], 0)
+        self.assertIsNone(summary["hit_rate_pct"])
+        self.assertIsNone(summary["avg_forward_return_pct"])
+
+    def test_report_renders_outcomes_and_footer(self):
+        fake_outcomes = [
+            {"symbol": "A", "forward_return_pct": 10.0, "qualified_on": "2026-01-01", "evaluated_on": "2026-01-10"},
+        ]
+        with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=fake_outcomes):
+            report = news_bot.build_trade_performance_report(lookback_days=5)
+        self.assertIn("1 outcome(s)", report)
+        self.assertIn("hit rate 100%", report)
+        self.assertIn("A", report)
+        self.assertIn("Informational only", report)
+
+    def test_report_handles_empty_history_gracefully(self):
+        with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=[]):
+            report = news_bot.build_trade_performance_report(lookback_days=5)
+        self.assertIn("No outcomes to evaluate yet", report)
+
+
+class TickerAnalysisTests(unittest.TestCase):
+    def _metrics(self, **overrides):
+        return _metrics(
+            symbol="AAPL", last_close=150.0, ema20=145.0, rsi_14=65.0,
+            support_level=140.0, resistance_level=160.0, volume_trend="rising",
+            **overrides,
+        )
+
+    def test_empty_symbol_returns_usage(self):
+        self.assertIn("Usage", news_bot.build_ticker_analysis("   "))
+
+    def test_report_includes_expected_sections(self):
+        info = {
+            "longName": "Apple Inc.", "sector": "Technology", "industry": "Consumer Electronics",
+            "country": "United States", "longBusinessSummary": "Makes phones and computers.",
+            "trailingPE": 30.0, "forwardPE": 28.0, "priceToSalesTrailing12Months": 8.0,
+            "dividendYield": 0.005, "fiftyTwoWeekLow": 120.0, "fiftyTwoWeekHigh": 180.0,
+            "grossMargins": 0.45, "operatingMargins": 0.3, "profitMargins": 0.25,
+            "returnOnEquity": 1.5, "totalCash": 60_000_000_000, "totalDebt": 100_000_000_000,
+            "debtToEquity": 180.0, "currentRatio": 1.0, "freeCashflow": 90_000_000_000,
+            "operatingCashflow": 110_000_000_000, "netIncomeToCommon": 95_000_000_000,
+            "beta": 1.3,
+        }
+        with patch("news_bot._compute_trade_metrics", return_value=self._metrics()), \
+             patch("news_bot._fetch_ticker_fundamentals", return_value=info):
+            report = news_bot.build_ticker_analysis("aapl")
+        self.assertIn("Apple Inc.", report)
+        self.assertIn("Company", report)
+        self.assertIn("Price &amp; Technicals", report)
+        self.assertIn("Valuation", report)
+        self.assertIn("Profitability", report)
+        self.assertIn("Balance Sheet", report)
+        self.assertIn("Cash Flow", report)
+        self.assertIn("Risk", report)
+        self.assertIn("Bull / Base / Bear", report)
+        self.assertIn("Not available in this bot", report)
+        self.assertIn("elevated debt/equity", report)
+        self.assertIn("more volatile than the market", report)
+
+    def test_report_degrades_gracefully_with_no_data(self):
+        with patch("news_bot._compute_trade_metrics", return_value=None), \
+             patch("news_bot._fetch_ticker_fundamentals", return_value={}):
+            report = news_bot.build_ticker_analysis("ZZZZ")
+        self.assertIn("ZZZZ", report)
+        self.assertIn("Not enough price history", report)
+        self.assertIn("n/a", report)
+        self.assertIn("none from the data available", report)
+
+
+class CommandDispatchTests(unittest.TestCase):
+    def test_analyze_without_argument_sends_usage(self):
+        with patch("news_bot.send_telegram_message") as mock_send:
+            news_bot._handle_command("/analyze", "123")
+        mock_send.assert_called_once()
+        self.assertIn("Usage", mock_send.call_args[0][0])
+
+    def test_analyze_with_argument_dispatches_to_ticker_analysis(self):
+        with patch("news_bot.build_ticker_analysis", return_value="report") as mock_build, \
+             patch("news_bot.send_telegram_message") as mock_send:
+            news_bot._handle_command("/analyze aapl", "123")
+        mock_build.assert_called_once_with("aapl")
+        mock_send.assert_called_once_with("report", chat_id="123")
+
+    def test_performance_command_dispatches(self):
+        with patch("news_bot.build_trade_performance_report", return_value="perf") as mock_build, \
+             patch("news_bot.send_telegram_message") as mock_send:
+            news_bot._handle_command("/performance", "123")
+        mock_build.assert_called_once()
+        mock_send.assert_called_once_with("perf", chat_id="123")
+
+    def test_unknown_command_help_text_mentions_new_commands(self):
+        with patch("news_bot.send_telegram_message") as mock_send:
+            news_bot._handle_command("/bogus", "123")
+        help_text = mock_send.call_args[0][0]
+        self.assertIn("/analyze", help_text)
+        self.assertIn("/performance", help_text)
+        self.assertIn("/news", help_text)
+        self.assertIn("/recommendations", help_text)
+
+    def test_news_command_sends_only_news_no_quotes_or_candidates(self):
+        with patch(
+            "news_bot.get_norwegian_morning_news", return_value=("norway\n\n", [])
+        ) as mock_norway, patch(
+            "news_bot.get_global_news", return_value=("global\n\n", [])
+        ) as mock_global, patch(
+            "news_bot._business_news_section", return_value=("business", [])
+        ) as mock_business, patch(
+            "news_bot.get_trade_candidates"
+        ) as mock_candidates, patch(
+            "news_bot._collect_live_quotes"
+        ) as mock_quotes, patch(
+            "news_bot.send_telegram_message"
+        ) as mock_send:
+            news_bot._handle_command("/news", "123")
+        mock_norway.assert_called_once()
+        mock_global.assert_called_once()
+        mock_business.assert_called_once()
+        mock_candidates.assert_not_called()
+        mock_quotes.assert_not_called()
+        payload = mock_send.call_args[0][0]
+        self.assertIn("norway", payload)
+        self.assertIn("global", payload)
+        self.assertIn("business", payload)
+
+    def test_recommendations_command_sends_only_trade_candidates(self):
+        with patch(
+            "news_bot.get_trade_candidates", return_value="candidates only"
+        ) as mock_candidates, patch(
+            "news_bot.get_norwegian_morning_news"
+        ) as mock_norway, patch(
+            "news_bot.get_global_news"
+        ) as mock_global, patch(
+            "news_bot._business_news_section"
+        ) as mock_business, patch(
+            "news_bot.send_telegram_message"
+        ) as mock_send:
+            news_bot._handle_command("/recommendations", "123")
+        mock_candidates.assert_called_once()
+        mock_norway.assert_not_called()
+        mock_global.assert_not_called()
+        mock_business.assert_not_called()
+        mock_send.assert_called_once_with("candidates only", chat_id="123")
 
 
 class ScreenUniverseDeadlineTests(unittest.TestCase):
@@ -1743,6 +2181,22 @@ class TradeRenderingTests(unittest.TestCase):
         with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
             result = news_bot.get_trade_candidates(universe={"A": "AAA", "B": "BBB"}, top_n=2)
         self.assertLess(result.index("BBB"), result.index("AAA"))
+
+    def test_signal_enrichment_lines_appear_for_a_qualifying_candidate(self):
+        metrics = news_bot.TradeMetrics(
+            symbol="ENR", session="2026-08-13", last_close=100.0,
+            day_change_pct=1.0, week_momentum_pct=5.0, volume_ratio=1.6,
+            drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
+            ema20=95.0, rsi_14=72.0, support_level=90.0, resistance_level=110.0,
+            volume_trend="rising",
+        )
+        with patch("news_bot._compute_trade_metrics", return_value=metrics):
+            result = news_bot.get_trade_candidates(universe={"Enrich": "ENR"}, top_n=1)
+        self.assertIn("RSI 72 (overbought)", result)
+        self.assertIn("volume rising", result)
+        self.assertIn("zone 90.00–95.00", result)
+        # reward 10 (110-100), risk 10 (100-90) -> 1.0:1
+        self.assertIn("reward:risk 1.0:1", result)
 
 
 class DeprecatedSettingTests(unittest.TestCase):

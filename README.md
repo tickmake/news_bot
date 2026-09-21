@@ -26,7 +26,8 @@ The bot is built in Python and scheduled with APScheduler.
 - **Relevance-ranked headlines** by importance, topic weight, and recency — not raw feed order.
 - **Cross-outlet and cross-day deduplication**, so one story appears once.
 - **Local LLM ranking** via Ollama — no API key, no data leaves your network — with a deterministic heuristic fallback.
-- **Telegram command support** (`/now`, `/morning`, `/evening`, `/watchlist`, `/health`).
+- **Telegram command support** (`/now`, `/morning`, `/evening`, `/news`, `/recommendations`, `/watchlist`, `/analyze`, `/performance`, `/health`).
+- **Optional Slack mirror** of every outbound message via an incoming webhook, alongside Telegram.
 - **Health ping** support for runtime monitoring.
 - **CI test workflow** via GitHub Actions.
 
@@ -122,6 +123,8 @@ python news_bot.py
 - `FINNHUB_CACHE_TTL_SECONDS` - Finnhub quote cache duration (default `120`)
 - `FINNHUB_FAILURE_COOLDOWN_SECONDS` - cooldown on Finnhub failures/rate limits (default `180`)
 - `FINNHUB_MAX_SYMBOLS_PER_REFRESH` - max symbols per section refreshed via Finnhub (default `16`)
+- `SLACK_WEBHOOK_URL` - optional Slack incoming webhook URL; mirrors every outbound message to Slack alongside Telegram (see [Slack Integration](#slack-integration))
+- `SLACK_MESSAGE_MAX_CHARS` - chunk size per Slack message (default `3900`)
 
 ### Logging
 
@@ -334,12 +337,38 @@ Candidate analysis fetches per-symbol history from yfinance. These controls keep
 - `TRADE_HISTORY_CACHE_TTL_SECONDS` - per-symbol history cache duration (default `600`)
 - `TRADE_TOTAL_DEADLINE_SECONDS` - overall deadline for candidate analysis; partial results returned if exceeded (default `45`)
 
+### Trade Signal History
+
+Every screening run records what it measured for every symbol it looked at —
+qualified or not — in a local SQLite file (stdlib `sqlite3`, no extra
+dependency). This is separate from the yfinance history cache above: it's a
+rolling memory of the screener's own daily output, used to see streaks (e.g.
+a symbol qualifying several sessions running) and, later, whether qualifying
+days actually paid off.
+
+- `TRADE_HISTORY_DB_FILE` - SQLite file path (default `.news_bot_trade_history.db`)
+- `TRADE_HISTORY_RETENTION_DAYS` - rolling window kept before older rows are pruned (default `14`)
+
 Candidates must pass every gate: price above its 20-day EMA, 5-day and 1-day
 returns above their thresholds, and ATR and drawdown below their ceilings.
 Metrics are computed on each symbol's last completed session — an in-progress
 bar is never used, so at the 19:00 run markets that closed earlier that day
 still report their previous session. Configured watchlist symbols are analysed
 before screener movers.
+
+Each qualifying candidate's block also shows:
+
+- **RSI(14)**, flagged `(overbought)` at 70+ or `(oversold)` at 30 or below.
+- **Volume trend** — the last 5 sessions' average volume vs. the 15 before
+  that, as `rising`, `falling`, or `flat`.
+- **Session streak** — how many recent sessions running (today included)
+  the symbol has qualified, once that's 2 or more; backed by the trade
+  signal history above.
+- A **zone / invalidation / reward:risk** line derived from the same
+  20-session support/resistance range the drawdown gate uses: the
+  pullback zone between the recent low and the 20-day EMA, the level a
+  close below which invalidates the setup, and the resulting reward-to-risk
+  ratio. Technical-only, not a recommendation — see the disclaimer below.
 
 ## Scheduling
 
@@ -366,8 +395,87 @@ After sending `/start` to the bot, you can use:
 - `/now` - send full briefing immediately
 - `/morning` - send morning-style briefing
 - `/evening` - send evening-style briefing
-- `/watchlist` - send market + screener sections only
+- `/news` - send only news headlines (Norway + global + business stories) — no live quotes, no trade candidates
+- `/recommendations` - send only the trade screener's candidate picks — no news, no live quote tables
+- `/watchlist` - send market + screener sections (business news + live stock/fund quotes + trade candidates)
+- `/analyze TICKER` - send a deep-dive report for one symbol, e.g. `/analyze AAPL`
+- `/performance` - send how the trade screener's past qualifying picks have done
 - `/health` - send runtime health report
+
+### `/news` and `/recommendations`
+
+Two focused alternatives to the full twice-daily briefing, for when you only
+want one half of it:
+
+- **`/news`** sends just the headline sections — Norway, global, and business
+  news — with no live stock/fund quote tables and no trade candidates mixed
+  in.
+- **`/recommendations`** sends just the trade screener's current candidate
+  picks (identical output to the trade-candidates section of the full
+  briefing) — no headlines, no live quote tables.
+
+Both are pure on-demand reads, same as `/watchlist`: they don't mark
+headlines as seen, so triggering `/news` manually never suppresses a
+headline from the next scheduled `/morning` or `/evening` briefing.
+
+### `/analyze TICKER`
+
+An on-demand, single-ticker report. It reuses the same price-history math as
+the automated trade screener (EMA20, RSI, ATR, support/resistance, the
+entry/exit sketch) and adds yfinance's `.info` snapshot for company profile,
+valuation multiples, margins, balance-sheet ratios, cash flow, and beta.
+
+This does **not** attempt every section of a full equity-research writeup.
+Sections with no real data source available to this bot — macro series
+(rates, inflation, GDP), options positioning, institutional 13F flow, insider
+transaction feeds — are explicitly labelled "not available," never
+fabricated. yfinance's fundamentals are also frequently incomplete for
+smaller or non-US tickers; missing fields render as `n/a` rather than
+breaking the report. Requested on demand only — it is not part of the
+scheduled 07:00/19:00 briefing, so it adds no load there.
+
+- `TICKER_INFO_CACHE_TTL_SECONDS` - cache duration for yfinance `.info` (default `21600`, 6h — fundamentals move far slower than price)
+- `TICKER_ANALYSIS_SUMMARY_MAX_CHARS` - business-summary truncation length (default `500`)
+
+### `/performance`
+
+Whether the trade screener's own past qualifying picks actually paid off:
+for each symbol with a qualifying session roughly `TRADE_OUTCOME_LOOKBACK_DAYS`
+sessions ago (default `5`) that has been screened again since, it reports the
+forward price move, plus an aggregate hit rate and average return. Computed
+on demand from the trade signal history (SQLite) above — no yfinance calls
+— since the screener already records every session's outcome as it runs;
+there is nothing to pre-materialize with a separate scheduled job.
+
+This is necessarily best-effort: it only sees a symbol's outcome if that
+symbol was screened both on its qualifying day and again near today, which
+holds reliably for configured watchlist symbols and only sometimes for ad
+hoc screener movers that come and go from the universe day to day.
+
+- `TRADE_OUTCOME_LOOKBACK_DAYS` - sessions after qualifying to evaluate the outcome (default `5`)
+
+## Slack Integration
+
+Set `SLACK_WEBHOOK_URL` to a Slack [incoming webhook](https://api.slack.com/messaging/webhooks)
+URL to mirror every outbound message — scheduled briefings, the health ping,
+and every `/command` reply above — to a Slack channel alongside Telegram.
+Leave it blank (the default) to disable Slack entirely; nothing changes for
+Telegram-only setups.
+
+This is a one-way broadcast, not a second control surface: an incoming
+webhook can only *post* to Slack, so `/commands` still have to be sent from
+Telegram — there is no Slack-side equivalent of `/now`, `/analyze`, etc.
+
+Telegram's HTML formatting (`<b>`, `<i>`, `<pre>`, links) is converted to
+Slack's own `mrkdwn` syntax (`*bold*`, `_italic_`, `` ```code``` ``,
+`<url|text>`) before sending, and long messages are chunked the same way
+Telegram messages are, using `SLACK_MESSAGE_MAX_CHARS`. A Slack send failure
+is logged and does not affect Telegram delivery, headline dedup, or the
+scheduled jobs' success/failure status — Telegram remains the source of
+truth for all of that; Slack is best-effort.
+
+- `SLACK_WEBHOOK_URL` - Slack incoming webhook URL (default empty — disabled)
+- `SLACK_MESSAGE_MAX_CHARS` - chunk size per Slack message (default `3900`)
 
 ## Testing
 

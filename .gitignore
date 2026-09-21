@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 *.pyc
 .news_bot_state.json
+.news_bot_trade_history.db
