@@ -319,6 +319,9 @@ class AppSettings(BaseSettings):
     trade_history_db_file: str = ".news_bot_trade_history.db"
     trade_history_retention_days: int = 14
     trade_outcome_lookback_days: int = 5
+    trade_weekly_top_picks_lookback_days: int = 7
+    trade_weekly_top_picks_min_qualifying_days: int = 2
+    trade_weekly_top_picks_count: int = 5
     ticker_info_cache_ttl_seconds: int = 21600
     ticker_analysis_summary_max_chars: int = 500
     command_long_poll_timeout_seconds: int = 25
@@ -2542,6 +2545,49 @@ class TradeHistoryStore:
             )
         return outcomes
 
+    def weekly_top_picks(
+        self,
+        lookback_days: int = 7,
+        top_n: int = 5,
+        min_qualifying_days: int = 2,
+        today: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Rank symbols by how consistently they qualified over the last
+        `lookback_days` sessions, not just today's single screener pass --
+        the "held up over the week" read `/stocks` needs for swing trading,
+        as distinct from `/recommendations`'s live single-day re-screen.
+
+        Pure read over already-recorded history (no fresh yfinance calls),
+        the same best-effort characteristics as `qualifying_outcomes`: a
+        symbol only shows up here if it was actually screened on the days
+        being counted.
+        """
+        picks: List[Dict[str, Any]] = []
+        for symbol in self.symbols_with_history():
+            rows = self.history(symbol, days=lookback_days, today=today)
+            if not rows:
+                continue
+            qualifying_days = sum(1 for row in rows if row["qualified"])
+            if qualifying_days < min_qualifying_days:
+                continue
+            avg_week_momentum = sum(row["week_momentum_pct"] for row in rows) / len(rows)
+            latest = rows[-1]
+            picks.append(
+                {
+                    "symbol": symbol,
+                    "qualifying_days": qualifying_days,
+                    "sessions_tracked": len(rows),
+                    "avg_week_momentum_pct": avg_week_momentum,
+                    "latest_session": latest["session_date"],
+                    "latest_close": latest["last_close"],
+                    "latest_day_change_pct": latest["day_change_pct"],
+                    "latest_atr_pct": latest["atr_pct"],
+                    "latest_drawdown_pct": latest["drawdown_pct"],
+                }
+            )
+        picks.sort(key=lambda p: (-p["qualifying_days"], -p["avg_week_momentum_pct"], p["symbol"]))
+        return picks[:top_n]
+
 
 TRADE_HISTORY = TradeHistoryStore(SETTINGS.trade_history_db_file)
 
@@ -2958,6 +3004,57 @@ def build_trade_performance_report(lookback_days: Optional[int] = None) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def build_weekly_top_picks(lookback_days: Optional[int] = None, top_n: Optional[int] = None) -> str:
+    """This week's most consistent qualifiers, for swing trading over the
+    next several sessions -- distinct from `/recommendations`, which is a
+    live single-day re-screen.
+
+    Computed on demand from `TRADE_HISTORY` -- a local SQLite read, no
+    fresh yfinance calls -- ranking by how many sessions in the window a
+    symbol qualified, then by average weekly momentum across the window.
+    """
+    lookback = lookback_days if lookback_days is not None else SETTINGS.trade_weekly_top_picks_lookback_days
+    limit = top_n if top_n is not None else SETTINGS.trade_weekly_top_picks_count
+    picks = TRADE_HISTORY.weekly_top_picks(
+        lookback_days=lookback,
+        top_n=limit,
+        min_qualifying_days=SETTINGS.trade_weekly_top_picks_min_qualifying_days,
+    )
+    lines = [
+        "<b>📆 Weekly Top Picks</b>",
+        f"<i>Last {lookback} sessions, ranked by qualifying-day consistency</i>",
+        "",
+    ]
+    if not picks:
+        lines.append(
+            "No symbol has qualified enough sessions yet in this window "
+            f"(needs at least {SETTINGS.trade_weekly_top_picks_min_qualifying_days}). "
+            "Keep the screener running daily and check back once history builds up, "
+            "or try /recommendations for today's live picks instead."
+        )
+        lines.append("")
+        return "\n".join(lines) + "\n\n"
+
+    for index, pick in enumerate(picks, start=1):
+        lines.append(
+            f"<b>{index}. {escape(pick['symbol'])}</b> - qualified {pick['qualifying_days']}/"
+            f"{pick['sessions_tracked']} tracked sessions"
+        )
+        lines.append(
+            f"    Avg weekly momentum: {pick['avg_week_momentum_pct']:+.1f}%"
+            f" · Last close: {pick['latest_close']:.2f} ({pick['latest_day_change_pct']:+.1f}% that day)"
+            f" · ATR: {pick['latest_atr_pct']:.1f}% · Drawdown: {pick['latest_drawdown_pct']:.1f}%"
+        )
+        lines.append(f"    Last tracked session: {pick['latest_session']}")
+        lines.append("")
+    lines.append(
+        "<i>Informational only. Not investment advice. Ranked from this bot's own stored "
+        "screening history, not a fresh live re-scan -- use /analyze TICKER for a deeper "
+        "read on any name before acting.</i>"
+    )
+    return "\n".join(lines) + "\n\n"
+
+
 def _fmt_num(value: Any, digits: int = 2) -> str:
     parsed = _as_float(value)
     return "n/a" if parsed is None else f"{parsed:,.{digits}f}"
@@ -3277,10 +3374,9 @@ def _command_help_text() -> str:
     return (
         "Supported commands:\n"
         "/now - Send full briefing now\n"
-        "/morning - Send morning-style briefing now\n"
-        "/evening - Send evening-style briefing now\n"
         "/news - Send only news headlines (no live quotes or trade candidates)\n"
-        "/recommendations - Send only the trade screener's candidate picks\n"
+        "/recommendations - Send only the trade screener's current candidate picks\n"
+        "/stocks - Send this week's top picks, ranked by qualifying consistency\n"
         "/watchlist - Send market + trade candidate sections\n"
         "/analyze TICKER - Send a deep-dive report for one symbol (e.g. /analyze AAPL)\n"
         "/performance - Send how the trade screener's past picks have done\n"
@@ -3300,10 +3396,6 @@ def _handle_command(command: str, chat_id: str) -> None:
     argument = parts[1].strip() if len(parts) > 1 else ""
     if normalized == "/now":
         _send_briefing(datetime.now(), chat_id)
-    elif normalized == "/morning":
-        _send_briefing(datetime.now().replace(hour=7, minute=0, second=0, microsecond=0), chat_id)
-    elif normalized == "/evening":
-        _send_briefing(datetime.now().replace(hour=19, minute=0, second=0, microsecond=0), chat_id)
     elif normalized == "/news":
         norway_text, _norway_selections = get_norwegian_morning_news()
         global_text, _global_selections = get_global_news()
@@ -3312,6 +3404,8 @@ def _handle_command(command: str, chat_id: str) -> None:
         _broadcast_message(payload, chat_id=chat_id)
     elif normalized == "/recommendations":
         _broadcast_message(get_trade_candidates(), chat_id=chat_id)
+    elif normalized == "/stocks":
+        _broadcast_message(build_weekly_top_picks(), chat_id=chat_id)
     elif normalized == "/watchlist":
         payload = get_business_and_stocks()[0] + "\n\n" + get_trade_candidates()
         _broadcast_message(payload, chat_id=chat_id)

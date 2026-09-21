@@ -1808,6 +1808,48 @@ class TradeHistoryStoreTests(unittest.TestCase):
         )
         self.assertEqual(store.qualifying_outcomes(lookback_days=5, today="2026-01-10"), [])
 
+    def test_weekly_top_picks_ranks_by_qualifying_days_then_momentum(self):
+        store = self._store()
+        # STRONG: qualifies every session, highest momentum.
+        for day, momentum in [("2026-01-05", 4.0), ("2026-01-06", 5.0), ("2026-01-07", 6.0)]:
+            store.record(
+                _metrics(symbol="STRONG", session=day, week_momentum_pct=momentum),
+                qualified=True, failed_gate=None,
+            )
+        # WEAK: qualifies fewer sessions than the minimum, must be excluded.
+        store.record(
+            _metrics(symbol="WEAK", session="2026-01-07", week_momentum_pct=9.0),
+            qualified=True, failed_gate=None,
+        )
+        # MODERATE: qualifies exactly at the threshold, lower momentum than STRONG.
+        for day, qualified in [("2026-01-06", True), ("2026-01-07", True)]:
+            store.record(
+                _metrics(symbol="MODERATE", session=day, week_momentum_pct=1.0),
+                qualified=qualified, failed_gate=None,
+            )
+        picks = store.weekly_top_picks(lookback_days=7, top_n=5, min_qualifying_days=2, today="2026-01-07")
+        symbols = [pick["symbol"] for pick in picks]
+        self.assertEqual(symbols, ["STRONG", "MODERATE"])
+        self.assertEqual(picks[0]["qualifying_days"], 3)
+        self.assertAlmostEqual(picks[0]["avg_week_momentum_pct"], 5.0)
+        self.assertEqual(picks[0]["latest_session"], "2026-01-07")
+
+    def test_weekly_top_picks_respects_top_n(self):
+        store = self._store()
+        for symbol in ["A", "B", "C"]:
+            for day in ["2026-01-06", "2026-01-07"]:
+                store.record(
+                    _metrics(symbol=symbol, session=day), qualified=True, failed_gate=None
+                )
+        picks = store.weekly_top_picks(lookback_days=7, top_n=2, min_qualifying_days=2, today="2026-01-07")
+        self.assertEqual(len(picks), 2)
+
+    def test_weekly_top_picks_empty_when_nothing_meets_the_threshold(self):
+        store = self._store()
+        store.record(_metrics(symbol="AAA", session="2026-01-07"), qualified=True, failed_gate=None)
+        picks = store.weekly_top_picks(lookback_days=7, top_n=5, min_qualifying_days=2, today="2026-01-07")
+        self.assertEqual(picks, [])
+
 
 class TradeOutcomeSummaryTests(unittest.TestCase):
     def test_summarize_aggregates_hit_rate_and_average(self):
@@ -1843,6 +1885,37 @@ class TradeOutcomeSummaryTests(unittest.TestCase):
         with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=[]):
             report = news_bot.build_trade_performance_report(lookback_days=5)
         self.assertIn("No outcomes to evaluate yet", report)
+
+
+class WeeklyTopPicksReportTests(unittest.TestCase):
+    def test_report_renders_ranked_picks(self):
+        fake_picks = [
+            {
+                "symbol": "AAA", "qualifying_days": 4, "sessions_tracked": 5,
+                "avg_week_momentum_pct": 3.5, "latest_session": "2026-01-07",
+                "latest_close": 123.45, "latest_day_change_pct": 1.2,
+                "latest_atr_pct": 2.1, "latest_drawdown_pct": 3.0,
+            },
+        ]
+        with patch.object(news_bot.TRADE_HISTORY, "weekly_top_picks", return_value=fake_picks):
+            report = news_bot.build_weekly_top_picks()
+        self.assertIn("Weekly Top Picks", report)
+        self.assertIn("AAA", report)
+        self.assertIn("qualified 4/5", report)
+        self.assertIn("Informational only", report)
+
+    def test_report_handles_no_picks_gracefully(self):
+        with patch.object(news_bot.TRADE_HISTORY, "weekly_top_picks", return_value=[]):
+            report = news_bot.build_weekly_top_picks()
+        self.assertIn("No symbol has qualified enough sessions", report)
+        self.assertIn("/recommendations", report)
+
+    def test_report_passes_lookback_and_top_n_through(self):
+        with patch.object(news_bot.TRADE_HISTORY, "weekly_top_picks", return_value=[]) as mock_picks:
+            news_bot.build_weekly_top_picks(lookback_days=10, top_n=3)
+        mock_picks.assert_called_once_with(
+            lookback_days=10, top_n=3, min_qualifying_days=news_bot.SETTINGS.trade_weekly_top_picks_min_qualifying_days
+        )
 
 
 class TickerAnalysisTests(unittest.TestCase):
@@ -1923,6 +1996,15 @@ class CommandDispatchTests(unittest.TestCase):
         self.assertIn("/performance", help_text)
         self.assertIn("/news", help_text)
         self.assertIn("/recommendations", help_text)
+        self.assertIn("/stocks", help_text)
+
+    def test_morning_and_evening_commands_are_removed(self):
+        """Removed in favor of /news, /recommendations and /stocks: both now
+        fall through to the help text like any other unrecognized command."""
+        for command in ("/morning", "/evening"):
+            with patch("news_bot.send_telegram_message") as mock_send:
+                news_bot._handle_command(command, "123")
+            self.assertIn("Supported commands", mock_send.call_args[0][0])
 
     def test_news_command_sends_only_news_no_quotes_or_candidates(self):
         with patch(
@@ -1967,6 +2049,14 @@ class CommandDispatchTests(unittest.TestCase):
         mock_global.assert_not_called()
         mock_business.assert_not_called()
         mock_send.assert_called_once_with("candidates only", chat_id="123")
+
+    def test_stocks_command_dispatches_to_weekly_top_picks(self):
+        with patch(
+            "news_bot.build_weekly_top_picks", return_value="weekly picks"
+        ) as mock_build, patch("news_bot.send_telegram_message") as mock_send:
+            news_bot._handle_command("/stocks", "123")
+        mock_build.assert_called_once_with()
+        mock_send.assert_called_once_with("weekly picks", chat_id="123")
 
 
 class ScreenUniverseDeadlineTests(unittest.TestCase):

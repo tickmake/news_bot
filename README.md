@@ -26,7 +26,7 @@ The bot is built in Python and scheduled with APScheduler.
 - **Relevance-ranked headlines** by importance, topic weight, and recency — not raw feed order.
 - **Cross-outlet and cross-day deduplication**, so one story appears once.
 - **Local LLM ranking** via Ollama — no API key, no data leaves your network — with a deterministic heuristic fallback.
-- **Telegram command support** (`/now`, `/morning`, `/evening`, `/news`, `/recommendations`, `/watchlist`, `/analyze`, `/performance`, `/health`).
+- **Telegram command support** (`/now`, `/news`, `/recommendations`, `/stocks`, `/watchlist`, `/analyze`, `/performance`, `/health`).
 - **Optional Slack mirror** of every outbound message via an incoming webhook, alongside Telegram.
 - **Health ping** support for runtime monitoring.
 - **CI test workflow** via GitHub Actions.
@@ -393,14 +393,19 @@ Additional jobs:
 After sending `/start` to the bot, you can use:
 
 - `/now` - send full briefing immediately
-- `/morning` - send morning-style briefing
-- `/evening` - send evening-style briefing
 - `/news` - send only news headlines (Norway + global + business stories) — no live quotes, no trade candidates
-- `/recommendations` - send only the trade screener's candidate picks — no news, no live quote tables
+- `/recommendations` - send only today's live trade screener candidate picks — no news, no live quote tables
+- `/stocks` - send this week's top picks, ranked by how consistently they've qualified — see below
 - `/watchlist` - send market + screener sections (business news + live stock/fund quotes + trade candidates)
 - `/analyze TICKER` - send a deep-dive report for one symbol, e.g. `/analyze AAPL`
 - `/performance` - send how the trade screener's past qualifying picks have done
 - `/health` - send runtime health report
+
+`/morning` and `/evening` (forcing the greeting/tone of the scheduled
+07:00/19:00 briefing on demand) have been removed in favor of the more
+focused `/news`, `/recommendations`, and `/stocks` commands above; the
+scheduled `07:00`/`19:00` jobs themselves are unaffected. `/now` still sends
+the full combined briefing on demand.
 
 ### `/news` and `/recommendations`
 
@@ -412,11 +417,34 @@ want one half of it:
   in.
 - **`/recommendations`** sends just the trade screener's current candidate
   picks (identical output to the trade-candidates section of the full
-  briefing) — no headlines, no live quote tables.
+  briefing) — no headlines, no live quote tables. This is a live, single-day
+  re-screen — for a view aggregated over the week, see `/stocks` below.
 
 Both are pure on-demand reads, same as `/watchlist`: they don't mark
 headlines as seen, so triggering `/news` manually never suppresses a
-headline from the next scheduled `/morning` or `/evening` briefing.
+headline from the next scheduled briefing.
+
+### `/stocks`
+
+This week's top trading picks — for swing trading, not a single day's
+snapshot. Unlike `/recommendations` (today's live re-screen), `/stocks` reads
+the rolling trade signal history (SQLite) built up over the last
+`TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS` sessions (default `7`) and ranks
+symbols by:
+
+1. how many of those sessions they actually qualified on (consistency), then
+2. their average weekly momentum across the window.
+
+A symbol only appears if it qualified at least
+`TRADE_WEEKLY_TOP_PICKS_MIN_QUALIFYING_DAYS` times (default `2`) in the
+window — a one-off qualifying day is filtered out as noise. Like
+`/performance`, this is a pure SQLite read (no fresh yfinance calls), so it
+needs a few days of the screener actually running before it has anything to
+rank; check `/recommendations` in the meantime.
+
+- `TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS` - sessions to look back over (default `7`)
+- `TRADE_WEEKLY_TOP_PICKS_MIN_QUALIFYING_DAYS` - minimum qualifying sessions in the window to be included (default `2`)
+- `TRADE_WEEKLY_TOP_PICKS_COUNT` - max picks returned (default `5`)
 
 ### `/analyze TICKER`
 
