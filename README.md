@@ -95,7 +95,7 @@ python news_bot.py
 - `TZ` - timezone for scheduler (default `Europe/Oslo`)
 - `RECIPIENT_NAME` - name shown in greeting (default `Sunil`)
 - `TELEGRAM_MESSAGE_MAX_CHARS` - chunk size per Telegram message (default `3900`)
-- `STATE_FILE` - local JSON state file path (default `.news_bot_state.json`)
+- `STATE_FILE` - local JSON state file path (default `.news_bot_state.json`; under docker compose it points into the `news_bot_data` volume at `/app/data`)
 - `COMMAND_POLL_ENABLED` - enable Telegram command handling (default `true`)
 - `COMMAND_LONG_POLL_TIMEOUT_SECONDS` - Telegram long-poll hold time; commands respond near-instantly (default `25`)
 - `COMMAND_POLL_INTERVAL_MINUTES` - **deprecated**, retained for compatibility but unused (long-polling replaced interval polling)
@@ -346,8 +346,15 @@ rolling memory of the screener's own daily output, used to see streaks (e.g.
 a symbol qualifying several sessions running) and, later, whether qualifying
 days actually paid off.
 
-- `TRADE_HISTORY_DB_FILE` - SQLite file path (default `.news_bot_trade_history.db`)
+- `TRADE_HISTORY_DB_FILE` - SQLite file path (default `.news_bot_trade_history.db`; under docker compose it points into the `news_bot_data` volume at `/app/data`)
 - `TRADE_HISTORY_RETENTION_DAYS` - rolling window kept before older rows are pruned (default `14`)
+
+Under docker compose both this DB and `STATE_FILE` are pinned to `/app/data`
+on the `news_bot_data` named volume, and the `.env` values above are ignored
+(they apply only to a direct, non-container run). Without that volume they
+live in the container's writable layer and are wiped by every
+`up --force-recreate`, silently resetting streaks, `/analyze` outcomes and
+`/stocks` weekly picks to empty until enough sessions re-accumulate.
 
 Candidates must pass every gate: price above its 20-day EMA, 5-day and 1-day
 returns above their thresholds, and ATR and drawdown below their ceilings.
@@ -489,6 +496,15 @@ URL to mirror every outbound message — scheduled briefings, the health ping,
 and every `/command` reply above — to a Slack channel alongside Telegram.
 Leave it blank (the default) to disable Slack entirely; nothing changes for
 Telegram-only setups.
+
+Under docker compose, setting it in `.env` is not enough on its own — the
+variable must also be listed in the `news-notifier` service's `environment:`
+block in `docker-compose.yml` (it is). The image ships no `.env` of its own,
+so any variable missing from that list is simply unset in the container, and
+an unset webhook makes the mirror return early *without logging anything* —
+the symptom is Slack silently never receiving messages while Telegram works
+fine. `/health` reports `Slack mirror: configured` / `not configured`, which
+is the quickest way to tell which side of this you are on.
 
 This is a one-way broadcast, not a second control surface: an incoming
 webhook can only *post* to Slack, so `/commands` still have to be sent from

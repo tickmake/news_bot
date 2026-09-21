@@ -58,9 +58,30 @@ services:
       - default
       # Lets the bot resolve an Ollama running in another compose project.
       - ranker
+    volumes:
+      # Everything the bot needs to survive a recreate. Without this the
+      # trade-history SQLite DB and the news dedup state live in the
+      # container's writable layer, so `up --force-recreate` silently resets
+      # qualifying streaks, /analyze outcomes and /stocks weekly picks to
+      # empty until enough sessions re-accumulate.
+      - news_bot_data:/app/data
     environment:
+      # Deliberately NOT ${STATE_FILE:-...}: compose interpolates that from the
+      # host .env, so a leftover `STATE_FILE=.news_bot_state.json` there would
+      # silently put both files back in the container's writable layer and
+      # quietly undo the volume above. The mount point is a property of this
+      # compose file, not user config -- change it here if you need it moved.
+      - STATE_FILE=/app/data/.news_bot_state.json
+      - TRADE_HISTORY_DB_FILE=/app/data/.news_bot_trade_history.db
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # Slack mirror. The image has no .env of its own (the Dockerfile copies
+      # only requirements.txt and news_bot.py), so anything absent from this
+      # list is simply unset in the container -- and an unset webhook makes
+      # send_slack_message() return early without logging, so the mirror goes
+      # silently dead rather than erroring.
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - SLACK_MESSAGE_MAX_CHARS=${SLACK_MESSAGE_MAX_CHARS:-3900}
       - NEWS_API_KEY=${NEWS_API_KEY}
       - FREENEWS_API_KEY=${FREENEWS_API_KEY}
       - FREEN_EWS_API_KEY=${FREEN_EWS_API_KEY}
@@ -115,3 +136,6 @@ networks:
 
 volumes:
   ollama_models:
+  # Trade-history SQLite DB and news dedup state. Survives recreates; the
+  # history is only as deep as TRADE_HISTORY_RETENTION_DAYS (14 by default).
+  news_bot_data:
