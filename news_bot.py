@@ -245,6 +245,13 @@ class AppSettings(BaseSettings):
     telegram_token: str = ""
     telegram_chat_id: str = ""
     slack_webhook_url: str = ""
+    # File upload is a separate capability from the webhook. An incoming
+    # webhook can only post text, but the Web API's upload endpoints are
+    # ordinary outbound HTTPS calls -- no inbound port, no Socket Mode -- so
+    # charts can reach Slack without the exposure trade-off that inbound
+    # Slack commands would need. Costs a bot token instead.
+    slack_bot_token: str = ""
+    slack_channel_id: str = ""
     slack_message_max_chars: int = 3900
     news_api_key: str = ""
     freenews_api_key: str = ""
@@ -884,6 +891,85 @@ def send_slack_message(message: str) -> bool:
         return True
     except Exception as exc:
         APP_LOG.error("slack_send_failed detail=%s", exc)
+        return False
+
+
+_SLACK_API_BASE = "https://slack.com/api"
+
+
+def _slack_api(method: str, payload: Dict[str, Any], as_json: bool = False) -> Dict[str, Any]:
+    """Call one Slack Web API method and return its parsed body.
+
+    Slack answers HTTP 200 with `{"ok": false, "error": ...}` for application
+    errors, so `raise_for_status` alone would treat a missing scope or a
+    channel the bot was never invited to as success. This raises on `ok:
+    false` instead, carrying Slack's own error code.
+    """
+    def _send() -> requests.Response:
+        headers = {"Authorization": f"Bearer {SETTINGS.slack_bot_token}"}
+        if as_json:
+            return requests.post(
+                f"{_SLACK_API_BASE}/{method}", headers=headers, json=payload,
+                timeout=SETTINGS.request_timeout_seconds,
+            )
+        return requests.post(
+            f"{_SLACK_API_BASE}/{method}", headers=headers, data=payload,
+            timeout=SETTINGS.request_timeout_seconds,
+        )
+
+    response = _with_retry(_send, f"slack_api_{method}")
+    response.raise_for_status()
+    body = response.json()
+    if not body.get("ok"):
+        raise RuntimeError(f"{method} failed: {body.get('error', 'unknown_error')}")
+    return body
+
+
+def send_slack_photo(image: bytes, title: str = "", comment: str = "") -> bool:
+    """Upload an image to Slack via the three-step external upload flow.
+
+    `files.upload` was retired in 2025; the replacement reserves a URL, PUTs
+    the bytes to it, then completes the upload against a channel. All three
+    are outbound calls.
+
+    Silent no-op unless both a bot token and a channel id are configured, so
+    a webhook-only install keeps behaving exactly as it did.
+    """
+    if not SETTINGS.slack_bot_token or not SETTINGS.slack_channel_id:
+        SYS_LOG.debug("slack_photo_skipped reason=no_bot_token_or_channel")
+        return False
+    try:
+        reserved = _slack_api(
+            "files.getUploadURLExternal",
+            {"filename": "candidates.png", "length": len(image)},
+        )
+        upload_url = reserved.get("upload_url")
+        file_id = reserved.get("file_id")
+        if not upload_url or not file_id:
+            raise RuntimeError("getUploadURLExternal returned no upload target")
+
+        def _put() -> requests.Response:
+            return requests.post(
+                upload_url,
+                files={"file": ("candidates.png", image, "image/png")},
+                timeout=SETTINGS.request_timeout_seconds,
+            )
+
+        _with_retry(_put, "slack_upload_bytes").raise_for_status()
+
+        # `files` is a JSON-encoded array even on the form-encoded endpoint.
+        _slack_api(
+            "files.completeUploadExternal",
+            {
+                "files": json.dumps([{"id": file_id, "title": title or "Trade candidates"}]),
+                "channel_id": SETTINGS.slack_channel_id,
+                "initial_comment": comment,
+            },
+        )
+        APP_LOG.info("slack_photo_sent bytes=%s", len(image))
+        return True
+    except Exception as exc:
+        APP_LOG.error("slack_photo_failed detail=%s", exc)
         return False
 
 
@@ -3417,11 +3503,14 @@ def send_candidate_charts(outcome: "ScreenOutcome", labels: Dict[str, str],
                           chat_id: Optional[str] = None) -> bool:
     """Chart the top candidates and upload them to Telegram.
 
-    Telegram only, and deliberately so: `_slack_post` uses an incoming
-    webhook, which cannot upload a file -- showing an image in Slack needs a
-    publicly reachable URL, i.e. exposing this home lab, which is exactly the
-    trade-off already declined for Slack commands. Slack therefore keeps
-    receiving the text rendering, which carries the same numbers.
+    Goes to both channels, but by different routes. Telegram takes a
+    multipart `sendPhoto`. Slack cannot: `_slack_post` is an incoming
+    webhook, and a webhook can only post text. The Web API's upload
+    endpoints handle it instead -- outbound calls needing a bot token, not an
+    exposed port -- so Slack gets the image too wherever one is configured,
+    and falls back to the text rendering alone where one is not.
+
+    Rendered once and sent twice: the figure is the expensive part.
     """
     if not SETTINGS.trade_chart_enabled:
         return False
@@ -3431,8 +3520,13 @@ def send_candidate_charts(outcome: "ScreenOutcome", labels: Dict[str, str],
     image = render_candidate_charts([(m, labels.get(m.symbol, m.symbol)) for m in top])
     if image is None:
         return False
-    caption = "📊 " + ", ".join(m.symbol for m in top) + " — price vs EMA20, 20-day range, volume, RSI"
-    return send_telegram_photo(image, caption=caption, chat_id=chat_id)
+    symbols = ", ".join(m.symbol for m in top)
+    caption = f"📊 {symbols} — price vs EMA20, 20-day range, volume, RSI"
+    # Both are attempted regardless of the other's outcome: a Slack app that
+    # was never invited to the channel must not cost Telegram its chart.
+    telegram_ok = send_telegram_photo(image, caption=caption, chat_id=chat_id)
+    slack_ok = send_slack_photo(image, title=f"Trade candidates — {symbols}", comment=caption)
+    return telegram_ok or slack_ok
 
 
 def _summarize_trade_outcomes(lookback_days: Optional[int] = None) -> Dict[str, Any]:
