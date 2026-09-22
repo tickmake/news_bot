@@ -2032,9 +2032,15 @@ class CommandDispatchTests(unittest.TestCase):
         self.assertIn("business", payload)
 
     def test_recommendations_command_sends_only_trade_candidates(self):
+        # Goes through build_trade_candidates_payload now, so the screen runs
+        # once and its result is reused to chart the top candidates.
+        outcome = news_bot.ScreenOutcome(checked=0, analysed=0)
         with patch(
-            "news_bot.get_trade_candidates", return_value="candidates only"
+            "news_bot.build_trade_candidates_payload",
+            return_value=("candidates only", outcome, {}),
         ) as mock_candidates, patch(
+            "news_bot.send_candidate_charts"
+        ) as mock_charts, patch(
             "news_bot.get_norwegian_morning_news"
         ) as mock_norway, patch(
             "news_bot.get_global_news"
@@ -2045,6 +2051,7 @@ class CommandDispatchTests(unittest.TestCase):
         ) as mock_send:
             news_bot._handle_command("/recommendations", "123")
         mock_candidates.assert_called_once()
+        mock_charts.assert_called_once()
         mock_norway.assert_not_called()
         mock_global.assert_not_called()
         mock_business.assert_not_called()
@@ -2828,3 +2835,160 @@ class WatchlistReportTests(unittest.TestCase):
             news_bot._handle_command("/watchlist", "123")
         mock_build.assert_called_once()
         mock_send.assert_called_once_with("wl", chat_id="123")
+
+
+def _chart_frame(rows=120, start=100.0):
+    """Deterministic OHLCV frame shaped like what yfinance returns."""
+    index = pd.date_range("2026-04-01", periods=rows, freq="B", tz="America/New_York")
+    close = pd.Series([start + (i * 0.4) + ((i % 7) - 3) * 0.6 for i in range(rows)], index=index)
+    return pd.DataFrame(
+        {
+            "Open": close,
+            "High": close + 1.0,
+            "Low": close - 1.0,
+            "Close": close,
+            "Volume": pd.Series([1_000_000 + (i % 11) * 90_000 for i in range(rows)], index=index),
+        },
+        index=index,
+    )
+
+
+class RsiSeriesTests(unittest.TestCase):
+    def test_series_last_point_matches_the_scalar_the_text_prints(self):
+        """A chart that disagreed with the RSI printed beside it would be
+        worse than no chart."""
+        close = _chart_frame()["Close"]
+        self.assertAlmostEqual(
+            float(news_bot._rsi_series(close).iloc[-1]),
+            news_bot._compute_rsi_14(close),
+            places=6,
+        )
+
+    def test_series_is_none_for_a_series_too_short_to_measure(self):
+        self.assertIsNone(news_bot._rsi_series(pd.Series([1.0, 2.0, 3.0])))
+
+    def test_unbroken_gains_map_to_100_like_the_scalar(self):
+        rising = pd.Series([100.0 + i for i in range(40)])
+        self.assertEqual(float(news_bot._rsi_series(rising).iloc[-1]), 100.0)
+        self.assertEqual(news_bot._compute_rsi_14(rising), 100.0)
+
+
+class ChartRenderTests(unittest.TestCase):
+    def _metrics_for(self, symbol, frame):
+        last = float(frame["Close"].iloc[-1])
+        return _metrics(
+            symbol=symbol, last_close=last, ema20=last * 0.97,
+            rsi_14=61.0, support_level=last * 0.95, resistance_level=last * 1.03,
+        )
+
+    def test_renders_a_png(self):
+        frame = _chart_frame()
+        metrics = self._metrics_for("AAPL", frame)
+        with patch.object(news_bot, "_fetch_ticker_history", return_value=frame):
+            image = news_bot.render_candidate_charts([(metrics, "Apple")])
+        self.assertIsNotNone(image)
+        self.assertTrue(image.startswith(b"\x89PNG"), "not a PNG payload")
+
+    def test_no_candidates_renders_nothing(self):
+        self.assertIsNone(news_bot.render_candidate_charts([]))
+
+    def test_symbol_without_enough_history_is_skipped(self):
+        short = _chart_frame(rows=10)
+        metrics = self._metrics_for("TINY", short)
+        with patch.object(news_bot, "_fetch_ticker_history", return_value=short):
+            self.assertIsNone(news_bot.render_candidate_charts([(metrics, "Tiny")]))
+
+    def test_render_failure_degrades_to_none_rather_than_raising(self):
+        """Charts decorate the text; they must never take it down."""
+        frame = _chart_frame()
+        metrics = self._metrics_for("AAPL", frame)
+        with patch.object(news_bot, "_fetch_ticker_history", side_effect=RuntimeError("boom")):
+            self.assertIsNone(news_bot.render_candidate_charts([(metrics, "Apple")]))
+
+
+class CandidateChartDeliveryTests(unittest.TestCase):
+    def _screen_outcome(self, count):
+        qualified = [_metrics(symbol=f"SYM{i}") for i in range(count)]
+        return news_bot.ScreenOutcome(checked=count, analysed=count, qualified=qualified)
+
+    def test_sends_only_the_configured_number_of_charts(self):
+        outcome = self._screen_outcome(6)
+        with patch.object(news_bot.SETTINGS, "trade_chart_count", 3), \
+             patch.object(news_bot, "render_candidate_charts", return_value=b"\x89PNGdata") as mock_render, \
+             patch.object(news_bot, "send_telegram_photo", return_value=True) as mock_send:
+            self.assertTrue(news_bot.send_candidate_charts(outcome, {}))
+        charted = [m.symbol for m, _name in mock_render.call_args[0][0]]
+        self.assertEqual(charted, ["SYM0", "SYM1", "SYM2"])
+        mock_send.assert_called_once()
+
+    def test_disabled_setting_sends_nothing(self):
+        with patch.object(news_bot.SETTINGS, "trade_chart_enabled", False), \
+             patch.object(news_bot, "send_telegram_photo") as mock_send:
+            self.assertFalse(news_bot.send_candidate_charts(self._screen_outcome(3), {}))
+        mock_send.assert_not_called()
+
+    def test_nothing_qualified_sends_nothing(self):
+        with patch.object(news_bot, "send_telegram_photo") as mock_send:
+            self.assertFalse(news_bot.send_candidate_charts(self._screen_outcome(0), {}))
+        mock_send.assert_not_called()
+
+    def test_unrenderable_charts_send_nothing(self):
+        with patch.object(news_bot, "render_candidate_charts", return_value=None), \
+             patch.object(news_bot, "send_telegram_photo") as mock_send:
+            self.assertFalse(news_bot.send_candidate_charts(self._screen_outcome(3), {}))
+        mock_send.assert_not_called()
+
+    def test_charts_never_go_to_slack(self):
+        """An incoming webhook cannot upload a file, so Slack deliberately
+        keeps receiving only the text rendering."""
+        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), \
+             patch.object(news_bot, "render_candidate_charts", return_value=b"\x89PNGdata"), \
+             patch.object(news_bot, "_telegram_post_photo") as mock_photo, \
+             patch.object(news_bot, "send_slack_message") as mock_slack, \
+             patch.object(news_bot, "_slack_post") as mock_post:
+            news_bot.send_candidate_charts(self._screen_outcome(2), {}, chat_id="123")
+        mock_photo.assert_called_once()
+        mock_slack.assert_not_called()
+        mock_post.assert_not_called()
+
+    def test_caption_is_truncated_to_telegram_limit(self):
+        """Telegram rejects a caption over 1024 characters, which would fail
+        the whole upload rather than trimming it."""
+        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), \
+             patch.object(news_bot, "_telegram_post_photo") as mock_post:
+            news_bot.send_telegram_photo(b"png", caption="x" * 2000, chat_id="123")
+        mock_post.assert_called_once()
+        self.assertLessEqual(len(mock_post.call_args[0][2]), 1024)
+
+    def test_upload_is_skipped_without_a_token(self):
+        with patch.object(news_bot.SETTINGS, "telegram_token", ""), \
+             patch.object(news_bot, "_telegram_post_photo") as mock_post:
+            self.assertFalse(news_bot.send_telegram_photo(b"png", chat_id="123"))
+        mock_post.assert_not_called()
+
+    def test_photo_upload_failure_is_swallowed(self):
+        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), \
+             patch.object(news_bot, "_telegram_post_photo", side_effect=RuntimeError("down")):
+            self.assertFalse(news_bot.send_telegram_photo(b"png", chat_id="123"))
+
+
+class RecommendationsChartWiringTests(unittest.TestCase):
+    def test_text_is_sent_before_charts_and_screening_runs_once(self):
+        outcome = news_bot.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAA")])
+        with patch.object(news_bot, "build_trade_candidates_payload",
+                          return_value=("picks", outcome, {"AAA": "Alpha"})) as mock_payload, \
+             patch.object(news_bot, "send_candidate_charts") as mock_charts, \
+             patch("news_bot.send_telegram_message") as mock_send:
+            news_bot._handle_command("/recommendations", "123")
+        mock_payload.assert_called_once()
+        mock_send.assert_called_once_with("picks", chat_id="123")
+        mock_charts.assert_called_once()
+        self.assertEqual(mock_charts.call_args[1]["chat_id"], "123")
+
+    def test_get_trade_candidates_still_returns_just_text(self):
+        """Back-compat: the briefing path only ever wanted the string."""
+        outcome = news_bot.ScreenOutcome(checked=0, analysed=0)
+        with patch.object(news_bot, "_build_candidate_universe", return_value=[]), \
+             patch.object(news_bot, "_screen_universe", return_value=(outcome, {})):
+            result = news_bot.get_trade_candidates()
+        self.assertIsInstance(result, str)

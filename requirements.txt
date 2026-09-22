@@ -13,3 +13,15 @@ defusedxml==0.7.1
 # `requests`, so no LLM SDK is needed.
 pydantic==2.13.4
 pydantic-settings==2.11.0
+# Technical-analysis charts for /recommendations, rendered locally and
+# uploaded via Telegram's sendPhoto. Imported lazily in render_candidate_charts
+# so an install without it degrades to text-only rather than failing to start.
+#
+# Split by architecture because neither version covers both: 3.11.x ships no
+# manylinux aarch64 wheel (a Pi would fall back to a from-source build
+# python:3.11-slim has no toolchain for), while 3.10.3 cannot render at all on
+# Python 3.14 -- every savefig hits a RecursionError in Path.__deepcopy__ --
+# which is what a dev machine on current Homebrew python runs. Each marker
+# picks the newest release with a real wheel for that platform.
+matplotlib==3.10.3; platform_machine == "aarch64"
+matplotlib==3.11.2; platform_machine != "aarch64"
