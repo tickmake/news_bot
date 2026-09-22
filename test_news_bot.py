@@ -2659,3 +2659,172 @@ class LogRoutingTests(unittest.TestCase):
             source = handle.read()
         for level in ("debug", "info", "warning", "error"):
             self.assertNotIn(f"LOGGER.{level}(", source)
+
+
+class StickyUniverseTests(unittest.TestCase):
+    """The continuity tier that lets /stocks and /performance have data.
+
+    Discovery returns a near-different set of movers every session, so a
+    symbol screened once was never looked at again -- and both of those
+    commands read recorded history rather than live prices, so neither could
+    ever say anything about a symbol seen exactly once.
+    """
+
+    def setUp(self):
+        self._patches = [
+            patch.object(news_bot, "USA_STOCK_UNIVERSE", {"Apple": "AAPL"}),
+            patch.object(news_bot, "INDIA_STOCK_UNIVERSE", {}),
+            patch.object(news_bot, "NORWAY_STOCK_UNIVERSE", {}),
+            patch.object(news_bot, "EU_STOCK_UNIVERSE", {}),
+            patch.object(news_bot, "INDIA_MUTUAL_FUNDS", {}),
+            patch.object(news_bot, "NORWAY_MUTUAL_FUNDS", {}),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_recently_tracked_symbols_rank_by_qualifying_count(self):
+        store = news_bot.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "sticky.db"))
+        self.addCleanup(store.close)
+        store.record(_metrics(symbol="ONCE", session="2026-08-12"), qualified=True, failed_gate=None)
+        store.record(_metrics(symbol="OFTEN", session="2026-08-11"), qualified=True, failed_gate=None)
+        store.record(_metrics(symbol="OFTEN", session="2026-08-12"), qualified=True, failed_gate=None)
+        self.assertEqual(
+            store.recently_tracked_symbols(days=10, today="2026-08-13"), ["OFTEN", "ONCE"]
+        )
+
+    def test_recently_tracked_symbols_excludes_stale_rows(self):
+        store = news_bot.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "sticky.db"))
+        self.addCleanup(store.close)
+        store.record(_metrics(symbol="OLD", session="2026-07-01"), qualified=True, failed_gate=None)
+        self.assertEqual(store.recently_tracked_symbols(days=10, today="2026-08-13"), [])
+
+    def test_tracked_symbols_are_rescreened_before_fresh_movers(self):
+        screener = {f"Mover {i}": f"SCR{i}" for i in range(20)}
+        with patch.object(news_bot.TRADE_HISTORY, "recently_tracked_symbols",
+                          return_value=["STICKY1", "STICKY2"]), \
+             patch.object(news_bot, "_build_live_universe", return_value=screener):
+            universe = news_bot._build_candidate_universe(20)
+        symbols = [symbol for _, symbol in universe]
+        self.assertEqual(symbols[:3], ["AAPL", "STICKY1", "STICKY2"])
+
+    def test_discovery_keeps_its_reserved_slots(self):
+        """A long-lived tracked set must never freeze the universe: discovery
+        keeps TRADE_DISCOVERY_MIN_SLOTS however many symbols are tracked."""
+        tracked = [f"STK{i}" for i in range(50)]
+        screener = {f"Mover {i}": f"SCR{i}" for i in range(20)}
+        with patch.object(news_bot.SETTINGS, "trade_discovery_min_slots", 4), \
+             patch.object(news_bot.TRADE_HISTORY, "recently_tracked_symbols", return_value=tracked), \
+             patch.object(news_bot, "_build_live_universe", return_value=screener):
+            universe = news_bot._build_candidate_universe(20)
+        symbols = [symbol for _, symbol in universe]
+        self.assertEqual(len(symbols), 20)
+        self.assertEqual(len([s for s in symbols if s.startswith("SCR")]), 4)
+
+    def test_tracked_symbol_already_on_the_watchlist_is_not_duplicated(self):
+        with patch.object(news_bot.TRADE_HISTORY, "recently_tracked_symbols",
+                          return_value=["AAPL"]), \
+             patch.object(news_bot, "_build_live_universe", return_value={}):
+            universe = news_bot._build_candidate_universe(10)
+        self.assertEqual([symbol for _, symbol in universe].count("AAPL"), 1)
+
+    def test_retention_floor_outlasts_every_reader_window(self):
+        """prune used to delete at the 14-day retention default regardless of
+        how far back the reports actually read, silently truncating them."""
+        with patch.object(news_bot.SETTINGS, "trade_history_retention_days", 14), \
+             patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 30), \
+             patch.object(news_bot.SETTINGS, "trade_sticky_universe_days", 10), \
+             patch.object(news_bot.SETTINGS, "trade_weekly_top_picks_lookback_days", 7):
+            self.assertEqual(news_bot._effective_history_retention_days(), 40)
+
+
+class RankingQualityTests(unittest.TestCase):
+    """RSI and volume were measured and printed but read by nothing."""
+
+    def test_overbought_sorts_below_a_calmer_name_with_less_momentum(self):
+        extended = _metrics(symbol="EXTENDED", week_momentum_pct=9.0, rsi_14=85.0)
+        healthy = _metrics(symbol="HEALTHY", week_momentum_pct=3.0, rsi_14=55.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([extended, healthy], key=news_bot._rank_key)],
+            ["HEALTHY", "EXTENDED"],
+        )
+
+    def test_unconfirmed_volume_sorts_below_a_confirmed_name(self):
+        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
+            thin = _metrics(symbol="THIN", week_momentum_pct=9.0, volume_ratio=0.4)
+            confirmed = _metrics(symbol="CONFIRMED", week_momentum_pct=3.0, volume_ratio=2.0)
+            self.assertEqual(
+                [m.symbol for m in sorted([thin, confirmed], key=news_bot._rank_key)],
+                ["CONFIRMED", "THIN"],
+            )
+
+    def test_missing_rsi_is_not_treated_as_overbought(self):
+        unknown = _metrics(symbol="UNKNOWN", week_momentum_pct=9.0, rsi_14=None)
+        known = _metrics(symbol="KNOWN", week_momentum_pct=3.0, rsi_14=50.0)
+        self.assertEqual(
+            [m.symbol for m in sorted([unknown, known], key=news_bot._rank_key)],
+            ["UNKNOWN", "KNOWN"],
+        )
+
+    def test_neither_flag_disqualifies_anything(self):
+        """These tiers reorder the list, they never shorten it."""
+        self.assertEqual(news_bot._failed_gates(_metrics(rsi_14=95.0, volume_ratio=0.1)), [])
+
+
+class WatchlistReportTests(unittest.TestCase):
+    def test_reports_configured_symbols_that_did_not_qualify(self):
+        """Regression: /watchlist rendered a market snapshot plus a filtered
+        trade screen, so a configured symbol that failed a gate appeared
+        nowhere -- the command never showed the watchlist at all."""
+        passing = _metrics(symbol="AAPL")
+        failing = _metrics(symbol="MSFT", above_ema20=False)
+        outcome = news_bot.ScreenOutcome(
+            checked=2,
+            analysed=2,
+            qualified=[passing],
+            rejected=[(failing, ["trend"])],
+        )
+        with patch.object(news_bot, "_configured_watchlist",
+                          return_value=[("Apple [USA Stock]", "AAPL"), ("Microsoft [USA Stock]", "MSFT")]), \
+             patch.object(news_bot, "_screen_universe",
+                          return_value=(outcome, {"AAPL": "Apple", "MSFT": "Microsoft"})):
+            report = news_bot.build_watchlist_report()
+        self.assertIn("AAPL", report)
+        self.assertIn("MSFT", report)
+        self.assertIn("Holding off", report)
+        self.assertIn(news_bot.TRADE_GATE_LABELS["trend"], report)
+
+    def test_explains_how_to_configure_when_watchlist_is_empty(self):
+        with patch.object(news_bot, "_configured_watchlist", return_value=[]), \
+             patch.object(news_bot, "_screen_universe") as mock_screen:
+            report = news_bot.build_watchlist_report()
+        mock_screen.assert_not_called()
+        self.assertIn("USA_STOCK_UNIVERSE", report)
+
+    def test_screens_only_configured_symbols(self):
+        """It must not depend on whatever the screeners surfaced today."""
+        entries = [("Apple [USA Stock]", "AAPL")]
+        outcome = news_bot.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAPL")])
+        with patch.object(news_bot, "_configured_watchlist", return_value=entries), \
+             patch.object(news_bot, "_build_live_universe") as mock_live, \
+             patch.object(news_bot, "_screen_universe", return_value=(outcome, {"AAPL": "Apple"})) as mock_screen:
+            news_bot.build_watchlist_report()
+        mock_live.assert_not_called()
+        self.assertEqual(mock_screen.call_args[0][0], entries)
+
+    def test_flags_configured_symbols_the_universe_cap_left_out(self):
+        entries = [(f"N{i} [USA Stock]", f"S{i}") for i in range(6)]
+        outcome = news_bot.ScreenOutcome(checked=2, analysed=2)
+        with patch.object(news_bot.SETTINGS, "trade_universe_max", 2), \
+             patch.object(news_bot, "_configured_watchlist", return_value=entries), \
+             patch.object(news_bot, "_screen_universe", return_value=(outcome, {})):
+            report = news_bot.build_watchlist_report()
+        self.assertIn("TRADE_UNIVERSE_MAX", report)
+        self.assertIn("4 configured symbol(s) not analysed", report)
+
+    def test_watchlist_command_dispatches_to_the_report(self):
+        with patch("news_bot.build_watchlist_report", return_value="wl") as mock_build, \
+             patch("news_bot.send_telegram_message") as mock_send:
+            news_bot._handle_command("/watchlist", "123")
+        mock_build.assert_called_once()
+        mock_send.assert_called_once_with("wl", chat_id="123")

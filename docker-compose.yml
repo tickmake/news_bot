@@ -65,6 +65,21 @@ services:
       # qualifying streaks, /analyze outcomes and /stocks weekly picks to
       # empty until enough sessions re-accumulate.
       - news_bot_data:/app/data
+    # The image carries no .env of its own (the Dockerfile copies only
+    # requirements.txt and news_bot.py), and the explicit `environment` list
+    # below is an allowlist -- so every setting missing from it was simply
+    # unset in the container. That is how the configured stock universes
+    # (USA_/INDIA_/NORWAY_/EU_STOCK_UNIVERSE and the mutual-fund lists) never
+    # reached the screener: they have no code default, so the trade screen
+    # silently ran on screener-discovered movers alone.
+    #
+    # `required: false` so a host without a .env still starts. Anything also
+    # named in `environment` below keeps that value -- compose gives the
+    # explicit list precedence -- which is what keeps STATE_FILE and
+    # TRADE_HISTORY_DB_FILE pinned to the volume regardless of .env.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Deliberately NOT ${STATE_FILE:-...}: compose interpolates that from the
       # host .env, so a leftover `STATE_FILE=.news_bot_state.json` there would
@@ -113,6 +128,28 @@ services:
       - NEWS_DEDUP_WINDOW_DAYS=${NEWS_DEDUP_WINDOW_DAYS:-7}
       - NEWS_RECENT_TITLE_DAYS=${NEWS_RECENT_TITLE_DAYS:-3}
       - NEWS_TOPIC_WEIGHTS=${NEWS_TOPIC_WEIGHTS}
+      # Trade screener. Listed explicitly as well as via env_file so the
+      # defaults are visible here rather than buried in the Python.
+      - TRADE_UNIVERSE_MAX=${TRADE_UNIVERSE_MAX:-30}
+      - TRADE_HISTORY_RETENTION_DAYS=${TRADE_HISTORY_RETENTION_DAYS:-14}
+      - TRADE_OUTCOME_LOOKBACK_DAYS=${TRADE_OUTCOME_LOOKBACK_DAYS:-5}
+      - TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS=${TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS:-7}
+      - TRADE_WEEKLY_TOP_PICKS_MIN_QUALIFYING_DAYS=${TRADE_WEEKLY_TOP_PICKS_MIN_QUALIFYING_DAYS:-2}
+      # Universe continuity. /stocks and /performance read recorded history,
+      # so they need symbols re-screened across several sessions; discovery
+      # alone churns almost completely day to day. Tracked symbols are carried
+      # forward for this many days, while discovery keeps a reserved slot
+      # count so new names still surface.
+      - TRADE_STICKY_UNIVERSE_DAYS=${TRADE_STICKY_UNIVERSE_DAYS:-10}
+      - TRADE_DISCOVERY_MIN_SLOTS=${TRADE_DISCOVERY_MIN_SLOTS:-10}
+      # Watchlists. No code default -- unset here means the screener sees only
+      # discovered movers and /watchlist has nothing to report.
+      - USA_STOCK_UNIVERSE=${USA_STOCK_UNIVERSE}
+      - INDIA_STOCK_UNIVERSE=${INDIA_STOCK_UNIVERSE}
+      - NORWAY_STOCK_UNIVERSE=${NORWAY_STOCK_UNIVERSE}
+      - EU_STOCK_UNIVERSE=${EU_STOCK_UNIVERSE}
+      - INDIA_MUTUAL_FUNDS=${INDIA_MUTUAL_FUNDS}
+      - NORWAY_MUTUAL_FUNDS=${NORWAY_MUTUAL_FUNDS}
     # json-file with no options grows without limit, and DEBUG accelerates it.
     logging:
       driver: json-file
