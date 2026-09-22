@@ -2992,3 +2992,123 @@ class RecommendationsChartWiringTests(unittest.TestCase):
              patch.object(news_bot, "_screen_universe", return_value=(outcome, {})):
             result = news_bot.get_trade_candidates()
         self.assertIsInstance(result, str)
+
+
+class SlackPhotoUploadTests(unittest.TestCase):
+    """Slack's external-upload flow: reserve a URL, PUT bytes, complete."""
+
+    def setUp(self):
+        self._token = patch.object(news_bot.SETTINGS, "slack_bot_token", "xoxb-test")
+        self._channel = patch.object(news_bot.SETTINGS, "slack_channel_id", "C123")
+        self._token.start(); self._channel.start()
+        self.addCleanup(self._token.stop); self.addCleanup(self._channel.stop)
+
+    def _response(self, payload, status=200):
+        response = MagicMock()
+        response.status_code = status
+        response.json.return_value = payload
+        response.raise_for_status.return_value = None
+        return response
+
+    def test_completes_the_three_step_upload(self):
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append(url)
+            if url.endswith("files.getUploadURLExternal"):
+                return self._response({"ok": True, "upload_url": "https://files.slack/up", "file_id": "F1"})
+            if url == "https://files.slack/up":
+                return self._response({})
+            if url.endswith("files.completeUploadExternal"):
+                return self._response({"ok": True})
+            raise AssertionError(f"unexpected url {url}")
+
+        with patch.object(news_bot.requests, "post", side_effect=fake_post):
+            self.assertTrue(news_bot.send_slack_photo(b"\x89PNGdata", title="T", comment="C"))
+        self.assertEqual(
+            calls,
+            [
+                "https://slack.com/api/files.getUploadURLExternal",
+                "https://files.slack/up",
+                "https://slack.com/api/files.completeUploadExternal",
+            ],
+        )
+
+    def test_application_error_is_a_failure_despite_http_200(self):
+        """Slack answers ok:false with HTTP 200, so raise_for_status alone
+        would read a missing scope as success."""
+        with patch.object(news_bot.requests, "post",
+                          return_value=self._response({"ok": False, "error": "missing_scope"})):
+            self.assertFalse(news_bot.send_slack_photo(b"png"))
+
+    def test_skipped_without_a_bot_token(self):
+        with patch.object(news_bot.SETTINGS, "slack_bot_token", ""), \
+             patch.object(news_bot.requests, "post") as mock_post:
+            self.assertFalse(news_bot.send_slack_photo(b"png"))
+        mock_post.assert_not_called()
+
+    def test_skipped_without_a_channel_id(self):
+        with patch.object(news_bot.SETTINGS, "slack_channel_id", ""), \
+             patch.object(news_bot.requests, "post") as mock_post:
+            self.assertFalse(news_bot.send_slack_photo(b"png"))
+        mock_post.assert_not_called()
+
+    def test_missing_upload_target_is_a_failure(self):
+        with patch.object(news_bot.requests, "post",
+                          return_value=self._response({"ok": True})):
+            self.assertFalse(news_bot.send_slack_photo(b"png"))
+
+    def test_channel_id_and_file_id_reach_the_completion_call(self):
+        seen = {}
+
+        def fake_post(url, **kwargs):
+            if url.endswith("getUploadURLExternal"):
+                return self._response({"ok": True, "upload_url": "https://u", "file_id": "F9"})
+            if url.endswith("completeUploadExternal"):
+                seen.update(kwargs.get("data") or {})
+                return self._response({"ok": True})
+            return self._response({})
+
+        with patch.object(news_bot.requests, "post", side_effect=fake_post):
+            news_bot.send_slack_photo(b"png", title="Candidates", comment="hello")
+        self.assertEqual(seen["channel_id"], "C123")
+        self.assertIn("F9", seen["files"])
+        self.assertEqual(seen["initial_comment"], "hello")
+
+
+class DualChannelChartDeliveryTests(unittest.TestCase):
+    def _screen_outcome(self):
+        return news_bot.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAA")])
+
+    def test_chart_is_rendered_once_and_sent_to_both(self):
+        with patch.object(news_bot, "render_candidate_charts", return_value=b"png") as mock_render, \
+             patch.object(news_bot, "send_telegram_photo", return_value=True) as mock_tg, \
+             patch.object(news_bot, "send_slack_photo", return_value=True) as mock_slack:
+            self.assertTrue(news_bot.send_candidate_charts(self._screen_outcome(), {}))
+        mock_render.assert_called_once()
+        self.assertEqual(mock_tg.call_args[0][0], b"png")
+        self.assertEqual(mock_slack.call_args[0][0], b"png")
+
+    def test_slack_failure_does_not_cost_telegram_its_chart(self):
+        with patch.object(news_bot, "render_candidate_charts", return_value=b"png"), \
+             patch.object(news_bot, "send_telegram_photo", return_value=True) as mock_tg, \
+             patch.object(news_bot, "send_slack_photo", return_value=False):
+            self.assertTrue(news_bot.send_candidate_charts(self._screen_outcome(), {}))
+        mock_tg.assert_called_once()
+
+    def test_telegram_failure_does_not_cost_slack_its_chart(self):
+        with patch.object(news_bot, "render_candidate_charts", return_value=b"png"), \
+             patch.object(news_bot, "send_telegram_photo", return_value=False), \
+             patch.object(news_bot, "send_slack_photo", return_value=True) as mock_slack:
+            self.assertTrue(news_bot.send_candidate_charts(self._screen_outcome(), {}))
+        mock_slack.assert_called_once()
+
+    def test_webhook_only_install_is_unchanged(self):
+        """No bot token configured: Telegram still gets its chart, Slack
+        keeps receiving only the text."""
+        with patch.object(news_bot.SETTINGS, "slack_bot_token", ""), \
+             patch.object(news_bot, "render_candidate_charts", return_value=b"png"), \
+             patch.object(news_bot, "send_telegram_photo", return_value=True), \
+             patch.object(news_bot.requests, "post") as mock_post:
+            self.assertTrue(news_bot.send_candidate_charts(self._screen_outcome(), {}))
+        mock_post.assert_not_called()

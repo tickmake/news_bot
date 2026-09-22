@@ -490,11 +490,14 @@ The chart is rendered locally with matplotlib and uploaded through Telegram's
 `sendPhoto`, which takes a multipart upload — so the image never has to be
 reachable from the internet and no port needs exposing.
 
-**Telegram only, by construction.** `_slack_post` uses a Slack incoming
-webhook, and incoming webhooks cannot upload files; rendering an image in
-Slack would need a publicly reachable URL, i.e. exposing this home lab. Slack
-therefore keeps receiving the text, which carries the same numbers. Set
-`TRADE_CHART_ENABLED=false` for text everywhere.
+**Both channels, by different routes.** Telegram takes the multipart
+`sendPhoto` above. Slack cannot: `_slack_post` is an incoming webhook, and a
+webhook can only post text. Slack's Web API upload endpoints handle it
+instead — still ordinary outbound HTTPS calls, so no port is exposed and no
+Socket Mode is involved, but they authenticate with a **bot token** rather
+than a webhook URL. See [Chart uploads to Slack](#chart-uploads-to-slack)
+below. With no bot token configured, Slack keeps receiving the text only and
+nothing else changes. Set `TRADE_CHART_ENABLED=false` for text everywhere.
 
 matplotlib is imported lazily inside `render_candidate_charts`, so an install
 without it — or any drawing failure — loses the charts and nothing else: the
@@ -599,6 +602,35 @@ URL to mirror every outbound message — scheduled briefings, the health ping,
 and every `/command` reply above — to a Slack channel alongside Telegram.
 Leave it blank (the default) to disable Slack entirely; nothing changes for
 Telegram-only setups.
+
+### Chart uploads to Slack
+
+The incoming webhook can only post text. To get the `/recommendations` charts
+into Slack as well, the bot needs the Web API:
+
+1. Create a Slack app in the workspace (or reuse one).
+2. Give its **bot token** the `files:write` scope, and install the app.
+3. Invite the bot to the target channel — an uninvited bot gets
+   `not_in_channel` and the upload fails.
+4. Set `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_CHANNEL_ID` (the channel *ID*,
+   e.g. `C0123ABCDEF`, not its name).
+
+Leave either blank and chart upload is a silent no-op — Slack keeps receiving
+the text rendering exactly as before.
+
+This does **not** reopen the inbound-command question. Uploading a file is an
+outbound call, so unlike Slash Commands or the Events API it needs no exposed
+port and no Socket Mode connection; the bot still cannot *receive* anything
+from Slack, and all commands are still triggered from Telegram.
+
+Uploads use the three-step external flow (`files.getUploadURLExternal` → PUT
+the bytes → `files.completeUploadExternal`), since `files.upload` was retired
+in 2025. Slack answers application errors with HTTP 200 and `ok: false`, so
+the client checks `ok` rather than trusting the status code — otherwise a
+missing scope or an uninvited bot would read as success.
+
+- `SLACK_BOT_TOKEN` - bot token with `files:write` (default empty, disabled)
+- `SLACK_CHANNEL_ID` - channel ID to upload into (default empty, disabled)
 
 Under docker compose, setting it in `.env` is not enough on its own — the
 variable must also be listed in the `news-notifier` service's `environment:`
