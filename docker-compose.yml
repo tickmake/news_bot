@@ -142,6 +142,11 @@ services:
       # count so new names still surface.
       - TRADE_STICKY_UNIVERSE_DAYS=${TRADE_STICKY_UNIVERSE_DAYS:-10}
       - TRADE_DISCOVERY_MIN_SLOTS=${TRADE_DISCOVERY_MIN_SLOTS:-10}
+      # Charts on /recommendations. Telegram-only by construction: an incoming
+      # webhook cannot upload a file, so Slack keeps getting the text.
+      - TRADE_CHART_ENABLED=${TRADE_CHART_ENABLED:-true}
+      - TRADE_CHART_COUNT=${TRADE_CHART_COUNT:-3}
+      - TRADE_CHART_LOOKBACK_DAYS=${TRADE_CHART_LOOKBACK_DAYS:-90}
       # Watchlists. No code default -- unset here means the screener sees only
       # discovered movers and /watchlist has nothing to report.
       - USA_STOCK_UNIVERSE=${USA_STOCK_UNIVERSE}

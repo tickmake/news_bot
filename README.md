@@ -449,7 +449,7 @@ After sending `/start` to the bot, you can use:
 
 - `/now` - send full briefing immediately
 - `/news` - send only news headlines (Norway + global + business stories) — no live quotes, no trade candidates
-- `/recommendations` - send only today's live trade screener candidate picks — no news, no live quote tables
+- `/recommendations` - send today's live trade screener candidate picks, with technical-analysis charts for the top few — no news, no live quote tables
 - `/stocks` - send this week's top picks, ranked by how consistently they've qualified — see below
 - `/watchlist` - send every configured watchlist symbol with today's read and its verdict — see below
 - `/analyze TICKER` - send a deep-dive report for one symbol, e.g. `/analyze AAPL`
@@ -473,7 +473,36 @@ want one half of it:
 - **`/recommendations`** sends just the trade screener's current candidate
   picks (identical output to the trade-candidates section of the full
   briefing) — no headlines, no live quote tables. This is a live, single-day
-  re-screen — for a view aggregated over the week, see `/stocks` below.
+  re-screen — for a view aggregated over the week, see `/stocks` below. It
+  also attaches technical-analysis charts for the top candidates; see below.
+
+#### Charts
+
+`/recommendations` follows its text with a single PNG covering the top
+`TRADE_CHART_COUNT` candidates (default `3`). Each gets two stacked panels:
+
+- **Price** — close, EMA20, the 20-session support/resistance band the
+  drawdown and entry/exit sketch are both measured against, and volume bars
+  (green/red by direction) compressed along the bottom as context.
+- **RSI 14** — with the 30 and 70 lines marked.
+
+The chart is rendered locally with matplotlib and uploaded through Telegram's
+`sendPhoto`, which takes a multipart upload — so the image never has to be
+reachable from the internet and no port needs exposing.
+
+**Telegram only, by construction.** `_slack_post` uses a Slack incoming
+webhook, and incoming webhooks cannot upload files; rendering an image in
+Slack would need a publicly reachable URL, i.e. exposing this home lab. Slack
+therefore keeps receiving the text, which carries the same numbers. Set
+`TRADE_CHART_ENABLED=false` for text everywhere.
+
+matplotlib is imported lazily inside `render_candidate_charts`, so an install
+without it — or any drawing failure — loses the charts and nothing else: the
+text always sends first, and never depends on the image.
+
+- `TRADE_CHART_ENABLED` - attach charts to `/recommendations` (default `true`)
+- `TRADE_CHART_COUNT` - how many top candidates to chart (default `3`)
+- `TRADE_CHART_LOOKBACK_DAYS` - sessions drawn per chart (default `90`)
 
 Both are pure on-demand reads: they don't mark headlines as seen, so
 triggering `/news` manually never suppresses a headline from the next
