@@ -323,10 +323,34 @@ universe variables above).
   startup.
 - `TRADE_MIN_WEEK_MOMENTUM_PCT`
 - `TRADE_MIN_DAY_CHANGE_PCT`
-- `TRADE_MIN_VOLUME_RATIO` - threshold for the `✓` volume-confirmation marker.
-  Volume does not admit or reject a candidate; it breaks ties in the ranking.
+- `TRADE_MIN_VOLUME_RATIO` - threshold for the `✓` volume-confirmation marker,
+  and for the volume-confirmation tier in the ranking below. Volume never
+  admits or rejects a candidate.
 - `TRADE_MAX_DRAWDOWN_PCT`
 - `TRADE_MAX_ATR_PCT`
+
+#### How qualifying candidates are ordered
+
+Everything that passes the gates is shown; ranking only decides the order.
+Two quality tiers sort first, then the original ordinal rule:
+
+1. **Not overbought** — RSI 14 below 70 sorts above anything at or over it.
+2. **Volume confirmed** — at or above `TRADE_MIN_VOLUME_RATIO` sorts above
+   anything below it.
+3. 5-day momentum, then volume ratio, then qualifying streak, then lower ATR,
+   then symbol (so identical metrics always render identically).
+
+Tiers 1 and 2 are new. RSI was measured and displayed but read by nothing, so
+a name at RSI 85 — extended, and the worst moment to open a swing position —
+sorted above a healthy pullback purely on momentum, which is exactly the
+number a blow-off top maximises. Volume had the mirror-image problem: as a raw
+ratio in the second slot it only ever broke *exact* momentum ties, so an
+unconfirmed move still outranked a confirmed one whenever momentum differed at
+all.
+
+Both are deliberately tiers rather than gates: they sort a name **down**, not
+out, so nothing that qualifies today stops qualifying. Make them hard
+disqualifiers only if you're willing to have days with zero picks.
 
 ### Trade Candidate Performance
 
@@ -336,6 +360,30 @@ Candidate analysis fetches per-symbol history from yfinance. These controls keep
 - `TRADE_FETCH_WORKERS` - parallel history fetch workers (default `6`)
 - `TRADE_HISTORY_CACHE_TTL_SECONDS` - per-symbol history cache duration (default `600`)
 - `TRADE_TOTAL_DEADLINE_SECONDS` - overall deadline for candidate analysis; partial results returned if exceeded (default `45`)
+
+#### Which symbols get screened
+
+Each run fills `TRADE_UNIVERSE_MAX` slots in three tiers, in order:
+
+1. **Configured watchlist** — every symbol in `USA_/INDIA_/NORWAY_/EU_STOCK_UNIVERSE`
+   and the mutual-fund lists. Always screened first.
+2. **Recently tracked** — symbols screened at least once in the last
+   `TRADE_STICKY_UNIVERSE_DAYS` (default `10`), most-often-qualifying first.
+3. **Discovery** — fresh movers from Yahoo's predefined screeners, filling
+   whatever is left, with at least `TRADE_DISCOVERY_MIN_SLOTS` (default `10`)
+   slots reserved so a long-lived tracked set can never freeze the universe.
+
+Tier 2 exists because `/stocks` and `/performance` read *recorded history*
+rather than live prices, so they can only speak about symbols re-screened
+across several sessions. Discovery alone returns a near-different set of
+movers every day, so before this tier a discovered mover was measured once
+and never looked at again — meaning neither command could ever evaluate one.
+
+- `TRADE_STICKY_UNIVERSE_DAYS` - how long a seen symbol is carried forward (default `10`)
+- `TRADE_DISCOVERY_MIN_SLOTS` - slots always reserved for fresh discovery (default `10`)
+
+Screener names are **discovery only** — they decide which symbols are looked
+at, never whether one qualifies. That stays with the five gates below.
 
 ### Trade Signal History
 
@@ -403,7 +451,7 @@ After sending `/start` to the bot, you can use:
 - `/news` - send only news headlines (Norway + global + business stories) — no live quotes, no trade candidates
 - `/recommendations` - send only today's live trade screener candidate picks — no news, no live quote tables
 - `/stocks` - send this week's top picks, ranked by how consistently they've qualified — see below
-- `/watchlist` - send market + screener sections (business news + live stock/fund quotes + trade candidates)
+- `/watchlist` - send every configured watchlist symbol with today's read and its verdict — see below
 - `/analyze TICKER` - send a deep-dive report for one symbol, e.g. `/analyze AAPL`
 - `/performance` - send how the trade screener's past qualifying picks have done
 - `/health` - send runtime health report
@@ -427,9 +475,27 @@ want one half of it:
   briefing) — no headlines, no live quote tables. This is a live, single-day
   re-screen — for a view aggregated over the week, see `/stocks` below.
 
-Both are pure on-demand reads, same as `/watchlist`: they don't mark
-headlines as seen, so triggering `/news` manually never suppresses a
-headline from the next scheduled briefing.
+Both are pure on-demand reads: they don't mark headlines as seen, so
+triggering `/news` manually never suppresses a headline from the next
+scheduled briefing.
+
+### `/watchlist`
+
+Every symbol in your configured watchlist (`USA_/INDIA_/NORWAY_/EU_STOCK_UNIVERSE`
+and the mutual-fund lists), screened live and grouped by verdict:
+
+- **Trade-ready today** — passed all five gates, with any qualifying streak.
+- **Holding off** — measured fine but failed a gate, showing which one.
+- **No usable price data** — the fetch returned nothing usable.
+
+It screens *only* the configured symbols, so it stays fast and its result
+doesn't depend on whatever the screeners happened to surface this morning.
+
+This is the point of the command: a watchlist is for seeing how your own
+names are doing, **including the ones that aren't trade-worthy today**.
+Previously `/watchlist` rendered the market snapshot plus a filtered trade
+screen — the same thing `/recommendations` shows — so a configured symbol
+that failed a gate appeared nowhere at all.
 
 ### `/stocks`
 
@@ -447,7 +513,12 @@ A symbol only appears if it qualified at least
 window — a one-off qualifying day is filtered out as noise. Like
 `/performance`, this is a pure SQLite read (no fresh yfinance calls), so it
 needs a few days of the screener actually running before it has anything to
-rank; check `/recommendations` in the meantime.
+rank; check `/recommendations` or `/watchlist` in the meantime.
+
+The window is counted in **recorded sessions**, not calendar days — a symbol
+is ranked over its last `TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS` rows. It used
+to window by calendar day, which made a "7 session" window about 5 actual
+trading sessions and quietly under-counted every symbol.
 
 - `TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS` - sessions to look back over (default `7`)
 - `TRADE_WEEKLY_TOP_PICKS_MIN_QUALIFYING_DAYS` - minimum qualifying sessions in the window to be included (default `2`)
@@ -482,10 +553,13 @@ on demand from the trade signal history (SQLite) above — no yfinance calls
 — since the screener already records every session's outcome as it runs;
 there is nothing to pre-materialize with a separate scheduled job.
 
-This is necessarily best-effort: it only sees a symbol's outcome if that
-symbol was screened both on its qualifying day and again near today, which
-holds reliably for configured watchlist symbols and only sometimes for ad
-hoc screener movers that come and go from the universe day to day.
+This is best-effort: it only sees a symbol's outcome if that symbol was
+screened both on its qualifying day and again near today. Configured
+watchlist symbols are screened every session, and discovered movers are
+carried forward for `TRADE_STICKY_UNIVERSE_DAYS` after they are first seen
+(see [Which symbols get screened](#which-symbols-get-screened)) — without
+that carry-forward a discovered mover was measured exactly once and could
+never produce an outcome at all.
 
 - `TRADE_OUTCOME_LOOKBACK_DAYS` - sessions after qualifying to evaluate the outcome (default `5`)
 

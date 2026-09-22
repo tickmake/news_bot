@@ -322,6 +322,15 @@ class AppSettings(BaseSettings):
     trade_weekly_top_picks_lookback_days: int = 7
     trade_weekly_top_picks_min_qualifying_days: int = 2
     trade_weekly_top_picks_count: int = 5
+    # Universe continuity. /stocks and /performance are pure reads over
+    # recorded history, so they only have anything to say about symbols
+    # that get re-screened across more than one session. Screener
+    # discovery returns a near-different set of movers every day, so
+    # without carrying recently-seen symbols forward both commands report
+    # "nothing yet" indefinitely. Discovery keeps a reserved slot count so
+    # the sticky set can never crowd out fresh names entirely.
+    trade_sticky_universe_days: int = 10
+    trade_discovery_min_slots: int = 10
     ticker_info_cache_ttl_seconds: int = 21600
     ticker_analysis_summary_max_chars: int = 500
     command_long_poll_timeout_seconds: int = 25
@@ -2303,7 +2312,7 @@ def _failed_gates(metrics: TradeMetrics) -> List[str]:
     return failed
 
 
-def _rank_key(metrics: TradeMetrics) -> Tuple[float, float, int, float, str]:
+def _rank_key(metrics: TradeMetrics) -> Tuple[bool, bool, float, float, int, float, str]:
     """Ordering for qualifying candidates: momentum, then confirmation,
     then consistency, then calm.
 
@@ -2318,7 +2327,23 @@ def _rank_key(metrics: TradeMetrics) -> Tuple[float, float, int, float, str]:
     signal than today's directly measured volume confirmation, but still
     more informative than volatility alone for breaking a tie.
     """
+    # Two quality tiers ahead of momentum, both of them booleans rather than
+    # gates: they reorder the list, they never shorten it.
+    #
+    # RSI was measured and printed but read by nothing, so a name at RSI 85 --
+    # extended, and the worst moment to open a swing position -- sorted above
+    # a healthy pullback purely on momentum, which is exactly the number a
+    # blow-off top maximises. Volume had the same problem in reverse: the
+    # docstring said it "ranks rather than admits", but as a raw ratio in the
+    # second slot it only ever broke exact momentum ties, so an unconfirmed
+    # move still outranked a confirmed one whenever momentum differed at all.
+    # Both now sort *down* rather than out, which keeps every currently
+    # qualifying symbol qualifying.
+    overbought = metrics.rsi_14 is not None and metrics.rsi_14 >= 70
+    unconfirmed = metrics.volume_ratio < SETTINGS.trade_min_volume_ratio
     return (
+        overbought,
+        unconfirmed,
         -metrics.week_momentum_pct,
         -metrics.volume_ratio,
         -TRADE_HISTORY.recent_qualifying_streak(metrics.symbol),
@@ -2486,6 +2511,47 @@ class TradeHistoryStore:
                 SYS_LOG.warning("trade_history_symbols_failed detail=%s", exc)
                 return []
 
+    def recently_tracked_symbols(
+        self, days: int, today: Optional[str] = None
+    ) -> List[str]:
+        """Symbols screened at least once in the last `days` calendar days,
+        the ones that qualified most often first.
+
+        This is what gives the screened universe continuity. Discovery hands
+        back a fresh set of movers each session, so a symbol picked up on
+        Monday was simply never looked at again -- and both `/stocks` and
+        `/performance`, which read recorded history rather than live prices,
+        need a symbol measured on several sessions before they can say
+        anything about it at all.
+
+        Ordering by qualifying count and then recency means a limited slot
+        budget is spent re-measuring the names that have actually been
+        earning their place, not whatever happened to be screened last.
+        """
+        anchor_text = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            anchor = datetime.strptime(anchor_text, "%Y-%m-%d")
+        except ValueError:
+            anchor = datetime.now(timezone.utc)
+        cutoff = (anchor - timedelta(days=max(0, days))).strftime("%Y-%m-%d")
+        with TRADE_HISTORY_LOCK:
+            try:
+                conn = self._connection()
+                rows = conn.execute(
+                    """
+                    SELECT symbol
+                    FROM trade_metrics_history
+                    WHERE session_date >= ?
+                    GROUP BY symbol
+                    ORDER BY SUM(qualified) DESC, MAX(session_date) DESC, symbol ASC
+                    """,
+                    (cutoff,),
+                ).fetchall()
+                return [row[0] for row in rows]
+            except Exception as exc:
+                SYS_LOG.warning("trade_history_tracked_failed detail=%s", exc)
+                return []
+
     def qualifying_outcomes(
         self, lookback_days: int, today: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -2511,7 +2577,12 @@ class TradeHistoryStore:
 
         outcomes: List[Dict[str, Any]] = []
         for symbol in self.symbols_with_history():
-            rows = self.history(symbol, days=max(lookback_days + 30, 30), today=anchor_text)
+            # Read a little past the anchor so the "latest qualifying row at or
+            # before target_date" search has room for weekends and holidays.
+            # It used to ask for lookback + 30 days, which `prune` then deleted
+            # out from under it at the 14-day retention default -- a silent
+            # truncation of exactly the window this report needs.
+            rows = self.history(symbol, days=lookback_days + 10, today=anchor_text)
             if len(rows) < 2:
                 continue
             # Rows are ascending by session_date; the qualifying anchor is the
@@ -2564,7 +2635,12 @@ class TradeHistoryStore:
         """
         picks: List[Dict[str, Any]] = []
         for symbol in self.symbols_with_history():
-            rows = self.history(symbol, days=lookback_days, today=today)
+            # `history` windows by calendar day, but this ranks by *sessions*
+            # -- a 7-calendar-day window is only about 5 trading sessions, so
+            # asking for 7 days and calling the result "7 sessions" quietly
+            # under-counted every symbol. Read wide, then keep the last
+            # `lookback_days` rows, which are one per session by construction.
+            rows = self.history(symbol, days=lookback_days * 2 + 7, today=today)[-lookback_days:]
             if not rows:
                 continue
             qualifying_days = sum(1 for row in rows if row["qualified"])
@@ -2663,7 +2739,7 @@ def _configured_watchlist() -> List[Tuple[str, str]]:
 
 
 def _build_candidate_universe(max_symbols: int) -> List[Tuple[str, str]]:
-    """Configured watchlist first, screener discovery filling what remains.
+    """Configured watchlist, then recently-tracked symbols, then discovery.
 
     The previous order appended the watchlist *after* ~67 screener names and
     then truncated to the cap, so with healthy screeners no configured symbol
@@ -2672,6 +2748,12 @@ def _build_candidate_universe(max_symbols: int) -> List[Tuple[str, str]]:
     Screener names are discovery only: they decide which symbols are looked at,
     never whether one qualifies. That decision belongs to _failed_gates, which
     reads completed-session metrics.
+
+    The sticky middle tier exists because discovery alone made the universe
+    churn almost completely from one session to the next. `/stocks` and
+    `/performance` read recorded history rather than live prices, so a symbol
+    seen exactly once can never satisfy either of them -- which is why both
+    reported "nothing yet" indefinitely on a discovery-only deployment.
     """
     selected: List[Tuple[str, str]] = []
     seen: set = set()
@@ -2694,7 +2776,24 @@ def _build_candidate_universe(max_symbols: int) -> List[Tuple[str, str]]:
     if len(selected) >= max_symbols:
         return selected
 
-    for label, symbol in _build_live_universe(limit=max_symbols).items():
+    # Hold back slots for discovery before the sticky set spends them, so a
+    # long-lived tracked set can never freeze the universe and stop surfacing
+    # new names.
+    reserved = max(0, min(SETTINGS.trade_discovery_min_slots, max_symbols - len(selected)))
+    sticky_budget = max_symbols - reserved
+    for symbol in TRADE_HISTORY.recently_tracked_symbols(SETTINGS.trade_sticky_universe_days):
+        if len(selected) >= sticky_budget:
+            break
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        selected.append((f"{symbol} [Tracked]", symbol))
+
+    remaining = max_symbols - len(selected)
+    if remaining <= 0:
+        return selected
+
+    for label, symbol in _build_live_universe(limit=remaining).items():
         if symbol in seen:
             continue
         seen.add(symbol)
@@ -2718,6 +2817,29 @@ class ScreenOutcome:
     qualified: List[TradeMetrics] = field(default_factory=list)
     failed_counts: Dict[str, int] = field(default_factory=dict)
     deadline_hit: bool = False
+    # Rejections kept in full, not just counted. `/watchlist` has to show a
+    # configured symbol whatever its verdict -- the point of a watchlist is
+    # seeing how your own names are doing, including the ones that are not
+    # trade-worthy today -- and counts alone cannot answer that.
+    rejected: List[Tuple[TradeMetrics, List[str]]] = field(default_factory=list)
+    no_data_symbols: List[str] = field(default_factory=list)
+
+
+def _effective_history_retention_days() -> int:
+    """How long history must actually be kept for the reports that read it.
+
+    `prune` used to delete at TRADE_HISTORY_RETENTION_DAYS (14) flat, while
+    the outcome, weekly-picks and sticky-universe reads all ask for windows
+    derived from their own settings. Raising one of those settings past the
+    retention default silently got a truncated window rather than an error,
+    so retention is now a floor computed from what the readers need.
+    """
+    return max(
+        SETTINGS.trade_history_retention_days,
+        SETTINGS.trade_outcome_lookback_days + 10,
+        SETTINGS.trade_weekly_top_picks_lookback_days * 2 + 7,
+        SETTINGS.trade_sticky_universe_days + 7,
+    )
 
 
 def _screen_universe(
@@ -2728,31 +2850,41 @@ def _screen_universe(
     workers = max(1, min(SETTINGS.trade_fetch_workers, len(candidate_items) or 1))
     deadline = time.time() + max(5, SETTINGS.trade_total_deadline_seconds)
 
+    consumed: set = set()
+
+    def _consume(future: Any, symbol: str) -> None:
+        if symbol in consumed:
+            return
+        consumed.add(symbol)
+        try:
+            metrics = future.result()
+        except Exception as exc:
+            SYS_LOG.debug("candidate_future_failed symbol=%s detail=%s", symbol, exc)
+            metrics = None
+
+        outcome.analysed += 1
+        if metrics is None:
+            outcome.no_data += 1
+            outcome.no_data_symbols.append(symbol)
+            return
+
+        failed = _failed_gates(metrics)
+        if failed:
+            outcome.failed_counts[failed[0]] = outcome.failed_counts.get(failed[0], 0) + 1
+            outcome.rejected.append((metrics, failed))
+        else:
+            outcome.qualified.append(metrics)
+        TRADE_HISTORY.record(
+            metrics, qualified=not failed, failed_gate=(failed[0] if failed else None)
+        )
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         future_to_symbol = {
             pool.submit(_compute_trade_metrics, symbol): symbol
             for _, symbol in candidate_items
         }
         for future in as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            try:
-                metrics = future.result()
-            except Exception as exc:
-                SYS_LOG.debug("candidate_future_failed symbol=%s detail=%s", symbol, exc)
-                metrics = None
-
-            outcome.analysed += 1
-            if metrics is None:
-                outcome.no_data += 1
-            else:
-                failed = _failed_gates(metrics)
-                if failed:
-                    outcome.failed_counts[failed[0]] = (
-                        outcome.failed_counts.get(failed[0], 0) + 1
-                    )
-                else:
-                    outcome.qualified.append(metrics)
-                TRADE_HISTORY.record(metrics, qualified=not failed, failed_gate=(failed[0] if failed else None))
+            _consume(future, future_to_symbol[future])
 
             # Checked after the result is consumed: testing first discarded work
             # that had already finished.
@@ -2763,12 +2895,20 @@ def _screen_universe(
                     outcome.checked,
                 )
                 outcome.deadline_hit = True
+                # Drain everything else that already finished before cancelling.
+                # Throwing away a completed measurement loses that symbol's
+                # history row for the session, which silently breaks its
+                # qualifying streak and its eligibility for /stocks and
+                # /performance -- for no saving at all, since the work is done.
+                for other, other_symbol in list(future_to_symbol.items()):
+                    if other.done():
+                        _consume(other, other_symbol)
                 for pending in future_to_symbol:
                     pending.cancel()
                 break
 
     outcome.qualified.sort(key=_rank_key)
-    TRADE_HISTORY.prune(SETTINGS.trade_history_retention_days)
+    TRADE_HISTORY.prune(_effective_history_retention_days())
     return outcome, labels
 
 
@@ -2942,6 +3082,97 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
     return "\n".join(lines) + "\n\n"
 
 
+def _watchlist_line(metrics: TradeMetrics, name: str, note: str = "") -> str:
+    """One symbol on one line. A watchlist is read by scanning it, so every
+    entry gets the same shape and the same columns in the same order."""
+    return (
+        f"    <b>{escape(metrics.symbol)}</b> {escape(_truncate(name, 24))}"
+        f" · {metrics.last_close:,.2f}"
+        f" · {metrics.day_change_pct:+.2f}% today"
+        f" · {metrics.week_momentum_pct:+.2f}% 5d"
+        f" · RSI {_rsi_label(metrics.rsi_14)}{note}"
+    )
+
+
+def build_watchlist_report() -> str:
+    """Every configured watchlist symbol with today's read and its verdict.
+
+    `/watchlist` used to render the live market snapshot followed by a full
+    trade screen -- which is what `/recommendations` already shows, filtered
+    to the few names that passed. A configured symbol that failed a gate
+    appeared nowhere at all, so the command never actually showed the user's
+    watchlist. That is backwards: the reason to keep a watchlist is to see
+    how *your* names are doing, and the ones that are not trade-worthy today
+    are exactly the ones worth knowing about.
+
+    Screens only the configured symbols, so it stays fast and its result does
+    not depend on whatever the screeners happened to surface this morning.
+    """
+    entries = _configured_watchlist()
+    # Defensive rather than routine: EU_STOCK_UNIVERSE falls back to
+    # DEFAULT_EU_STOCK_UNIVERSE, so an untouched install still has 14 names
+    # here. This branch only fires if that default is emptied too.
+    if not entries:
+        return (
+            "<b>👀 Watchlist</b>\n\n"
+            "No watchlist symbols are configured, so there is nothing to track.\n"
+            "Set USA_STOCK_UNIVERSE, INDIA_STOCK_UNIVERSE, NORWAY_STOCK_UNIVERSE or "
+            "EU_STOCK_UNIVERSE (Label:SYMBOL, comma separated) and restart the bot.\n"
+            "Until then /recommendations screens discovered movers instead.\n\n"
+        )
+
+    universe_max = max(1, SETTINGS.trade_universe_max)
+    analysed_entries = entries[:universe_max]
+    outcome, labels = _screen_universe(analysed_entries)
+
+    lines = [
+        f"<b>👀 Watchlist — {len(outcome.qualified)} of {outcome.checked} trade-ready</b>",
+        "",
+    ]
+
+    if outcome.qualified:
+        lines.append("<b>✅ Trade-ready today</b>")
+        for metrics in outcome.qualified:
+            streak = TRADE_HISTORY.recent_qualifying_streak(metrics.symbol)
+            note = f" · {streak}-session streak" if streak >= 2 else ""
+            lines.append(_watchlist_line(metrics, labels.get(metrics.symbol, metrics.symbol), note))
+        lines.append("")
+
+    if outcome.rejected:
+        # Strongest first, so the names closest to qualifying sit at the top
+        # of the section a reader is most likely to skim.
+        rejected = sorted(outcome.rejected, key=lambda item: -item[0].week_momentum_pct)
+        lines.append("<b>⏸ Holding off</b>")
+        for metrics, failed in rejected:
+            reason = TRADE_GATE_LABELS.get(failed[0], failed[0])
+            lines.append(
+                _watchlist_line(metrics, labels.get(metrics.symbol, metrics.symbol), f" · {reason}")
+            )
+        lines.append("")
+
+    if outcome.no_data_symbols:
+        lines.append("<b>❔ No usable price data</b>")
+        lines.append("    " + escape(", ".join(sorted(outcome.no_data_symbols))))
+        lines.append("")
+
+    lines.extend(_render_deadline_notice(outcome))
+
+    if len(entries) > len(analysed_entries):
+        lines.append(
+            f"<i>{len(entries) - len(analysed_entries)} configured symbol(s) not analysed — "
+            f"raise TRADE_UNIVERSE_MAX above {universe_max} to cover them all.</i>"
+        )
+        lines.append("")
+
+    # Always the neutral heading: this report deliberately lists the symbols
+    # that failed too, so "every candidate passed all five" would be false
+    # here whenever anything is in the holding-off section.
+    lines.extend(_render_checks(False))
+    lines.append("<i>Informational only. Not investment advice.</i>")
+    lines.append("<i>No guarantee of profit. Use strict risk management.</i>")
+    return "\n".join(lines) + "\n\n"
+
+
 def _summarize_trade_outcomes(lookback_days: Optional[int] = None) -> Dict[str, Any]:
     lookback_days = lookback_days if lookback_days is not None else SETTINGS.trade_outcome_lookback_days
     outcomes = TRADE_HISTORY.qualifying_outcomes(lookback_days)
@@ -2976,9 +3207,10 @@ def build_trade_performance_report(lookback_days: Optional[int] = None) -> str:
     if summary["count"] == 0:
         lines.append(
             "No outcomes to evaluate yet. This needs a symbol that qualified at least "
-            f"{summary['lookback_days']} sessions ago and has been screened again since -- "
-            "reliable for configured watchlist symbols, sparse for ad hoc screener movers "
-            "that come and go from the universe day to day."
+            f"{summary['lookback_days']} sessions ago and has been screened again since. "
+            "Configured watchlist symbols are screened every session; discovered movers "
+            f"are carried forward for {SETTINGS.trade_sticky_universe_days} days after "
+            "they are first seen, so give the screener a few daily runs to build up."
         )
         lines.append("")
         return "\n".join(lines) + "\n\n"
@@ -3028,9 +3260,12 @@ def build_weekly_top_picks(lookback_days: Optional[int] = None, top_n: Optional[
     if not picks:
         lines.append(
             "No symbol has qualified enough sessions yet in this window "
-            f"(needs at least {SETTINGS.trade_weekly_top_picks_min_qualifying_days}). "
-            "Keep the screener running daily and check back once history builds up, "
-            "or try /recommendations for today's live picks instead."
+            f"(needs at least {SETTINGS.trade_weekly_top_picks_min_qualifying_days} of the "
+            f"last {lookback}). Configured watchlist symbols are screened every session; "
+            f"discovered movers are carried forward for "
+            f"{SETTINGS.trade_sticky_universe_days} days after they are first seen. "
+            "Try /recommendations for today's live picks, or /watchlist to see how your "
+            "configured names are doing right now."
         )
         lines.append("")
         return "\n".join(lines) + "\n\n"
@@ -3377,7 +3612,7 @@ def _command_help_text() -> str:
         "/news - Send only news headlines (no live quotes or trade candidates)\n"
         "/recommendations - Send only the trade screener's current candidate picks\n"
         "/stocks - Send this week's top picks, ranked by qualifying consistency\n"
-        "/watchlist - Send market + trade candidate sections\n"
+        "/watchlist - Send every configured watchlist symbol and its verdict\n"
         "/analyze TICKER - Send a deep-dive report for one symbol (e.g. /analyze AAPL)\n"
         "/performance - Send how the trade screener's past picks have done\n"
         "/health - Send bot health report\n"
@@ -3407,8 +3642,7 @@ def _handle_command(command: str, chat_id: str) -> None:
     elif normalized == "/stocks":
         _broadcast_message(build_weekly_top_picks(), chat_id=chat_id)
     elif normalized == "/watchlist":
-        payload = get_business_and_stocks()[0] + "\n\n" + get_trade_candidates()
-        _broadcast_message(payload, chat_id=chat_id)
+        _broadcast_message(build_watchlist_report(), chat_id=chat_id)
     elif normalized == "/analyze":
         if not argument:
             _broadcast_message("Usage: /analyze TICKER (e.g. /analyze AAPL)", chat_id=chat_id)
