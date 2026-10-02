@@ -482,6 +482,14 @@ want one half of it:
   re-screen — for a view aggregated over the week, see `/stocks` below. It
   also attaches technical-analysis charts for the top candidates; see below.
 
+> **A screen, not a signal.** The candidates are stocks that pass a set of
+> price-based gates today. Walk-forward testing (`/performance`) on the fixed
+> `broad-v1` basket found no measurable edge over simply holding a liquid
+> stock, and eight alternative gate sets showed none either (issue #12). Use
+> the list to decide what to look at, not what to buy. The test covers about
+> two years, one market regime, a survivorship-biased basket and 5-session
+> holds, so it cannot rule out small effects or other horizons.
+
 #### Charts
 
 `/recommendations` follows its text with a single PNG covering the top
