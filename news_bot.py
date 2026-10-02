@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -3035,34 +3036,50 @@ def _screen_universe(
             metrics, qualified=not failed, failed_gate=(failed[0] if failed else None)
         )
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    def _expire(future_to_symbol: Dict[Any, str]) -> None:
+        APP_LOG.warning(
+            "trade_candidates_deadline_reached analysed=%s of=%s",
+            outcome.analysed,
+            outcome.checked,
+        )
+        outcome.deadline_hit = True
+        # Drain everything else that already finished before cancelling.
+        # Throwing away a completed measurement loses that symbol's
+        # history row for the session, which silently breaks its
+        # qualifying streak and its eligibility for /stocks and
+        # /performance -- for no saving at all, since the work is done.
+        for other, other_symbol in list(future_to_symbol.items()):
+            if other.done():
+                _consume(other, other_symbol)
+        for pending in future_to_symbol:
+            pending.cancel()
+
+    # Not a `with` block: its exit is shutdown(wait=True), which waits for
+    # every fetch already running, so the deadline bounded nothing but the
+    # loop. Shutting down without waiting lets a hung fetch be abandoned.
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         future_to_symbol = {
             pool.submit(_compute_trade_metrics, symbol): symbol
             for _, symbol in candidate_items
         }
-        for future in as_completed(future_to_symbol):
-            _consume(future, future_to_symbol[future])
+        try:
+            # The timeout also covers the case where no future ever
+            # completes, which a post-result clock check cannot see.
+            for future in as_completed(
+                future_to_symbol, timeout=max(0.0, deadline - time.time())
+            ):
+                _consume(future, future_to_symbol[future])
 
-            # Checked after the result is consumed: testing first discarded work
-            # that had already finished.
-            if time.time() >= deadline:
-                APP_LOG.warning(
-                    "trade_candidates_deadline_reached analysed=%s of=%s",
-                    outcome.analysed,
-                    outcome.checked,
-                )
-                outcome.deadline_hit = True
-                # Drain everything else that already finished before cancelling.
-                # Throwing away a completed measurement loses that symbol's
-                # history row for the session, which silently breaks its
-                # qualifying streak and its eligibility for /stocks and
-                # /performance -- for no saving at all, since the work is done.
-                for other, other_symbol in list(future_to_symbol.items()):
-                    if other.done():
-                        _consume(other, other_symbol)
-                for pending in future_to_symbol:
-                    pending.cancel()
-                break
+                # Checked after the result is consumed: testing first
+                # discarded work that had already finished.
+                if time.time() >= deadline:
+                    _expire(future_to_symbol)
+                    break
+        except FuturesTimeoutError:
+            _expire(future_to_symbol)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     outcome.qualified.sort(key=_rank_key)
     TRADE_HISTORY.prune(_effective_history_retention_days())
@@ -4016,6 +4033,54 @@ def _handle_command(command: str, chat_id: str) -> None:
         _broadcast_message(_command_help_text(), chat_id=chat_id)
 
 
+def _authorized_chat_ids() -> set:
+    """Chats allowed to issue commands: the configured chat and health chat.
+
+    Anyone can message a bot, and every command spends market-data quota and
+    mirrors its reply to Slack, so unknown senders are ignored.
+    """
+    allowed = {SETTINGS.telegram_chat_id, SETTINGS.health_ping_chat_id}
+    return {str(chat) for chat in allowed if chat}
+
+
+# Commands run off the poller thread so a multi-minute /performance cannot
+# starve /health and the rest. Two workers, and one in-flight run per command.
+_COMMAND_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="command")
+_COMMANDS_IN_FLIGHT: set = set()
+_COMMANDS_LOCK = threading.Lock()
+
+
+def _run_command_safely(command: str, chat_id: str, key: str, flight: Tuple[str, str]) -> None:
+    try:
+        _handle_command(command, chat_id)
+    except Exception as exc:
+        APP_LOG.error("command_failed cmd=%s detail=%s", key, exc)
+        try:
+            send_telegram_message(f"Sorry, {key} failed. Check the bot logs.", chat_id=chat_id)
+        except Exception:
+            pass
+    finally:
+        with _COMMANDS_LOCK:
+            _COMMANDS_IN_FLIGHT.discard(flight)
+
+
+def _dispatch_command(command: str, chat_id: str) -> None:
+    parts = command.strip().split(maxsplit=1)
+    key = parts[0].lower() if parts else ""
+    # /analyze differs by argument, so only identical invocations collide.
+    flight = (chat_id, command.strip().lower())
+    with _COMMANDS_LOCK:
+        if flight in _COMMANDS_IN_FLIGHT:
+            busy = True
+        else:
+            _COMMANDS_IN_FLIGHT.add(flight)
+            busy = False
+    if busy:
+        send_telegram_message(f"{key} is already running; wait for it to finish.", chat_id=chat_id)
+        return
+    _COMMAND_POOL.submit(_run_command_safely, command, chat_id, key, flight)
+
+
 def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
     if not SETTINGS.command_poll_enabled or not SETTINGS.telegram_token:
         return True
@@ -4040,18 +4105,31 @@ def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
         payload = response.json()
         updates = payload.get("result", [])
         for update in updates:
-            update_id = int(update.get("update_id", 0))
-            message = update.get("message") or update.get("edited_message") or {}
-            chat = message.get("chat", {})
-            chat_id = str(chat.get("id", SETTINGS.telegram_chat_id))
-            text = message.get("text", "")
-            if text.startswith("/"):
-                APP_LOG.info("command_received cmd=%s chat_id=%s", text.split()[0], chat_id)
-                _handle_command(text, chat_id)
+            # Per-update isolation: one bad update must not abort the batch
+            # before the offset moves, or Telegram redelivers it forever.
+            update_id = 0
+            try:
+                update_id = int(update.get("update_id", 0))
+                message = update.get("message") or update.get("edited_message") or {}
+                chat_id = str((message.get("chat") or {}).get("id", ""))
+                text = message.get("text") or ""
+                if text.startswith("/"):
+                    if chat_id not in _authorized_chat_ids():
+                        SYS_LOG.warning(
+                            "command_rejected reason=unauthorized_chat chat_id=%s cmd=%s",
+                            chat_id,
+                            text.split()[0],
+                        )
+                    else:
+                        APP_LOG.info(
+                            "command_received cmd=%s chat_id=%s", text.split()[0], chat_id
+                        )
+                        _dispatch_command(text, chat_id)
+            except Exception as exc:
+                SYS_LOG.error("command_update_failed detail=%s", exc)
             if update_id > STATE.telegram_update_offset:
                 STATE.telegram_update_offset = update_id
-        if updates:
-            STATE.save()
+                STATE.save()
         return True
     except Exception as exc:
         SYS_LOG.error("command_poll_failed detail=%s", exc)
