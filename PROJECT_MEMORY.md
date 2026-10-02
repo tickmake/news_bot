@@ -4,9 +4,10 @@ Last updated: 2026-10-02 (cleanup pass)
 
 ## Project at a glance
 
-Python Telegram news and market-briefing bot. `news_bot.py` contains the
-application, scheduling, command handlers, market/news collection, and report
-generation. Settings are validated with Pydantic Settings. `test_news_bot.py`
+Python Telegram news and market-briefing bot. `news_bot.py` is a thin entry
+point; the application lives in the `newsbot/` package (one module per concern:
+config/state/logging, messaging, news and market data, the trade screener,
+backtest and reports, briefing, commands and startup). Settings are validated with Pydantic Settings. `test_news_bot.py`
 contains the `unittest` suite. Docker Compose is the deployment path, with
 SQLite-backed trade history persisted on its data volume.
 
@@ -52,7 +53,7 @@ above; a redeploy is pending. Open follow-ups live in GitHub issue #12.
 ## Useful project commands and files
 
 - Run tests: `python -m unittest -v`
-- Main implementation and command routing: `news_bot.py`
+- Entry point: `news_bot.py`; implementation and command routing: `newsbot/` (`commands.py` routes commands, `bot.py` starts the process)
 - Tests: `test_news_bot.py`
 - User/deployment documentation and configuration details: `README.md`
 - Example environment settings: `.env.example` (never put actual credentials in

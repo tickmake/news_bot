@@ -33,8 +33,16 @@ The bot is built in Python and scheduled with APScheduler.
 
 ## Project Structure
 
-- `news_bot.py` - main bot logic and scheduler
+- `news_bot.py` - entry point (`python news_bot.py`); the code lives in `newsbot/`
+- `newsbot/` - the application, one module per concern:
+  - `config`, `state`, `logsetup`, `util` - settings, persisted state and caches, banded logging, shared helpers
+  - `messaging` - Telegram and Slack delivery
+  - `news_feeds`, `market_data` - news collection and ranking; live quotes and price history
+  - `indicators`, `ranking`, `benchmarks`, `history_store`, `screener`, `charts` - the trade screener
+  - `backtest`, `backtest_reports` - the walk-forward engine and the `/performance` and `/diagnostics` reports
+  - `reports`, `briefing`, `commands`, `bot` - weekly picks and analysis, the briefing and scheduled jobs, command routing and polling, startup
 - `test_news_bot.py` - unit tests
+- `evaluation_universe.csv` - the fixed `broad-v1` evaluation basket
 - `requirements.txt` - Python dependencies
 - `Dockerfile` - container image definition
 - `docker-compose.yml` - service orchestration

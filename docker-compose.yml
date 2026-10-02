@@ -66,7 +66,7 @@ services:
       # empty until enough sessions re-accumulate.
       - news_bot_data:/app/data
     # The image carries no .env of its own (the Dockerfile copies only
-    # requirements.txt and news_bot.py), and the explicit `environment` list
+    # requirements.txt, news_bot.py, newsbot/ and evaluation_universe.csv), and the explicit `environment` list
     # below is an allowlist -- so every setting missing from it was simply
     # unset in the container. That is how the configured stock universes
     # (USA_/INDIA_/NORWAY_/EU_STOCK_UNIVERSE and the mutual-fund lists) never
@@ -91,7 +91,7 @@ services:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       # Slack mirror. The image has no .env of its own (the Dockerfile copies
-      # only requirements.txt and news_bot.py), so anything absent from this
+      # only requirements.txt, news_bot.py, newsbot/ and evaluation_universe.csv), so anything absent from this
       # list is simply unset in the container -- and an unset webhook makes
       # send_slack_message() return early without logging, so the mirror goes
       # silently dead rather than erroring.
