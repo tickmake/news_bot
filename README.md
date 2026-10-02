@@ -318,9 +318,6 @@ universe variables above).
 
 ### Trade Risk Controls
 
-- `TRADE_MIN_SCORE` - **deprecated and ignored.** Candidates now pass mandatory
-  gates rather than reaching a score threshold. Setting it logs a warning at
-  startup.
 - `TRADE_MIN_WEEK_MOMENTUM_PCT`
 - `TRADE_MIN_DAY_CHANGE_PCT`
 - `TRADE_MIN_VOLUME_RATIO` - threshold for the `✓` volume-confirmation marker,

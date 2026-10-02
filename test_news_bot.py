@@ -3190,25 +3190,6 @@ class TradeRenderingTests(unittest.TestCase):
         self.assertIn("reward:risk 1.0:1", result)
 
 
-class DeprecatedSettingTests(unittest.TestCase):
-    def test_warns_when_trade_min_score_is_customised(self):
-        with patch.object(news_bot.SETTINGS, "trade_min_score", 5):
-            with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
-                news_bot._warn_deprecated_settings()
-        self.assertTrue(any("TRADE_MIN_SCORE" in line for line in logs.output))
-
-    def test_silent_at_default_value(self):
-        default = news_bot.AppSettings.model_fields["trade_min_score"].default
-        with patch.object(news_bot.SETTINGS, "trade_min_score", default):
-            with patch.object(news_bot.LOGGER, "warning") as mock_warn:
-                news_bot._warn_deprecated_settings()
-        mock_warn.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TradeChecksHeadingTests(unittest.TestCase):
     """The checks heading must not claim candidates passed when none did."""
 
