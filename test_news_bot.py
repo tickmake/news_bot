@@ -5,6 +5,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -426,6 +427,101 @@ class SlackIntegrationTests(unittest.TestCase):
         self.assertEqual(params["timeout"], 25)
         # Read timeout must outlast the server-side hold.
         self.assertGreater(mock_get.call_args.kwargs["timeout"], 25)
+
+
+class TelegramPollerHardeningTests(unittest.TestCase):
+    def _updates(self, *items):
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"result": list(items)}
+        return response
+
+    @staticmethod
+    def _update(update_id, chat_id, text):
+        return {"update_id": update_id, "message": {"chat": {"id": chat_id}, "text": text}}
+
+    def _poll(self, *items):
+        with patch("news_bot.requests.get", return_value=self._updates(*items)), patch.object(
+            news_bot.SETTINGS, "telegram_token", "token"
+        ), patch.object(news_bot.SETTINGS, "command_poll_enabled", True), patch.object(
+            news_bot.SETTINGS, "telegram_chat_id", "42"
+        ), patch.object(news_bot.SETTINGS, "health_ping_chat_id", None), patch.object(
+            news_bot.STATE, "save"
+        ):
+            news_bot.STATE.telegram_update_offset = 0
+            return news_bot.poll_telegram_commands()
+
+    @patch("news_bot._dispatch_command")
+    def test_unauthorized_chat_is_ignored_but_offset_advances(self, dispatch):
+        self.assertTrue(self._poll(self._update(7, 999, "/performance")))
+        dispatch.assert_not_called()
+        self.assertEqual(news_bot.STATE.telegram_update_offset, 7)
+
+    @patch("news_bot._dispatch_command")
+    def test_authorized_chat_is_dispatched(self, dispatch):
+        self._poll(self._update(8, 42, "/health"))
+        dispatch.assert_called_once_with("/health", "42")
+
+    @patch("news_bot._dispatch_command")
+    def test_failing_update_does_not_block_offset_or_batch(self, dispatch):
+        dispatch.side_effect = [RuntimeError("boom"), None]
+        self.assertTrue(
+            self._poll(self._update(1, 42, "/now"), self._update(2, 42, "/health"))
+        )
+        self.assertEqual(dispatch.call_count, 2)
+        self.assertEqual(news_bot.STATE.telegram_update_offset, 2)
+
+    def test_slow_command_does_not_block_the_poller(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow(command, chat_id):
+            started.set()
+            release.wait(5)
+
+        with patch("news_bot._handle_command", side_effect=slow), patch(
+            "news_bot.send_telegram_message"
+        ) as send:
+            news_bot._dispatch_command("/performance", "42")
+            self.assertTrue(started.wait(2))
+            # Identical command while running is refused, not queued.
+            news_bot._dispatch_command("/performance", "42")
+            self.assertIn("already running", send.call_args.args[0])
+            release.set()
+            for _ in range(100):
+                with news_bot._COMMANDS_LOCK:
+                    if not news_bot._COMMANDS_IN_FLIGHT:
+                        break
+                time.sleep(0.02)
+            self.assertFalse(news_bot._COMMANDS_IN_FLIGHT)
+
+    def test_command_failure_is_reported_and_releases_slot(self):
+        with patch("news_bot._handle_command", side_effect=RuntimeError("x")), patch(
+            "news_bot.send_telegram_message"
+        ) as send:
+            news_bot._run_command_safely("/now", "42", "/now", ("42", "/now"))
+        self.assertIn("failed", send.call_args.args[0])
+        self.assertFalse(news_bot._COMMANDS_IN_FLIGHT)
+
+    def test_screen_deadline_abandons_a_hung_fetch(self):
+        release = threading.Event()
+
+        def hang(symbol):
+            release.wait(10)
+            return None
+
+        began = time.time()
+        try:
+            with patch("news_bot._compute_trade_metrics", side_effect=hang), patch.object(
+                news_bot.SETTINGS, "trade_total_deadline_seconds", 1
+            ), patch.object(news_bot.SETTINGS, "trade_fetch_workers", 2), patch.object(
+                news_bot.TRADE_HISTORY, "prune"
+            ):
+                outcome, _ = news_bot._screen_universe([("A", "A"), ("B", "B")])
+        finally:
+            release.set()
+        self.assertTrue(outcome.deadline_hit)
+        self.assertLess(time.time() - began, 8)  # deadline floor is 5s; the hang lasts 10s
 
 
 class FeedDateParsingTests(unittest.TestCase):
