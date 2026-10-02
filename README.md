@@ -630,6 +630,14 @@ stops. Holdout results are also broken down by benchmark market and signal
 quarter, including benchmark coverage. Excess return is calculated only on the
 matched subset; unmatched trades are not counted as benchmark wins.
 
+**Baseline:** the report also holds *every* liquid stock on every signal date
+with no gates, using the same next-open entry, fixed-session exit, costs,
+holdout purge and benchmark matching. It then pairs the screener against that
+baseline by signal date (each date weighted equally), for all qualifiers and
+for the top picks. This answers whether the gates beat simply holding a liquid
+stock, which the average return alone cannot. The comparison of the top picks
+against the other *qualifiers* lives in `/diagnostics`.
+
 **Validate before tuning:** the same report also evaluates unchanged picks in
 calendar-quarter blocks at the configured cost, plus 15 and 40 bps per side
 (defaults: 10, 25, and 50 bps per side). Costs are recalculated from gross returns;
