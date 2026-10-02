@@ -339,8 +339,8 @@ class AppSettings(BaseSettings):
     trade_backtest_holdout_start: str = ""
     trade_backtest_min_avg_volume: float = 100000.0
     trade_backtest_benchmarks: str = (
-        "DEFAULT:SPY,.NS:^NSEI,.BO:^BSESN,.OL:^OSEAX,.DE:^GDAXI,"
-        ".PA:^FCHI,.AS:^AEX,.MI:^FTSEMIB,.MC:^IBEX,.BR:^BFX,"
+        "DEFAULT:SPY,.NS:^NSEI,.BO:^BSESN,.OL:OSEBX.OL,.DE:^GDAXI,"
+        ".PA:^FCHI,.AS:^AEX,.MI:FTSEMIB.MI,.MC:^IBEX,.BR:^BFX,"
         ".L:^FTSE,.SW:^SSMI,.ST:^OMX,.CO:^OMXC25,.HE:^OMXH25"
     )
     trade_weekly_top_picks_lookback_days: int = 7

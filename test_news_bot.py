@@ -2295,6 +2295,17 @@ class WalkForwardBacktestTests(unittest.TestCase):
             self.assertEqual(news_bot._backtest_benchmark_for("AAPL"), "SPY")
             self.assertIsNone(news_bot._backtest_benchmark_for("ABC.T"))
 
+    def test_default_benchmarks_use_symbols_yahoo_serves(self):
+        # ^FTSEMIB and ^OSEAX return no price data from Yahoo, which silently
+        # zeroed benchmark coverage for Italy and Norway. Yahoo serves these
+        # two as plain exchange-suffixed tickers instead.
+        default = news_bot.AppSettings.model_fields["trade_backtest_benchmarks"].default
+        with patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", default):
+            self.assertEqual(news_bot._backtest_benchmark_for("ENI.MI"), "FTSEMIB.MI")
+            self.assertEqual(news_bot._backtest_benchmark_for("EQNR.OL"), "OSEBX.OL")
+        self.assertNotIn("^FTSEMIB", default)
+        self.assertNotIn("^OSEAX", default)
+
     def test_performance_loader_fetches_configured_symbols_and_benchmarks(self):
         data = {"AAA": self._rising_history(), "BENCH": self._rising_history(step=0.1)}
 
