@@ -524,6 +524,73 @@ class TelegramPollerHardeningTests(unittest.TestCase):
         self.assertLess(time.time() - began, 8)  # deadline floor is 5s; the hang lasts 10s
 
 
+class HeartbeatHealthcheckTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patches = [
+            patch.object(news_bot.SETTINGS, "state_file", os.path.join(self._tmp.name, "state.json")),
+            patch.object(news_bot.SETTINGS, "telegram_token", "token"),
+            patch.object(news_bot.SETTINGS, "command_poll_enabled", True),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_missing_heartbeats_are_reported(self):
+        problems = news_bot.heartbeat_problems()
+        self.assertIn("scheduler: no heartbeat", problems)
+        self.assertIn("poller: no heartbeat", problems)
+
+    def test_fresh_heartbeats_are_healthy_and_live_beside_the_state_file(self):
+        news_bot._touch_heartbeat("scheduler")
+        news_bot._touch_heartbeat("poller")
+        self.assertEqual(news_bot.heartbeat_problems(), [])
+        self.assertEqual(
+            os.path.dirname(news_bot._heartbeat_path("poller")), self._tmp.name
+        )
+
+    def test_stale_poller_is_unhealthy_even_with_a_live_scheduler(self):
+        news_bot._touch_heartbeat("scheduler")
+        news_bot._touch_heartbeat("poller")
+        future = time.time() + news_bot.HEARTBEAT_MAX_AGE_SECONDS["poller"] + 5
+        problems = news_bot.heartbeat_problems(now=future)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("poller: last beat"))
+
+    def test_poller_not_required_when_command_polling_is_off(self):
+        news_bot._touch_heartbeat("scheduler")
+        with patch.object(news_bot.SETTINGS, "command_poll_enabled", False):
+            self.assertEqual(news_bot.heartbeat_problems(), [])
+
+    def test_run_healthcheck_exit_status(self):
+        with patch("builtins.print"):
+            self.assertEqual(news_bot.run_healthcheck(), 1)
+            news_bot._touch_heartbeat("scheduler")
+            news_bot._touch_heartbeat("poller")
+            self.assertEqual(news_bot.run_healthcheck(), 0)
+
+    def test_heartbeat_write_failure_does_not_raise(self):
+        with patch("builtins.open", side_effect=OSError("disk full")):
+            news_bot._touch_heartbeat("scheduler")
+
+    def test_poll_loop_beats_only_after_a_successful_poll(self):
+        stop = threading.Event()
+        results = iter([True, False])
+
+        def fake_poll(long_poll_timeout=0):
+            outcome = next(results)
+            if not outcome:
+                stop.set()
+            return outcome
+
+        with patch("news_bot.poll_telegram_commands", side_effect=fake_poll), patch(
+            "news_bot._touch_heartbeat"
+        ) as touch:
+            news_bot.run_command_long_polling_loop(stop)
+        touch.assert_called_once_with("poller")
+
+
 class FeedDateParsingTests(unittest.TestCase):
     def test_parses_rfc2822_pubdate(self):
         parsed = news_bot._parse_feed_datetime("Thu, 13 Aug 2026 04:55:58 GMT")

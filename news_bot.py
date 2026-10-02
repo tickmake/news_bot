@@ -5303,6 +5303,59 @@ def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
         return False
 
 
+# How old a heartbeat may get before the container reports unhealthy. The
+# scheduler allowance is generous because a briefing holds a scheduler worker
+# for minutes (the LLM ranker alone can take 240s); the poller beats every
+# long-poll cycle, so a short allowance still tolerates retries.
+HEARTBEAT_MAX_AGE_SECONDS: Dict[str, int] = {"scheduler": 900, "poller": 300}
+
+
+def _heartbeat_path(name: str) -> str:
+    directory = os.path.dirname(os.path.abspath(SETTINGS.state_file)) or "."
+    return os.path.join(directory, f".news_bot_heartbeat_{name}")
+
+
+def _touch_heartbeat(name: str) -> None:
+    """Record that a loop is alive. Never raises: a full disk must not kill it."""
+    try:
+        with open(_heartbeat_path(name), "w", encoding="utf-8") as file_obj:
+            file_obj.write(str(time.time()))
+    except OSError as exc:
+        SYS_LOG.debug("heartbeat_write_failed name=%s detail=%s", name, exc)
+
+
+def heartbeat_problems(now: Optional[float] = None) -> List[str]:
+    """Reasons the bot looks hung or dead; empty means healthy.
+
+    A running process is not enough: a poller thread that died, or a scheduler
+    wedged behind a stuck job, leaves the container "up" while doing nothing.
+    """
+    current = time.time() if now is None else now
+    required = ["scheduler"]
+    if SETTINGS.command_poll_enabled and SETTINGS.telegram_token:
+        required.append("poller")
+    problems: List[str] = []
+    for name in required:
+        try:
+            age = current - os.path.getmtime(_heartbeat_path(name))
+        except OSError:
+            problems.append(f"{name}: no heartbeat")
+            continue
+        if age > HEARTBEAT_MAX_AGE_SECONDS[name]:
+            problems.append(f"{name}: last beat {age:.0f}s ago")
+    return problems
+
+
+def run_healthcheck() -> int:
+    """Exit status for `python news_bot.py --healthcheck` (Docker HEALTHCHECK)."""
+    problems = heartbeat_problems()
+    if problems:
+        print("unhealthy: " + "; ".join(problems))
+        return 1
+    print("healthy")
+    return 0
+
+
 def run_command_long_polling_loop(stop_event: Optional[threading.Event] = None) -> None:
     """Continuously long-poll Telegram for commands until stopped.
 
@@ -5312,6 +5365,10 @@ def run_command_long_polling_loop(stop_event: Optional[threading.Event] = None) 
     timeout = max(1, SETTINGS.command_long_poll_timeout_seconds)
     while stop_event is None or not stop_event.is_set():
         ok = poll_telegram_commands(long_poll_timeout=timeout)
+        if ok:
+            # Only a successful poll counts: an unreachable Telegram for
+            # minutes should show as unhealthy, not hide behind a live thread.
+            _touch_heartbeat("poller")
         if not ok:
             # Back off briefly on failure so we do not hammer the API.
             if stop_event is not None:
@@ -5355,6 +5412,9 @@ def get_missing_required_config() -> Iterable[str]:
 
 
 if __name__ == "__main__":
+    if "--healthcheck" in sys.argv[1:]:
+        raise SystemExit(run_healthcheck())
+
     missing_values = list(get_missing_required_config())
     if missing_values:
         print("Missing required environment variables: " + ", ".join(missing_values) + ".")
@@ -5371,6 +5431,8 @@ if __name__ == "__main__":
     )
     scheduler.add_job(job_daily_briefing, "cron", hour="7,19", minute=0)
     scheduler.add_job(job_health_ping, "cron", hour=12, minute=0)
+    scheduler.add_job(_touch_heartbeat, "interval", minutes=1, args=["scheduler"])
+    _touch_heartbeat("scheduler")
 
     command_stop_event = threading.Event()
     command_thread: Optional[threading.Thread] = None
