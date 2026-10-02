@@ -2314,6 +2314,39 @@ class WalkForwardBacktestTests(unittest.TestCase):
         self.assertGreater(summary["trade_count"], 0)
         self.assertEqual(summary["benchmark_count"], summary["trade_count"])
 
+    def test_baseline_holds_every_liquid_stock_not_just_qualifiers(self):
+        result = news_bot._walk_forward_backtest(
+            {"UP": self._rising_history(), "DOWN": self._rising_history(step=-0.4)},
+            {}, horizon_sessions=5, top_n=1,
+        )
+        # Only the riser ever passes the gates; the faller must still be held
+        # by the baseline, or it would not be a no-gates comparison.
+        self.assertEqual({trade["symbol"] for trade in result["all_trades"]}, {"UP"})
+        for cohort in ("development", "holdout"):
+            baseline = result["baseline"][cohort]
+            self.assertEqual(baseline["stats"]["symbol_count"], 2)
+            pairing = baseline["qualifiers_vs_baseline"]
+            self.assertGreater(pairing["paired_dates"], 0)
+            self.assertGreater(pairing["mean_delta_pp"], 0)
+            self.assertEqual(pairing["better_pct"], 100.0)
+
+    def test_baseline_obeys_the_holdout_purge_and_liquidity_filter(self):
+        histories = {"UP": self._rising_history(), "DOWN": self._rising_history(step=-0.4)}
+        dates = histories["UP"].index.strftime("%Y-%m-%d").tolist()
+        split = dates[60]
+        result = news_bot._walk_forward_backtest(
+            histories, {}, horizon_sessions=5, holdout_start=split,
+        )
+        development = result["baseline"]["development"]["stats"]
+        # A hold that would cross into the holdout is dropped, not truncated.
+        self.assertLess(development["signal_end"], split)
+        self.assertGreater(result["purged_outcomes"], 0)
+        illiquid = news_bot._walk_forward_backtest(
+            histories, {}, horizon_sessions=5, min_avg_volume=10_000_000.0,
+        )
+        for cohort in ("development", "holdout"):
+            self.assertEqual(illiquid["baseline"][cohort]["stats"]["trade_count"], 0)
+
     def test_walk_forward_report_discloses_overlap_and_universe_bias(self):
         result = news_bot._walk_forward_backtest(
             {"AAA": self._rising_history()},
@@ -2338,6 +2371,8 @@ class WalkForwardBacktestTests(unittest.TestCase):
         self.assertIn("survivorship/universe bias", report)
         self.assertIn("Unchanged-rule validation", report)
         self.assertIn("Cost 25 bps per side", report)
+        self.assertIn("Baseline: every liquid stock, no gates", report)
+        self.assertIn("qualifiers vs baseline:", report)
         self.assertIn("Cost 50 bps per side", report)
         self.assertIn("not independent folds or fresh validation", report)
 

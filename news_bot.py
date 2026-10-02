@@ -2921,6 +2921,39 @@ def _backtest_cost_validation(
     }
 
 
+def _backtest_baseline_summary(
+    baseline: List[Dict[str, Any]], qualifiers: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Every liquid stock with no gates, and how the screener compares to it.
+
+    The paired delta is by signal date with each date weighted equally, over
+    dates that have both a baseline and at least one qualifier (or selected
+    pick), so a busy date cannot dominate. Positive favours the screener.
+    """
+    def by_date(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+        grouped: Dict[str, List[float]] = {}
+        for trade in rows:
+            grouped.setdefault(trade["signal_session"], []).append(trade["net_return_pct"])
+        return {date: statistics.mean(values) for date, values in grouped.items()}
+
+    base_by_date = by_date(baseline)
+
+    def paired(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        mine = by_date(rows)
+        deltas = [mine[date] - base_by_date[date] for date in mine if date in base_by_date]
+        return {
+            "paired_dates": len(deltas),
+            "mean_delta_pp": statistics.mean(deltas) if deltas else None,
+            "better_pct": sum(delta > 0 for delta in deltas) / len(deltas) * 100.0 if deltas else None,
+        }
+
+    return {
+        "stats": _summarize_backtest_trades(baseline),
+        "qualifiers_vs_baseline": paired(qualifiers),
+        "top_vs_baseline": paired([trade for trade in qualifiers if trade["selected"]]),
+    }
+
+
 def _walk_forward_backtest(
     histories: Dict[str, Any],
     benchmark_histories: Dict[str, Any],
@@ -2994,10 +3027,72 @@ def _walk_forward_backtest(
     if not split and signal_dates:
         split = signal_dates[min(len(signal_dates) - 1, int(len(signal_dates) * 0.75))]
     trades: List[Dict[str, Any]] = []
+    baseline_trades: List[Dict[str, Any]] = []
     liquidity_rejected = 0
     pending_outcomes = 0
     purged_outcomes = 0
     transaction_cost_pct = 2.0 * cost_bps_per_side / 100.0
+
+    def _simulate(metrics: TradeMetrics, signal_session: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """One hold from a signal: ("ok", trade) or ("pending"|"purged"|"skip", None).
+
+        Shared by the screener's qualifiers and the no-gates baseline so both
+        are measured with identical entry, exit, cost, purge and benchmark rules.
+        """
+        frame = frames[metrics.symbol]
+        signal_position = session_positions[metrics.symbol].get(signal_session)
+        if signal_position is None:
+            return "skip", None
+        entry_position = signal_position + 1
+        exit_position = signal_position + horizon_sessions
+        if exit_position >= len(frame):
+            return "pending", None
+        entry_row, exit_row = frame.iloc[entry_position], frame.iloc[exit_position]
+        entry_price = float(entry_row["Open"])
+        exit_price = float(exit_row["Close"])
+        if (
+            not math.isfinite(entry_price)
+            or not math.isfinite(exit_price)
+            or entry_price <= 0
+            or exit_price <= 0
+        ):
+            return "skip", None
+        gross_return = (exit_price / entry_price - 1.0) * 100.0
+        net_return = gross_return - transaction_cost_pct
+        entry_date = frame.index[entry_position].strftime("%Y-%m-%d")
+        exit_date = frame.index[exit_position].strftime("%Y-%m-%d")
+        # Development returns must not include prices from the reserved
+        # holdout. Warm-up features may legitimately use earlier bars.
+        if split and signal_session < split <= exit_date:
+            return "purged", None
+        benchmark_symbol = _backtest_benchmark_for(metrics.symbol)
+        benchmark = benchmark_frames.get(benchmark_symbol or "")
+        benchmark_return = _matched_benchmark_return(
+            benchmark, entry_date, exit_date,
+            benchmark_positions.get(benchmark_symbol or ""),
+        )
+        return "ok", {
+            "symbol": metrics.symbol,
+            "cohort": "holdout" if split and signal_session >= split else "development",
+            "market": benchmark_symbol or f"unmapped:{metrics.symbol.rsplit('.', 1)[-1]}",
+            "quarter": f"{signal_session[:4]}-Q{(int(signal_session[5:7]) - 1) // 3 + 1}",
+            "signal_session": signal_session,
+            "entry_session": entry_date,
+            "exit_session": exit_date,
+            "gross_return_pct": gross_return,
+            "net_return_pct": net_return,
+            "adverse_excursion_pct": min(
+                0.0,
+                (float(frame.iloc[entry_position:exit_position + 1]["Low"].min())
+                 / entry_price - 1.0) * 100.0,
+            ),
+            "benchmark_symbol": benchmark_symbol,
+            "benchmark_return_pct": benchmark_return,
+            "excess_return_pct": (
+                net_return - benchmark_return if benchmark_return is not None else None
+            ),
+        }
+
     for signal_session in sorted(metrics_by_day):
         qualifiers = [
             metrics for metrics in metrics_by_day[signal_session] if not _failed_gates(metrics)
@@ -3012,43 +3107,15 @@ def _walk_forward_backtest(
             )
         )
         for rank, metrics in enumerate(candidates, 1):
-            frame = frames[metrics.symbol]
-            signal_position = session_positions[metrics.symbol].get(signal_session)
-            if signal_position is None:
-                continue
-            entry_position = signal_position + 1
-            exit_position = signal_position + horizon_sessions
-            if exit_position >= len(frame):
+            status, trade = _simulate(metrics, signal_session)
+            if status == "pending":
                 pending_outcomes += 1
-                continue
-            entry_row, exit_row = frame.iloc[entry_position], frame.iloc[exit_position]
-            entry_price = float(entry_row["Open"])
-            exit_price = float(exit_row["Close"])
-            if (
-                not math.isfinite(entry_price)
-                or not math.isfinite(exit_price)
-                or entry_price <= 0
-                or exit_price <= 0
-            ):
-                continue
-            gross_return = (exit_price / entry_price - 1.0) * 100.0
-            net_return = gross_return - transaction_cost_pct
-            entry_date = frame.index[entry_position].strftime("%Y-%m-%d")
-            exit_date = frame.index[exit_position].strftime("%Y-%m-%d")
-            # Development returns must not include prices from the reserved
-            # holdout. Warm-up features may legitimately use earlier bars.
-            if split and signal_session < split <= exit_date:
+            elif status == "purged":
                 purged_outcomes += 1
+            if trade is None:
                 continue
-            benchmark_symbol = _backtest_benchmark_for(metrics.symbol)
-            benchmark = benchmark_frames.get(benchmark_symbol or "")
-            benchmark_return = _matched_benchmark_return(
-                benchmark, entry_date, exit_date,
-                benchmark_positions.get(benchmark_symbol or ""),
-            )
-            trades.append(
+            trade.update(
                 {
-                    "symbol": metrics.symbol,
                     "rank": rank,
                     "qualifier_count": len(candidates),
                     "signal_metrics": {
@@ -3059,28 +3126,18 @@ def _walk_forward_backtest(
                     },
                     "qualifying_streak": streak_by_signal[(signal_session, metrics.symbol)],
                     "selected": rank <= top_n,
-                    "cohort": "holdout" if split and signal_session >= split else "development",
-                    "market": benchmark_symbol or f"unmapped:{metrics.symbol.rsplit('.', 1)[-1]}",
-                    "quarter": f"{signal_session[:4]}-Q{(int(signal_session[5:7]) - 1) // 3 + 1}",
-                    "signal_session": signal_session,
-                    "entry_session": entry_date,
-                    "exit_session": exit_date,
-                    "gross_return_pct": gross_return,
-                    "net_return_pct": net_return,
-                    "adverse_excursion_pct": min(
-                        0.0,
-                        (float(frame.iloc[entry_position:exit_position + 1]["Low"].min())
-                         / entry_price - 1.0) * 100.0,
-                    ),
-                    "benchmark_symbol": benchmark_symbol,
-                    "benchmark_return_pct": benchmark_return,
-                    "excess_return_pct": (
-                        net_return - benchmark_return
-                        if benchmark_return is not None
-                        else None
-                    ),
                 }
             )
+            trades.append(trade)
+
+        # No-gates baseline: every liquid stock on the date, qualifier or not.
+        for metrics in metrics_by_day[signal_session]:
+            if not liquidity_by_session[(signal_session, metrics.symbol)]:
+                continue
+            _, trade = _simulate(metrics, signal_session)
+            if trade is not None:
+                trade["selected"] = False
+                baseline_trades.append(trade)
 
     selected_trades = [trade for trade in trades if trade["selected"]]
     return {
@@ -3102,6 +3159,13 @@ def _walk_forward_backtest(
         "diagnostics": {
             cohort: _backtest_diagnostics(
                 [trade for trade in trades if trade["cohort"] == cohort]
+            )
+            for cohort in ("development", "holdout")
+        },
+        "baseline": {
+            cohort: _backtest_baseline_summary(
+                [trade for trade in baseline_trades if trade["cohort"] == cohort],
+                [trade for trade in trades if trade["cohort"] == cohort],
             )
             for cohort in ("development", "holdout")
         },
@@ -4623,6 +4687,43 @@ def build_trade_diagnostics_report() -> str:
     return "\n".join(lines)
 
 
+def _render_baseline(summary: Dict[str, Any]) -> List[str]:
+    """Compare the screener with holding any liquid stock, ungated."""
+    def percentage(value: Optional[float]) -> str:
+        return f"{value:+.2f}%" if value is not None else "n/a"
+
+    def delta(pairing: Dict[str, Any]) -> str:
+        if not pairing["paired_dates"]:
+            return "no paired dates"
+        return (
+            f"{pairing['mean_delta_pp']:+.2f} pp across {pairing['paired_dates']} dates, "
+            f"better on {pairing['better_pct']:.0f}%"
+        )
+
+    lines = [
+        "<b>Baseline: every liquid stock, no gates</b>",
+        "Same entry, exit, costs and holdout purge. Dates weighted equally; "
+        "positive favours the screener.",
+    ]
+    for key, label in (("development", "Development"), ("holdout", "Reserved holdout")):
+        block = summary["baseline"][key]
+        stats = block["stats"]
+        if not stats["trade_count"]:
+            lines.append(f"    {label}: no completed baseline trades.")
+            continue
+        lines.extend([
+            f"    <b>{label}</b>: {stats['trade_count']} stock-days / "
+            f"{stats['signal_days']} dates / {stats['symbol_count']} stocks",
+            f"    avg net {percentage(stats['avg_net_return_pct'])} · "
+            f"median {percentage(stats['median_net_return_pct'])} · "
+            f"hit rate {stats['hit_rate_pct']:.0f}% · "
+            f"excess {percentage(stats['avg_excess_return_pct'])}",
+            f"    qualifiers vs baseline: {delta(block['qualifiers_vs_baseline'])}",
+            f"    top {summary['top_n']} vs baseline: {delta(block['top_vs_baseline'])}",
+        ])
+    return lines
+
+
 def build_trade_performance_report(
     horizon_sessions: Optional[int] = None,
 ) -> str:
@@ -4680,6 +4781,9 @@ def build_trade_performance_report(
         lines.append(f"<b>{label}</b>")
         lines.extend(_render_backtest_comparison(comparison, summary["top_n"]))
         lines.append("")
+
+    lines.extend(_render_baseline(summary))
+    lines.append("")
 
     holdout = summary["cohorts"]["holdout"]
     for dimension in ("market", "sector"):
