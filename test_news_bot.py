@@ -14,7 +14,29 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-import news_bot
+import requests
+import yfinance  # noqa: F401  (patched by dotted path)
+
+from newsbot import (
+    backtest as nb_backtest,
+    backtest_reports as nb_backtest_reports,
+    benchmarks as nb_benchmarks,
+    briefing as nb_briefing,
+    charts as nb_charts,
+    commands as nb_commands,
+    config as nb_config,
+    history_store as nb_history_store,
+    indicators as nb_indicators,
+    logsetup as nb_logsetup,
+    market_data as nb_market_data,
+    messaging as nb_messaging,
+    news_feeds as nb_news_feeds,
+    ranking as nb_ranking,
+    reports as nb_reports,
+    screener as nb_screener,
+    state as nb_state,
+    util as nb_util,
+)
 
 
 def setUpModule():
@@ -24,39 +46,39 @@ def setUpModule():
     # the whole test run so tests never touch (or depend on) a real
     # `.news_bot_trade_history.db` in the working directory.
     global _ORIGINAL_TRADE_HISTORY
-    _ORIGINAL_TRADE_HISTORY = news_bot.TRADE_HISTORY
-    news_bot.TRADE_HISTORY = news_bot.TradeHistoryStore(
+    _ORIGINAL_TRADE_HISTORY = nb_history_store.TRADE_HISTORY
+    nb_history_store.TRADE_HISTORY = nb_history_store.TradeHistoryStore(
         os.path.join(tempfile.mkdtemp(), "test_trade_history.db")
     )
 
 
 def tearDownModule():
-    news_bot.TRADE_HISTORY.close()
-    news_bot.TRADE_HISTORY = _ORIGINAL_TRADE_HISTORY
+    nb_history_store.TRADE_HISTORY.close()
+    nb_history_store.TRADE_HISTORY = _ORIGINAL_TRADE_HISTORY
 
 
 class NewsBotTests(unittest.TestCase):
     def test_daily_pick_is_deterministic_for_context_and_day(self):
-        picked_1 = news_bot._daily_pick(["a", "b", "c"], "ctx", "2026-06-01")
-        picked_2 = news_bot._daily_pick(["a", "b", "c"], "ctx", "2026-06-01")
+        picked_1 = nb_util._daily_pick(["a", "b", "c"], "ctx", "2026-06-01")
+        picked_2 = nb_util._daily_pick(["a", "b", "c"], "ctx", "2026-06-01")
         self.assertEqual(picked_1, picked_2)
 
     def test_build_daily_intro_morning_contains_quote(self):
-        with patch.object(news_bot.SETTINGS, "recipient_name", "Sunil"):
-            intro = news_bot.build_daily_intro(datetime(2026, 6, 1, 7, 0))
+        with patch.object(nb_config.SETTINGS, "recipient_name", "Sunil"):
+            intro = nb_briefing.build_daily_intro(datetime(2026, 6, 1, 7, 0))
         self.assertIn("Quote of the day", intro)
         self.assertIn("2026-06-01", intro)
         self.assertIn("Hello, Sunil!", intro)
 
     def test_build_daily_intro_evening_contains_evening_message(self):
-        with patch.object(news_bot.SETTINGS, "recipient_name", "Sunil"):
-            intro = news_bot.build_daily_intro(datetime(2026, 6, 1, 19, 0))
+        with patch.object(nb_config.SETTINGS, "recipient_name", "Sunil"):
+            intro = nb_briefing.build_daily_intro(datetime(2026, 6, 1, 19, 0))
         self.assertNotIn("Quote of the day", intro)
         self.assertIn("2026-06-01", intro)
         self.assertIn("Hello, Sunil!", intro)
 
     def test_parse_instrument_env_parses_label_symbol_pairs(self):
-        parsed = news_bot._parse_instrument_env(
+        parsed = nb_config._parse_instrument_env(
             "Apple:AAPL, Microsoft:MSFT, TSLA",
             {"Fallback": "FALL"},
         )
@@ -66,21 +88,21 @@ class NewsBotTests(unittest.TestCase):
 
     def test_parse_instrument_env_uses_fallback_for_invalid_or_empty(self):
         fallback = {"Fallback": "FALL"}
-        parsed_empty = news_bot._parse_instrument_env("", fallback)
-        parsed_invalid = news_bot._parse_instrument_env(" , : , : ", fallback)
+        parsed_empty = nb_config._parse_instrument_env("", fallback)
+        parsed_invalid = nb_config._parse_instrument_env(" , : , : ", fallback)
         self.assertEqual(parsed_empty, fallback)
         self.assertEqual(parsed_invalid, fallback)
 
-    @patch("news_bot._compute_trade_metrics")
+    @patch("newsbot.indicators._compute_trade_metrics")
     def test_get_trade_candidates_formats_ranked_output(self, mock_metrics):
         def side_effect(symbol):
             data = {
-                "AAA": news_bot.TradeMetrics(
+                "AAA": nb_indicators.TradeMetrics(
                     symbol="AAA", session="2026-08-13", last_close=100.0,
                     day_change_pct=1.2, week_momentum_pct=3.5, volume_ratio=1.6,
                     drawdown_pct=2.1, atr_pct=1.4, above_ema20=True,
                 ),
-                "BBB": news_bot.TradeMetrics(
+                "BBB": nb_indicators.TradeMetrics(
                     symbol="BBB", session="2026-08-13", last_close=80.0,
                     day_change_pct=0.4, week_momentum_pct=2.1, volume_ratio=1.3,
                     drawdown_pct=3.0, atr_pct=2.0, above_ema20=True,
@@ -91,7 +113,7 @@ class NewsBotTests(unittest.TestCase):
 
         mock_metrics.side_effect = side_effect
 
-        result = news_bot.get_trade_candidates(
+        result = nb_screener.get_trade_candidates(
             universe={"Alpha": "AAA", "Beta": "BBB", "Gamma": "CCC"},
             top_n=2,
         )
@@ -105,15 +127,15 @@ class NewsBotTests(unittest.TestCase):
         self.assertIn("Not investment advice.", result)
         self.assertIn("No guarantee of profit.", result)
 
-    @patch("news_bot._compute_trade_metrics")
+    @patch("newsbot.indicators._compute_trade_metrics")
     def test_get_trade_candidates_no_matches(self, mock_metrics):
         mock_metrics.return_value = None
-        result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=2)
+        result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=2)
         self.assertIn("No stock passed all five checks.", result)
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_get_global_news_success(self, mock_get):
-        news_bot.STATE.data["sent_headline_keys"] = {}
+        nb_state.STATE.data["sent_headline_keys"] = {}
         mock_response = MagicMock()
         mock_response.text = (
             "<rss><channel>"
@@ -126,20 +148,20 @@ class NewsBotTests(unittest.TestCase):
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
-            news_bot.SETTINGS, "freenews_api_key", ""
-        ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
-            news_bot.SETTINGS, "news_ranker_enabled", False
+        with patch.object(nb_config.SETTINGS, "news_api_key", ""), patch.object(
+            nb_config.SETTINGS, "freenews_api_key", ""
+        ), patch.object(nb_config.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            nb_config.SETTINGS, "news_ranker_enabled", False
         ), patch.object(
-            news_bot, "_source_allowed", return_value=True
+            nb_news_feeds, "_source_allowed", return_value=True
         ):
-            result, _ = news_bot.get_global_news()
+            result, _ = nb_news_feeds.get_global_news()
 
         self.assertIn("Top Global News", result)
         self.assertIn("Fed holds interest rates steady", result)
         self.assertIn("https://example.com/2", result)
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_get_global_news_without_news_api_key_still_works(self, mock_get):
         mock_response = MagicMock()
         mock_response.text = (
@@ -149,17 +171,17 @@ class NewsBotTests(unittest.TestCase):
         )
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
-            news_bot.SETTINGS, "freenews_api_key", ""
-        ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
-            news_bot.SETTINGS, "news_ranker_enabled", False
+        with patch.object(nb_config.SETTINGS, "news_api_key", ""), patch.object(
+            nb_config.SETTINGS, "freenews_api_key", ""
+        ), patch.object(nb_config.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            nb_config.SETTINGS, "news_ranker_enabled", False
         ), patch.object(
-            news_bot, "_source_allowed", return_value=True
+            nb_news_feeds, "_source_allowed", return_value=True
         ):
-            result, _ = news_bot.get_global_news()
+            result, _ = nb_news_feeds.get_global_news()
         self.assertIn("Public headline", result)
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_get_norwegian_morning_news_success(self, mock_get):
         mock_response = MagicMock()
         mock_response.text = (
@@ -170,22 +192,22 @@ class NewsBotTests(unittest.TestCase):
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot.SETTINGS, "news_api_key", ""), patch.object(
-            news_bot.SETTINGS, "freenews_api_key", ""
-        ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
-            news_bot.SETTINGS, "news_ranker_enabled", False
+        with patch.object(nb_config.SETTINGS, "news_api_key", ""), patch.object(
+            nb_config.SETTINGS, "freenews_api_key", ""
+        ), patch.object(nb_config.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            nb_config.SETTINGS, "news_ranker_enabled", False
         ), patch.object(
-            news_bot, "_source_allowed", return_value=True
+            nb_news_feeds, "_source_allowed", return_value=True
         ):
-            result, _ = news_bot.get_norwegian_morning_news()
+            result, _ = nb_news_feeds.get_norwegian_morning_news()
 
         self.assertIn("Early Morning Norway News", result)
         self.assertIn("NRK headline", result)
         self.assertIn("https://example.no/1", result)
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_get_global_news_pools_api_and_rss_providers(self, mock_get):
-        news_bot.STATE.data["sent_headline_keys"] = {}
+        nb_state.STATE.data["sent_headline_keys"] = {}
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = {
@@ -198,14 +220,14 @@ class NewsBotTests(unittest.TestCase):
         )
         mock_get.return_value = mock_response
 
-        with patch.object(news_bot.SETTINGS, "news_api_key", "abc"), patch.object(
-            news_bot.SETTINGS, "freenews_api_key", ""
-        ), patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""), patch.object(
-            news_bot.SETTINGS, "news_fetch_priority", "newsapi,rss"
+        with patch.object(nb_config.SETTINGS, "news_api_key", "abc"), patch.object(
+            nb_config.SETTINGS, "freenews_api_key", ""
+        ), patch.object(nb_config.SETTINGS, "freen_ews_api_key", ""), patch.object(
+            nb_config.SETTINGS, "news_fetch_priority", "newsapi,rss"
         ), patch.object(
-            news_bot.SETTINGS, "news_ranker_enabled", False
-        ), patch.object(news_bot, "_source_allowed", return_value=True):
-            result, _selections = news_bot.get_global_news()
+            nb_config.SETTINGS, "news_ranker_enabled", False
+        ), patch.object(nb_news_feeds, "_source_allowed", return_value=True):
+            result, _selections = nb_news_feeds.get_global_news()
 
         # Both providers now contribute to one pool rather than the first
         # provider short-circuiting the rest.
@@ -213,15 +235,15 @@ class NewsBotTests(unittest.TestCase):
         self.assertIn("RSS headline", result)
 
     def test_active_finnhub_key_supports_legacy_env_name(self):
-        with patch.object(news_bot.SETTINGS, "finnhub_api_key", ""), patch.object(
-            news_bot.SETTINGS, "finhub_api_key", "legacy-key"
+        with patch.object(nb_config.SETTINGS, "finnhub_api_key", ""), patch.object(
+            nb_config.SETTINGS, "finhub_api_key", "legacy-key"
         ):
-            self.assertEqual(news_bot._active_finnhub_key(), "legacy-key")
+            self.assertEqual(nb_market_data._active_finnhub_key(), "legacy-key")
 
-    @patch("news_bot._collect_live_quotes")
-    @patch("news_bot._build_news_section")
+    @patch("newsbot.market_data._collect_live_quotes")
+    @patch("newsbot.news_feeds._build_news_section")
     def test_get_business_and_stocks_uses_live_feeds(self, mock_news_section, mock_collect_live):
-        news_bot.STATE.data["sent_headline_keys"] = {}
+        nb_state.STATE.data["sent_headline_keys"] = {}
         mock_news_section.return_value = (
             "💼 Top Business Stories:\n"
             '1. Market headline (<a href="https://example.com/market">more</a>)\n',
@@ -244,25 +266,25 @@ class NewsBotTests(unittest.TestCase):
             },
         ]
 
-        with patch.object(news_bot.SETTINGS, "finnhub_api_key", ""), patch.object(
-            news_bot.SETTINGS, "finhub_api_key", ""
+        with patch.object(nb_config.SETTINGS, "finnhub_api_key", ""), patch.object(
+            nb_config.SETTINGS, "finhub_api_key", ""
         ):
-            result, _selections = news_bot.get_business_and_stocks()
+            result, _selections = nb_market_data.get_business_and_stocks()
         self.assertIn("Top Business Stories", result)
         self.assertIn("Market headline", result)
         self.assertIn("Live Stock Movers", result)
         self.assertIn("Live Funds & ETFs", result)
 
-    @patch("news_bot.requests.post")
+    @patch("requests.post")
     def test_send_telegram_message_success(self, mock_post):
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_post.return_value = mock_response
 
-        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), patch.object(
-            news_bot.SETTINGS, "telegram_chat_id", "chat"
+        with patch.object(nb_config.SETTINGS, "telegram_token", "token"), patch.object(
+            nb_config.SETTINGS, "telegram_chat_id", "chat"
         ):
-            ok = news_bot.send_telegram_message("hello")
+            ok = nb_messaging.send_telegram_message("hello")
 
         self.assertTrue(ok)
         self.assertTrue(mock_post.called)
@@ -270,15 +292,15 @@ class NewsBotTests(unittest.TestCase):
         self.assertEqual(sent_payload["parse_mode"], "HTML")
 
     def test_send_telegram_message_missing_config(self):
-        with patch.object(news_bot.SETTINGS, "telegram_token", ""), patch.object(
-            news_bot.SETTINGS, "telegram_chat_id", ""
+        with patch.object(nb_config.SETTINGS, "telegram_token", ""), patch.object(
+            nb_config.SETTINGS, "telegram_chat_id", ""
         ):
-            ok = news_bot.send_telegram_message("hello")
+            ok = nb_messaging.send_telegram_message("hello")
         self.assertFalse(ok)
 
     def test_split_message_html_chunks_long_payload(self):
         text = ("section\n\n" * 2000).strip()
-        chunks = news_bot._split_message_html(text, 200)
+        chunks = nb_messaging._split_message_html(text, 200)
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk) <= 200 for chunk in chunks))
 
@@ -289,7 +311,7 @@ class SlackIntegrationTests(unittest.TestCase):
             '<b>Bold</b> and <i>italic</i> and <a href="https://x.example">link</a> '
             "and &amp; entity and <pre>code block</pre>"
         )
-        text = news_bot._html_to_slack_text(html)
+        text = nb_messaging._html_to_slack_text(html)
         self.assertIn("*Bold*", text)
         self.assertIn("_italic_", text)
         self.assertIn("<https://x.example|link>", text)
@@ -299,17 +321,17 @@ class SlackIntegrationTests(unittest.TestCase):
         self.assertNotIn("<i>", text)
 
     def test_html_to_slack_text_strips_unknown_tags(self):
-        text = news_bot._html_to_slack_text("<div>hi</div>")
+        text = nb_messaging._html_to_slack_text("<div>hi</div>")
         self.assertEqual(text, "hi")
 
-    @patch("news_bot.requests.post")
+    @patch("requests.post")
     def test_send_slack_message_success(self, mock_post):
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_post.return_value = mock_response
 
-        with patch.object(news_bot.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"):
-            ok = news_bot.send_slack_message("<b>hello</b>")
+        with patch.object(nb_config.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"):
+            ok = nb_messaging.send_slack_message("<b>hello</b>")
 
         self.assertTrue(ok)
         sent_payload = mock_post.call_args.kwargs["json"]
@@ -317,63 +339,63 @@ class SlackIntegrationTests(unittest.TestCase):
         self.assertEqual(mock_post.call_args[0][0], "https://hooks.slack.example/x")
 
     def test_send_slack_message_missing_config(self):
-        with patch.object(news_bot.SETTINGS, "slack_webhook_url", ""):
-            ok = news_bot.send_slack_message("hello")
+        with patch.object(nb_config.SETTINGS, "slack_webhook_url", ""):
+            ok = nb_messaging.send_slack_message("hello")
         self.assertFalse(ok)
 
-    @patch("news_bot.time.sleep")
-    @patch("news_bot.requests.post")
+    @patch("time.sleep")
+    @patch("requests.post")
     def test_send_slack_message_failure_is_caught(self, mock_post, mock_sleep):
-        mock_post.side_effect = news_bot.requests.exceptions.ConnectionError("down")
-        with patch.object(news_bot.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"):
-            ok = news_bot.send_slack_message("hello")
+        mock_post.side_effect = requests.exceptions.ConnectionError("down")
+        with patch.object(nb_config.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"):
+            ok = nb_messaging.send_slack_message("hello")
         self.assertFalse(ok)
 
     def test_broadcast_message_skips_slack_when_not_configured(self):
-        with patch.object(news_bot.SETTINGS, "slack_webhook_url", ""), patch.object(
-            news_bot, "send_telegram_message", return_value=True
-        ) as mock_telegram, patch.object(news_bot, "send_slack_message") as mock_slack:
-            ok = news_bot._broadcast_message("hi", chat_id="123")
+        with patch.object(nb_config.SETTINGS, "slack_webhook_url", ""), patch.object(
+            nb_messaging, "send_telegram_message", return_value=True
+        ) as mock_telegram, patch.object(nb_messaging, "send_slack_message") as mock_slack:
+            ok = nb_messaging._broadcast_message("hi", chat_id="123")
         self.assertTrue(ok)
         mock_telegram.assert_called_once_with("hi", chat_id="123")
         mock_slack.assert_not_called()
 
     def test_broadcast_message_mirrors_to_slack_when_configured(self):
-        with patch.object(news_bot.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"), \
-             patch.object(news_bot, "send_telegram_message", return_value=True), \
-             patch.object(news_bot, "send_slack_message") as mock_slack:
-            ok = news_bot._broadcast_message("hi", chat_id="123")
+        with patch.object(nb_config.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"), \
+             patch.object(nb_messaging, "send_telegram_message", return_value=True), \
+             patch.object(nb_messaging, "send_slack_message") as mock_slack:
+            ok = nb_messaging._broadcast_message("hi", chat_id="123")
         self.assertTrue(ok)
         mock_slack.assert_called_once_with("hi")
 
     def test_broadcast_message_returns_telegram_result_even_if_slack_fails(self):
         """Slack is a best-effort mirror; its failure must not affect the
         Telegram-derived return value that gates headline-dedup commits."""
-        with patch.object(news_bot.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"), \
-             patch.object(news_bot, "send_telegram_message", return_value=True), \
-             patch.object(news_bot, "send_slack_message", return_value=False):
-            ok = news_bot._broadcast_message("hi")
+        with patch.object(nb_config.SETTINGS, "slack_webhook_url", "https://hooks.slack.example/x"), \
+             patch.object(nb_messaging, "send_telegram_message", return_value=True), \
+             patch.object(nb_messaging, "send_slack_message", return_value=False):
+            ok = nb_messaging._broadcast_message("hi")
         self.assertTrue(ok)
 
     def test_source_allowed_blocks_explicit_blocklist(self):
-        with patch.object(news_bot, "BLOCKED_DOMAINS", ["bad.com"]), patch.object(
-            news_bot, "TRUSTED_DOMAINS", []
+        with patch.object(nb_config, "BLOCKED_DOMAINS", ["bad.com"]), patch.object(
+            nb_config, "TRUSTED_DOMAINS", []
         ):
-            self.assertFalse(news_bot._source_allowed("https://bad.com/x"))
-            self.assertTrue(news_bot._source_allowed("https://good.com/x"))
+            self.assertFalse(nb_news_feeds._source_allowed("https://bad.com/x"))
+            self.assertTrue(nb_news_feeds._source_allowed("https://good.com/x"))
 
     def test_get_missing_required_config_reads_settings(self):
-        with patch.object(news_bot.SETTINGS, "telegram_token", ""), patch.object(
-            news_bot.SETTINGS, "telegram_chat_id", "1"
+        with patch.object(nb_config.SETTINGS, "telegram_token", ""), patch.object(
+            nb_config.SETTINGS, "telegram_chat_id", "1"
         ):
-            missing = list(news_bot.get_missing_required_config())
+            missing = list(nb_config.get_missing_required_config())
         self.assertIn("TELEGRAM_TOKEN", missing)
         self.assertNotIn("NEWS_API_KEY", missing)
 
     def test_state_save_writes_valid_json_atomically(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, "state.json")
-            state = news_bot.AppState(path)
+            state = nb_state.AppState(path)
             state.telegram_update_offset = 42
             state.mark_headline_seen("global_news", "key1", "2026-06-01")
             state.save()
@@ -384,7 +406,7 @@ class SlackIntegrationTests(unittest.TestCase):
                 loaded = json.load(file_obj)
             self.assertEqual(loaded["telegram_update_offset"], 42)
 
-            reloaded = news_bot.AppState(path)
+            reloaded = nb_state.AppState(path)
             self.assertEqual(reloaded.telegram_update_offset, 42)
             self.assertTrue(
                 reloaded.has_seen_headline(
@@ -393,36 +415,36 @@ class SlackIntegrationTests(unittest.TestCase):
             )
 
     def test_fetch_ticker_history_caches_result(self):
-        news_bot.HISTORY_CACHE.clear()
+        nb_state.HISTORY_CACHE.clear()
         sentinel = MagicMock(name="history_frame")
-        with patch("news_bot.yf.Ticker") as mock_ticker:
+        with patch("yfinance.Ticker") as mock_ticker:
             mock_ticker.return_value.history.return_value = sentinel
-            first = news_bot._fetch_ticker_history("AAPL")
-            second = news_bot._fetch_ticker_history("AAPL")
+            first = nb_market_data._fetch_ticker_history("AAPL")
+            second = nb_market_data._fetch_ticker_history("AAPL")
         self.assertIs(first, sentinel)
         self.assertIs(second, sentinel)
         # Second call served from cache: yfinance touched only once.
         self.assertEqual(mock_ticker.call_count, 1)
-        news_bot.HISTORY_CACHE.clear()
+        nb_state.HISTORY_CACHE.clear()
 
-    @patch("news_bot._compute_trade_metrics")
+    @patch("newsbot.indicators._compute_trade_metrics")
     def test_get_trade_candidates_caps_universe(self, mock_metrics):
         mock_metrics.return_value = None
         big_universe = {f"Name{i}": f"SYM{i}" for i in range(50)}
-        with patch.object(news_bot.SETTINGS, "trade_universe_max", 5):
-            news_bot.get_trade_candidates(universe=big_universe, top_n=3)
+        with patch.object(nb_config.SETTINGS, "trade_universe_max", 5):
+            nb_screener.get_trade_candidates(universe=big_universe, top_n=3)
         self.assertEqual(mock_metrics.call_count, 5)
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_poll_telegram_commands_passes_long_poll_timeout(self, mock_get):
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = {"result": []}
         mock_get.return_value = mock_response
-        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), patch.object(
-            news_bot.SETTINGS, "command_poll_enabled", True
+        with patch.object(nb_config.SETTINGS, "telegram_token", "token"), patch.object(
+            nb_config.SETTINGS, "command_poll_enabled", True
         ):
-            news_bot.poll_telegram_commands(long_poll_timeout=25)
+            nb_commands.poll_telegram_commands(long_poll_timeout=25)
         params = mock_get.call_args.kwargs["params"]
         self.assertEqual(params["timeout"], 25)
         # Read timeout must outlast the server-side hold.
@@ -441,35 +463,35 @@ class TelegramPollerHardeningTests(unittest.TestCase):
         return {"update_id": update_id, "message": {"chat": {"id": chat_id}, "text": text}}
 
     def _poll(self, *items):
-        with patch("news_bot.requests.get", return_value=self._updates(*items)), patch.object(
-            news_bot.SETTINGS, "telegram_token", "token"
-        ), patch.object(news_bot.SETTINGS, "command_poll_enabled", True), patch.object(
-            news_bot.SETTINGS, "telegram_chat_id", "42"
-        ), patch.object(news_bot.SETTINGS, "health_ping_chat_id", None), patch.object(
-            news_bot.STATE, "save"
+        with patch("requests.get", return_value=self._updates(*items)), patch.object(
+            nb_config.SETTINGS, "telegram_token", "token"
+        ), patch.object(nb_config.SETTINGS, "command_poll_enabled", True), patch.object(
+            nb_config.SETTINGS, "telegram_chat_id", "42"
+        ), patch.object(nb_config.SETTINGS, "health_ping_chat_id", None), patch.object(
+            nb_state.STATE, "save"
         ):
-            news_bot.STATE.telegram_update_offset = 0
-            return news_bot.poll_telegram_commands()
+            nb_state.STATE.telegram_update_offset = 0
+            return nb_commands.poll_telegram_commands()
 
-    @patch("news_bot._dispatch_command")
+    @patch("newsbot.commands._dispatch_command")
     def test_unauthorized_chat_is_ignored_but_offset_advances(self, dispatch):
         self.assertTrue(self._poll(self._update(7, 999, "/performance")))
         dispatch.assert_not_called()
-        self.assertEqual(news_bot.STATE.telegram_update_offset, 7)
+        self.assertEqual(nb_state.STATE.telegram_update_offset, 7)
 
-    @patch("news_bot._dispatch_command")
+    @patch("newsbot.commands._dispatch_command")
     def test_authorized_chat_is_dispatched(self, dispatch):
         self._poll(self._update(8, 42, "/health"))
         dispatch.assert_called_once_with("/health", "42")
 
-    @patch("news_bot._dispatch_command")
+    @patch("newsbot.commands._dispatch_command")
     def test_failing_update_does_not_block_offset_or_batch(self, dispatch):
         dispatch.side_effect = [RuntimeError("boom"), None]
         self.assertTrue(
             self._poll(self._update(1, 42, "/now"), self._update(2, 42, "/health"))
         )
         self.assertEqual(dispatch.call_count, 2)
-        self.assertEqual(news_bot.STATE.telegram_update_offset, 2)
+        self.assertEqual(nb_state.STATE.telegram_update_offset, 2)
 
     def test_slow_command_does_not_block_the_poller(self):
         release = threading.Event()
@@ -479,29 +501,29 @@ class TelegramPollerHardeningTests(unittest.TestCase):
             started.set()
             release.wait(5)
 
-        with patch("news_bot._handle_command", side_effect=slow), patch(
-            "news_bot.send_telegram_message"
+        with patch("newsbot.commands._handle_command", side_effect=slow), patch(
+            "newsbot.messaging.send_telegram_message"
         ) as send:
-            news_bot._dispatch_command("/performance", "42")
+            nb_commands._dispatch_command("/performance", "42")
             self.assertTrue(started.wait(2))
             # Identical command while running is refused, not queued.
-            news_bot._dispatch_command("/performance", "42")
+            nb_commands._dispatch_command("/performance", "42")
             self.assertIn("already running", send.call_args.args[0])
             release.set()
             for _ in range(100):
-                with news_bot._COMMANDS_LOCK:
-                    if not news_bot._COMMANDS_IN_FLIGHT:
+                with nb_commands._COMMANDS_LOCK:
+                    if not nb_commands._COMMANDS_IN_FLIGHT:
                         break
                 time.sleep(0.02)
-            self.assertFalse(news_bot._COMMANDS_IN_FLIGHT)
+            self.assertFalse(nb_commands._COMMANDS_IN_FLIGHT)
 
     def test_command_failure_is_reported_and_releases_slot(self):
-        with patch("news_bot._handle_command", side_effect=RuntimeError("x")), patch(
-            "news_bot.send_telegram_message"
+        with patch("newsbot.commands._handle_command", side_effect=RuntimeError("x")), patch(
+            "newsbot.messaging.send_telegram_message"
         ) as send:
-            news_bot._run_command_safely("/now", "42", "/now", ("42", "/now"))
+            nb_commands._run_command_safely("/now", "42", "/now", ("42", "/now"))
         self.assertIn("failed", send.call_args.args[0])
-        self.assertFalse(news_bot._COMMANDS_IN_FLIGHT)
+        self.assertFalse(nb_commands._COMMANDS_IN_FLIGHT)
 
     def test_screen_deadline_abandons_a_hung_fetch(self):
         release = threading.Event()
@@ -512,12 +534,12 @@ class TelegramPollerHardeningTests(unittest.TestCase):
 
         began = time.time()
         try:
-            with patch("news_bot._compute_trade_metrics", side_effect=hang), patch.object(
-                news_bot.SETTINGS, "trade_total_deadline_seconds", 1
-            ), patch.object(news_bot.SETTINGS, "trade_fetch_workers", 2), patch.object(
-                news_bot.TRADE_HISTORY, "prune"
+            with patch("newsbot.indicators._compute_trade_metrics", side_effect=hang), patch.object(
+                nb_config.SETTINGS, "trade_total_deadline_seconds", 1
+            ), patch.object(nb_config.SETTINGS, "trade_fetch_workers", 2), patch.object(
+                nb_history_store.TRADE_HISTORY, "prune"
             ):
-                outcome, _ = news_bot._screen_universe([("A", "A"), ("B", "B")])
+                outcome, _ = nb_screener._screen_universe([("A", "A"), ("B", "B")])
         finally:
             release.set()
         self.assertTrue(outcome.deadline_hit)
@@ -529,50 +551,50 @@ class HeartbeatHealthcheckTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         patches = [
-            patch.object(news_bot.SETTINGS, "state_file", os.path.join(self._tmp.name, "state.json")),
-            patch.object(news_bot.SETTINGS, "telegram_token", "token"),
-            patch.object(news_bot.SETTINGS, "command_poll_enabled", True),
+            patch.object(nb_config.SETTINGS, "state_file", os.path.join(self._tmp.name, "state.json")),
+            patch.object(nb_config.SETTINGS, "telegram_token", "token"),
+            patch.object(nb_config.SETTINGS, "command_poll_enabled", True),
         ]
         for item in patches:
             item.start()
             self.addCleanup(item.stop)
 
     def test_missing_heartbeats_are_reported(self):
-        problems = news_bot.heartbeat_problems()
+        problems = nb_commands.heartbeat_problems()
         self.assertIn("scheduler: no heartbeat", problems)
         self.assertIn("poller: no heartbeat", problems)
 
     def test_fresh_heartbeats_are_healthy_and_live_beside_the_state_file(self):
-        news_bot._touch_heartbeat("scheduler")
-        news_bot._touch_heartbeat("poller")
-        self.assertEqual(news_bot.heartbeat_problems(), [])
+        nb_commands._touch_heartbeat("scheduler")
+        nb_commands._touch_heartbeat("poller")
+        self.assertEqual(nb_commands.heartbeat_problems(), [])
         self.assertEqual(
-            os.path.dirname(news_bot._heartbeat_path("poller")), self._tmp.name
+            os.path.dirname(nb_commands._heartbeat_path("poller")), self._tmp.name
         )
 
     def test_stale_poller_is_unhealthy_even_with_a_live_scheduler(self):
-        news_bot._touch_heartbeat("scheduler")
-        news_bot._touch_heartbeat("poller")
-        future = time.time() + news_bot.HEARTBEAT_MAX_AGE_SECONDS["poller"] + 5
-        problems = news_bot.heartbeat_problems(now=future)
+        nb_commands._touch_heartbeat("scheduler")
+        nb_commands._touch_heartbeat("poller")
+        future = time.time() + nb_commands.HEARTBEAT_MAX_AGE_SECONDS["poller"] + 5
+        problems = nb_commands.heartbeat_problems(now=future)
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("poller: last beat"))
 
     def test_poller_not_required_when_command_polling_is_off(self):
-        news_bot._touch_heartbeat("scheduler")
-        with patch.object(news_bot.SETTINGS, "command_poll_enabled", False):
-            self.assertEqual(news_bot.heartbeat_problems(), [])
+        nb_commands._touch_heartbeat("scheduler")
+        with patch.object(nb_config.SETTINGS, "command_poll_enabled", False):
+            self.assertEqual(nb_commands.heartbeat_problems(), [])
 
     def test_run_healthcheck_exit_status(self):
         with patch("builtins.print"):
-            self.assertEqual(news_bot.run_healthcheck(), 1)
-            news_bot._touch_heartbeat("scheduler")
-            news_bot._touch_heartbeat("poller")
-            self.assertEqual(news_bot.run_healthcheck(), 0)
+            self.assertEqual(nb_commands.run_healthcheck(), 1)
+            nb_commands._touch_heartbeat("scheduler")
+            nb_commands._touch_heartbeat("poller")
+            self.assertEqual(nb_commands.run_healthcheck(), 0)
 
     def test_heartbeat_write_failure_does_not_raise(self):
         with patch("builtins.open", side_effect=OSError("disk full")):
-            news_bot._touch_heartbeat("scheduler")
+            nb_commands._touch_heartbeat("scheduler")
 
     def test_poll_loop_beats_only_after_a_successful_poll(self):
         stop = threading.Event()
@@ -584,36 +606,36 @@ class HeartbeatHealthcheckTests(unittest.TestCase):
                 stop.set()
             return outcome
 
-        with patch("news_bot.poll_telegram_commands", side_effect=fake_poll), patch(
-            "news_bot._touch_heartbeat"
+        with patch("newsbot.commands.poll_telegram_commands", side_effect=fake_poll), patch(
+            "newsbot.commands._touch_heartbeat"
         ) as touch:
-            news_bot.run_command_long_polling_loop(stop)
+            nb_commands.run_command_long_polling_loop(stop)
         touch.assert_called_once_with("poller")
 
 
 class FeedDateParsingTests(unittest.TestCase):
     def test_parses_rfc2822_pubdate(self):
-        parsed = news_bot._parse_feed_datetime("Thu, 13 Aug 2026 04:55:58 GMT")
+        parsed = nb_news_feeds._parse_feed_datetime("Thu, 13 Aug 2026 04:55:58 GMT")
         self.assertEqual(parsed, datetime(2026, 8, 13, 4, 55, 58, tzinfo=timezone.utc))
 
     def test_parses_iso8601_with_trailing_z(self):
-        parsed = news_bot._parse_feed_datetime("2026-08-13T10:00:47Z")
+        parsed = nb_news_feeds._parse_feed_datetime("2026-08-13T10:00:47Z")
         self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 47, tzinfo=timezone.utc))
 
     def test_parses_iso8601_with_offset_and_normalises_to_utc(self):
-        parsed = news_bot._parse_feed_datetime("2026-08-13T12:00:00+02:00")
+        parsed = nb_news_feeds._parse_feed_datetime("2026-08-13T12:00:00+02:00")
         self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 0, tzinfo=timezone.utc))
 
     def test_naive_timestamp_is_treated_as_utc(self):
-        parsed = news_bot._parse_feed_datetime("2026-08-13T10:00:00")
+        parsed = nb_news_feeds._parse_feed_datetime("2026-08-13T10:00:00")
         self.assertEqual(parsed, datetime(2026, 8, 13, 10, 0, 0, tzinfo=timezone.utc))
 
     def test_returns_none_for_malformed_input(self):
-        self.assertIsNone(news_bot._parse_feed_datetime("not a date"))
+        self.assertIsNone(nb_news_feeds._parse_feed_datetime("not a date"))
 
     def test_returns_none_for_empty_and_missing_input(self):
-        self.assertIsNone(news_bot._parse_feed_datetime(""))
-        self.assertIsNone(news_bot._parse_feed_datetime(None))
+        self.assertIsNone(nb_news_feeds._parse_feed_datetime(""))
+        self.assertIsNone(nb_news_feeds._parse_feed_datetime(None))
 
 
 class RssDateExtractionTests(unittest.TestCase):
@@ -624,7 +646,7 @@ class RssDateExtractionTests(unittest.TestCase):
             "<pubDate>Thu, 13 Aug 2026 04:55:58 GMT</pubDate></item>"
             "</channel></rss>"
         )
-        items = news_bot._parse_rss_items(xml_text)
+        items = nb_news_feeds._parse_rss_items(xml_text)
         self.assertEqual(len(items), 1)
         title, url, published = items[0]
         self.assertEqual(title, "T1")
@@ -639,7 +661,7 @@ class RssDateExtractionTests(unittest.TestCase):
             "<dc:date>2026-08-13T09:00:00Z</dc:date></item>"
             "</channel></rss>"
         )
-        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        _, _, published = nb_news_feeds._parse_rss_items(xml_text)[0]
         self.assertEqual(published.hour, 4)
 
     def test_falls_back_to_dc_date_when_pubdate_absent(self):
@@ -649,7 +671,7 @@ class RssDateExtractionTests(unittest.TestCase):
             "<dc:date>2026-08-13T09:48:44Z</dc:date></item>"
             "</channel></rss>"
         )
-        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        _, _, published = nb_news_feeds._parse_rss_items(xml_text)[0]
         self.assertEqual(published, datetime(2026, 8, 13, 9, 48, 44, tzinfo=timezone.utc))
 
     def test_item_without_any_date_yields_none(self):
@@ -658,7 +680,7 @@ class RssDateExtractionTests(unittest.TestCase):
             "<item><title>T1</title><link>https://example.com/1</link></item>"
             "</channel></rss>"
         )
-        _, _, published = news_bot._parse_rss_items(xml_text)[0]
+        _, _, published = nb_news_feeds._parse_rss_items(xml_text)[0]
         self.assertIsNone(published)
 
     def test_atom_entry_published_is_parsed(self):
@@ -669,7 +691,7 @@ class RssDateExtractionTests(unittest.TestCase):
             "<published>2026-08-13T06:30:00Z</published></entry>"
             "</feed>"
         )
-        title, url, published = news_bot._parse_rss_items(xml_text)[0]
+        title, url, published = nb_news_feeds._parse_rss_items(xml_text)[0]
         self.assertEqual(title, "A1")
         self.assertEqual(url, "https://example.com/a1")
         self.assertEqual(published, datetime(2026, 8, 13, 6, 30, 0, tzinfo=timezone.utc))
@@ -685,7 +707,7 @@ class XmlHardeningTests(unittest.TestCase):
             "<rss><channel><item><title>&lol3;</title></item></channel></rss>"
         )
         with self.assertRaises(Exception):
-            news_bot._parse_rss_items(bomb)
+            nb_news_feeds._parse_rss_items(bomb)
 
     def test_ordinary_feeds_still_parse(self):
         xml_text = (
@@ -693,77 +715,77 @@ class XmlHardeningTests(unittest.TestCase):
             "<item><title>Normal</title><link>https://example.com/1</link></item>"
             "</channel></rss>"
         )
-        self.assertEqual(len(news_bot._parse_rss_items(xml_text)), 1)
+        self.assertEqual(len(nb_news_feeds._parse_rss_items(xml_text)), 1)
 
 
 class CandidateModelTests(unittest.TestCase):
     def test_trusted_domain_is_flagged(self):
-        candidate = news_bot._make_candidate(
+        candidate = nb_news_feeds._make_candidate(
             "Headline", "https://www.reuters.com/x", None, "rss"
         )
         self.assertEqual(candidate.domain, "reuters.com")
         self.assertTrue(candidate.trusted)
 
     def test_unknown_domain_is_not_trusted(self):
-        candidate = news_bot._make_candidate(
+        candidate = nb_news_feeds._make_candidate(
             "Headline", "https://random-blog.example/x", None, "rss"
         )
         self.assertFalse(candidate.trusted)
 
     def test_age_hours_is_none_without_a_date(self):
-        candidate = news_bot._make_candidate("Headline", None, None, "rss")
-        self.assertIsNone(news_bot._age_hours(candidate))
+        candidate = nb_news_feeds._make_candidate("Headline", None, None, "rss")
+        self.assertIsNone(nb_news_feeds._age_hours(candidate))
 
     def test_age_hours_computed_from_published_at(self):
         now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
-        candidate = news_bot._make_candidate(
+        candidate = nb_news_feeds._make_candidate(
             "Headline", None, now - timedelta(hours=5), "rss"
         )
-        self.assertAlmostEqual(news_bot._age_hours(candidate, now), 5.0, places=3)
+        self.assertAlmostEqual(nb_news_feeds._age_hours(candidate, now), 5.0, places=3)
 
     def test_future_timestamps_clamp_to_zero(self):
         now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
-        candidate = news_bot._make_candidate(
+        candidate = nb_news_feeds._make_candidate(
             "Headline", None, now + timedelta(hours=2), "rss"
         )
-        self.assertEqual(news_bot._age_hours(candidate, now), 0.0)
+        self.assertEqual(nb_news_feeds._age_hours(candidate, now), 0.0)
 
 
 class ClusterKeyTests(unittest.TestCase):
     def test_identical_titles_share_a_cluster_key(self):
         self.assertEqual(
-            news_bot._cluster_key("Fed holds rates steady"),
-            news_bot._cluster_key("Fed holds rates steady"),
+            nb_news_feeds._cluster_key("Fed holds rates steady"),
+            nb_news_feeds._cluster_key("Fed holds rates steady"),
         )
 
     def test_cluster_key_ignores_case_and_punctuation(self):
         self.assertEqual(
-            news_bot._cluster_key("Fed holds rates steady!"),
-            news_bot._cluster_key("fed holds rates, steady"),
+            nb_news_feeds._cluster_key("Fed holds rates steady!"),
+            nb_news_feeds._cluster_key("fed holds rates, steady"),
         )
 
     def test_cluster_key_ignores_word_order(self):
         self.assertEqual(
-            news_bot._cluster_key("Fed holds rates steady"),
-            news_bot._cluster_key("Rates steady, Fed holds"),
+            nb_news_feeds._cluster_key("Fed holds rates steady"),
+            nb_news_feeds._cluster_key("Rates steady, Fed holds"),
         )
 
     def test_cluster_key_ignores_stopwords(self):
         self.assertEqual(
-            news_bot._cluster_key("The Fed holds the rates steady"),
-            news_bot._cluster_key("Fed holds rates steady"),
+            nb_news_feeds._cluster_key("The Fed holds the rates steady"),
+            nb_news_feeds._cluster_key("Fed holds rates steady"),
         )
 
     def test_different_stories_have_different_cluster_keys(self):
         self.assertNotEqual(
-            news_bot._cluster_key("Fed holds rates steady"),
-            news_bot._cluster_key("Norway raises fuel duty"),
+            nb_news_feeds._cluster_key("Fed holds rates steady"),
+            nb_news_feeds._cluster_key("Norway raises fuel duty"),
         )
 
 
 class DedupWindowTests(unittest.TestCase):
     def setUp(self):
-        self.state = news_bot.AppState(path=os.path.join(tempfile.mkdtemp(), "state.json"))
+        self.state = nb_state.AppState(path=os.path.join(tempfile.mkdtemp(), "state.json"))
 
     def test_headline_seen_yesterday_is_suppressed_today(self):
         self.state.mark_headline_seen("global", ["k1"], "2026-08-12")
@@ -832,7 +854,7 @@ class DedupWindowTests(unittest.TestCase):
 
 class RecentTitleTests(unittest.TestCase):
     def setUp(self):
-        self.state = news_bot.AppState(path=os.path.join(tempfile.mkdtemp(), "state.json"))
+        self.state = nb_state.AppState(path=os.path.join(tempfile.mkdtemp(), "state.json"))
 
     def test_recent_titles_are_returned_within_the_window(self):
         self.state.record_recent_title("Fed holds rates steady", "2026-08-12")
@@ -867,8 +889,8 @@ FIXED_NOW = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
 def _cand(title, url=None, hours_old=1.0, trusted=True, provider="rss"):
     """Test helper: build a Candidate with an age relative to FIXED_NOW."""
     published = None if hours_old is None else FIXED_NOW - timedelta(hours=hours_old)
-    base = news_bot._make_candidate(title, url, published, provider)
-    return news_bot.Candidate(
+    base = nb_news_feeds._make_candidate(title, url, published, provider)
+    return nb_news_feeds.Candidate(
         title=base.title,
         url=base.url,
         domain=base.domain,
@@ -905,25 +927,25 @@ def _history(closes, volumes=None, last_date=None, tz="America/New_York"):
 
 class TopicWeightTests(unittest.TestCase):
     def test_defaults_are_used_when_override_is_empty(self):
-        with patch.object(news_bot.SETTINGS, "news_topic_weights", ""):
-            weights = news_bot._resolve_topic_weights()
-        self.assertEqual(weights["markets"], news_bot.TOPIC_CATEGORIES["markets"]["weight"])
+        with patch.object(nb_config.SETTINGS, "news_topic_weights", ""):
+            weights = nb_news_feeds._resolve_topic_weights()
+        self.assertEqual(weights["markets"], nb_news_feeds.TOPIC_CATEGORIES["markets"]["weight"])
 
     def test_override_replaces_a_single_category(self):
-        with patch.object(news_bot.SETTINGS, "news_topic_weights", "markets:5.0"):
-            weights = news_bot._resolve_topic_weights()
+        with patch.object(nb_config.SETTINGS, "news_topic_weights", "markets:5.0"):
+            weights = nb_news_feeds._resolve_topic_weights()
         self.assertEqual(weights["markets"], 5.0)
-        self.assertEqual(weights["sports"], news_bot.TOPIC_CATEGORIES["sports"]["weight"])
+        self.assertEqual(weights["sports"], nb_news_feeds.TOPIC_CATEGORIES["sports"]["weight"])
 
     def test_unknown_categories_in_the_override_are_ignored(self):
-        with patch.object(news_bot.SETTINGS, "news_topic_weights", "nonsense:9.0"):
-            weights = news_bot._resolve_topic_weights()
+        with patch.object(nb_config.SETTINGS, "news_topic_weights", "nonsense:9.0"):
+            weights = nb_news_feeds._resolve_topic_weights()
         self.assertNotIn("nonsense", weights)
 
     def test_malformed_override_entries_are_skipped(self):
-        with patch.object(news_bot.SETTINGS, "news_topic_weights", "markets:abc,tech:1.0"):
-            weights = news_bot._resolve_topic_weights()
-        self.assertEqual(weights["markets"], news_bot.TOPIC_CATEGORIES["markets"]["weight"])
+        with patch.object(nb_config.SETTINGS, "news_topic_weights", "markets:abc,tech:1.0"):
+            weights = nb_news_feeds._resolve_topic_weights()
+        self.assertEqual(weights["markets"], nb_news_feeds.TOPIC_CATEGORIES["markets"]["weight"])
         self.assertEqual(weights["tech"], 1.0)
 
 
@@ -943,7 +965,7 @@ DISTINCT_HEADLINES = [
 
 class HeuristicSelectorTests(unittest.TestCase):
     def setUp(self):
-        self.selector = news_bot.HeuristicSelector(now=FIXED_NOW)
+        self.selector = nb_news_feeds.HeuristicSelector(now=FIXED_NOW)
 
     def test_returns_at_most_the_limit(self):
         pool = [
@@ -1103,7 +1125,7 @@ class LlmSelectorTests(unittest.TestCase):
         ]
 
     def _select(self, transport, limit=2):
-        selector = news_bot.LlmSelector(transport=transport, now=FIXED_NOW, recent_titles=[])
+        selector = nb_news_feeds.LlmSelector(transport=transport, now=FIXED_NOW, recent_titles=[])
         return selector.select(self.pool, "global", limit)
 
     def test_selects_by_returned_index(self):
@@ -1165,13 +1187,13 @@ class LlmSelectorTests(unittest.TestCase):
 
     def test_empty_pool_does_not_call_the_model(self):
         t = _StubTransport({"selections": []})
-        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        selector = nb_news_feeds.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
         self.assertEqual(selector.select([], "global", 5), [])
         self.assertEqual(t.calls, [])
 
     def test_recent_titles_are_included_in_the_prompt(self):
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
-        selector = news_bot.LlmSelector(
+        selector = nb_news_feeds.LlmSelector(
             transport=t, now=FIXED_NOW, recent_titles=["Previously shown story"]
         )
         selector.select(self.pool, "global", 2)
@@ -1189,7 +1211,7 @@ class LlmSelectorTests(unittest.TestCase):
 
     def test_request_targets_the_configured_ollama_endpoint(self):
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
-        with patch.object(news_bot.SETTINGS, "news_ranker_url", "http://ollama:11434"):
+        with patch.object(nb_config.SETTINGS, "news_ranker_url", "http://ollama:11434"):
             self._select(t)
         self.assertEqual(t.calls[0]["url"], "http://ollama:11434/api/chat")
 
@@ -1197,8 +1219,8 @@ class LlmSelectorTests(unittest.TestCase):
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
         self._select(t)
         # limit=2 against a 3-candidate pool, so the floor is 2.
-        self.assertEqual(t.body["format"], news_bot._ranker_response_schema(2))
-        self.assertEqual(t.body["model"], news_bot.SETTINGS.news_ranker_model)
+        self.assertEqual(t.body["format"], nb_news_feeds._ranker_response_schema(2))
+        self.assertEqual(t.body["model"], nb_config.SETTINGS.news_ranker_model)
         self.assertFalse(t.body["stream"])
 
     def test_request_floors_selections_so_the_model_cannot_answer_empty(self):
@@ -1225,8 +1247,8 @@ class LlmSelectorTests(unittest.TestCase):
             for i, title in enumerate(DISTINCT_HEADLINES)
         ]
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
-        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
-        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 3):
+        selector = nb_news_feeds.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(nb_config.SETTINGS, "news_ranker_max_candidates", 3):
             selector.select(pool, "global", 2)
         sent = t.body["messages"][1]["content"]
         self.assertEqual(sent.count("\n["), 3)
@@ -1238,8 +1260,8 @@ class LlmSelectorTests(unittest.TestCase):
             _cand("Fed signals inflation rate decision", "https://a.example/fed"),
         ]
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
-        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
-        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 1):
+        selector = nb_news_feeds.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(nb_config.SETTINGS, "news_ranker_max_candidates", 1):
             result = selector.select(pool, "global", 1)
         # The heuristic ranks the markets story first, so id 0 is that one.
         self.assertEqual(result[0].candidate.url, "https://a.example/fed")
@@ -1247,8 +1269,8 @@ class LlmSelectorTests(unittest.TestCase):
     def test_small_pool_is_sent_untouched(self):
         pool = [_cand("Only story", "https://a.example/1")]
         t = _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
-        selector = news_bot.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
-        with patch.object(news_bot.SETTINGS, "news_ranker_max_candidates", 20):
+        selector = nb_news_feeds.LlmSelector(transport=t, now=FIXED_NOW, recent_titles=[])
+        with patch.object(nb_config.SETTINGS, "news_ranker_max_candidates", 20):
             self.assertEqual(len(selector.select(pool, "global", 5)), 1)
 
     def test_request_is_deterministic(self):
@@ -1262,20 +1284,20 @@ class RankerSchemaTests(unittest.TestCase):
         return schema["properties"]["selections"]
 
     def test_floor_is_set_to_the_requested_minimum(self):
-        self.assertEqual(self._selections(news_bot._ranker_response_schema(8))["minItems"], 8)
+        self.assertEqual(self._selections(nb_news_feeds._ranker_response_schema(8))["minItems"], 8)
 
     def test_floor_is_never_below_one(self):
         """A zero floor is the empty array again, which is the defect."""
-        self.assertEqual(self._selections(news_bot._ranker_response_schema(0))["minItems"], 1)
+        self.assertEqual(self._selections(nb_news_feeds._ranker_response_schema(0))["minItems"], 1)
 
     def test_builder_does_not_mutate_the_shared_base_schema(self):
-        news_bot._ranker_response_schema(5)
-        self.assertNotIn("minItems", self._selections(news_bot.RANKER_RESPONSE_SCHEMA))
+        nb_news_feeds._ranker_response_schema(5)
+        self.assertNotIn("minItems", self._selections(nb_news_feeds.RANKER_RESPONSE_SCHEMA))
 
     def test_base_schema_alone_would_admit_an_empty_selection(self):
         """Documents the defect: the unconstrained schema is what let the model
         answer `{"selections": []}` in 3.9s instead of doing the ranking."""
-        self.assertNotIn("minItems", self._selections(news_bot.RANKER_RESPONSE_SCHEMA))
+        self.assertNotIn("minItems", self._selections(nb_news_feeds.RANKER_RESPONSE_SCHEMA))
 
 
 class LlmSelectorFallthroughTests(unittest.TestCase):
@@ -1285,26 +1307,26 @@ class LlmSelectorFallthroughTests(unittest.TestCase):
         self.pool = [_cand("Fed holds interest rates steady", "https://a.example/1")]
 
     def _select_with(self, transport):
-        selector = news_bot.LlmSelector(transport=transport, now=FIXED_NOW, recent_titles=[])
+        selector = nb_news_feeds.LlmSelector(transport=transport, now=FIXED_NOW, recent_titles=[])
         return selector.select(self.pool, "global", 5)
 
     def test_missing_transport_returns_empty(self):
-        selector = news_bot.LlmSelector(transport=None, now=FIXED_NOW, recent_titles=[])
+        selector = nb_news_feeds.LlmSelector(transport=None, now=FIXED_NOW, recent_titles=[])
         self.assertEqual(selector.select(self.pool, "global", 5), [])
 
     def test_connection_error_returns_empty(self):
         """The common case: Ollama is not running."""
-        exc = news_bot.requests.exceptions.ConnectionError("refused")
+        exc = requests.exceptions.ConnectionError("refused")
         self.assertEqual(self._select_with(_StubTransport(exception=exc)), [])
 
     def test_timeout_returns_empty(self):
-        exc = news_bot.requests.exceptions.Timeout("too slow")
+        exc = requests.exceptions.Timeout("too slow")
         self.assertEqual(self._select_with(_StubTransport(exception=exc)), [])
 
     def test_http_error_returns_empty(self):
         response = MagicMock()
         response.status_code = 404
-        response.raise_for_status.side_effect = news_bot.requests.exceptions.HTTPError(
+        response.raise_for_status.side_effect = requests.exceptions.HTTPError(
             "model not found"
         )
         self.assertEqual(self._select_with(_StubTransport(response=response)), [])
@@ -1327,44 +1349,44 @@ class LlmSelectorFallthroughTests(unittest.TestCase):
         self.assertEqual(self._select_with(t), [])
 
     def test_failure_is_recorded_for_health(self):
-        news_bot.RANKER_STATUS["error"] = None
+        nb_state.RANKER_STATUS["error"] = None
         self._select_with(_StubTransport(exception=RuntimeError("boom")))
-        self.assertIsNotNone(news_bot.RANKER_STATUS["error"])
+        self.assertIsNotNone(nb_state.RANKER_STATUS["error"])
 
     def test_success_clears_a_previous_error(self):
-        news_bot.RANKER_STATUS["error"] = "stale"
+        nb_state.RANKER_STATUS["error"] = "stale"
         self._select_with(
             _StubTransport({"selections": [{"id": 0, "duplicate_ids": [], "reason": "x"}]})
         )
-        self.assertIsNone(news_bot.RANKER_STATUS["error"])
+        self.assertIsNone(nb_state.RANKER_STATUS["error"])
 
 
 class SelectorFactoryTests(unittest.TestCase):
     def test_heuristic_used_when_ranker_disabled(self):
-        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", False):
-            selector = news_bot._build_selector("global", FIXED_NOW)
-        self.assertIsInstance(selector, news_bot.HeuristicSelector)
+        with patch.object(nb_config.SETTINGS, "news_ranker_enabled", False):
+            selector = nb_news_feeds._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, nb_news_feeds.HeuristicSelector)
 
     def test_heuristic_used_when_no_url_configured(self):
-        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", True), patch.object(
-            news_bot.SETTINGS, "news_ranker_url", ""
+        with patch.object(nb_config.SETTINGS, "news_ranker_enabled", True), patch.object(
+            nb_config.SETTINGS, "news_ranker_url", ""
         ):
-            selector = news_bot._build_selector("global", FIXED_NOW)
-        self.assertIsInstance(selector, news_bot.HeuristicSelector)
+            selector = nb_news_feeds._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, nb_news_feeds.HeuristicSelector)
 
     def test_llm_selector_used_when_enabled_and_url_present(self):
         """No credential needed — a reachable local endpoint is the only gate."""
-        with patch.object(news_bot.SETTINGS, "news_ranker_enabled", True), patch.object(
-            news_bot.SETTINGS, "news_ranker_url", "http://ollama:11434"
+        with patch.object(nb_config.SETTINGS, "news_ranker_enabled", True), patch.object(
+            nb_config.SETTINGS, "news_ranker_url", "http://ollama:11434"
         ):
-            selector = news_bot._build_selector("global", FIXED_NOW)
-        self.assertIsInstance(selector, news_bot.LlmSelector)
+            selector = nb_news_feeds._build_selector("global", FIXED_NOW)
+        self.assertIsInstance(selector, nb_news_feeds.LlmSelector)
 
 
 class PipelineIntegrationTests(unittest.TestCase):
     def setUp(self):
-        news_bot.STATE.data["sent_headline_keys"] = {}
-        news_bot.STATE.data["recent_titles"] = {}
+        nb_state.STATE.data["sent_headline_keys"] = {}
+        nb_state.STATE.data["recent_titles"] = {}
 
     @staticmethod
     def _rss(*items):
@@ -1383,11 +1405,11 @@ class PipelineIntegrationTests(unittest.TestCase):
     @staticmethod
     def _patches():
         return (
-            patch.object(news_bot.SETTINGS, "news_api_key", ""),
-            patch.object(news_bot.SETTINGS, "freenews_api_key", ""),
-            patch.object(news_bot.SETTINGS, "freen_ews_api_key", ""),
-            patch.object(news_bot.SETTINGS, "news_ranker_enabled", False),
-            patch.object(news_bot, "_source_allowed", return_value=True),
+            patch.object(nb_config.SETTINGS, "news_api_key", ""),
+            patch.object(nb_config.SETTINGS, "freenews_api_key", ""),
+            patch.object(nb_config.SETTINGS, "freen_ews_api_key", ""),
+            patch.object(nb_config.SETTINGS, "news_ranker_enabled", False),
+            patch.object(nb_news_feeds, "_source_allowed", return_value=True),
         )
 
     def _run(self, mock_get, response):
@@ -1396,12 +1418,12 @@ class PipelineIntegrationTests(unittest.TestCase):
         for item in patches:
             item.start()
         try:
-            return news_bot.get_global_news()
+            return nb_news_feeds.get_global_news()
         finally:
             for item in patches:
                 item.stop()
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_section_renders_and_returns_selections(self, mock_get):
         fresh = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
         rendered, selections = self._run(
@@ -1410,7 +1432,7 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertIn("Top Global News", rendered)
         self.assertGreaterEqual(len(selections), 1)
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_empty_pool_renders_the_empty_message(self, mock_get):
         response = MagicMock()
         response.text = "<rss><channel></channel></rss>"
@@ -1419,7 +1441,7 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertIn("No fresh global headlines", rendered)
         self.assertEqual(selections, [])
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_stale_dated_items_are_dropped_by_the_ceiling(self, mock_get):
         rendered, selections = self._run(
             mock_get, self._rss(("Ancient story", "Mon, 01 Jun 2020 10:00:00 GMT"))
@@ -1427,18 +1449,18 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(selections, [])
         self.assertIn("No fresh global headlines", rendered)
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_undated_items_survive_the_ceiling(self, mock_get):
         rendered, selections = self._run(mock_get, self._rss(("Undated story", None)))
         self.assertIn("Undated story", rendered)
         self.assertEqual(len(selections), 1)
 
-    @patch("news_bot.requests.get")
+    @patch("requests.get")
     def test_already_seen_headline_is_suppressed(self, mock_get):
         fresh = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
         today = datetime.today().strftime("%Y-%m-%d")
-        news_bot.STATE.mark_headline_seen(
-            "global_news", news_bot._headline_keys("Seen already", None), today
+        nb_state.STATE.mark_headline_seen(
+            "global_news", nb_news_feeds._headline_keys("Seen already", None), today
         )
         rendered, selections = self._run(mock_get, self._rss(("Seen already", fresh)))
         self.assertEqual(selections, [])
@@ -1446,30 +1468,30 @@ class PipelineIntegrationTests(unittest.TestCase):
 
 class MarkOnSendTests(unittest.TestCase):
     def setUp(self):
-        news_bot.STATE.data["sent_headline_keys"] = {}
-        news_bot.STATE.data["recent_titles"] = {}
+        nb_state.STATE.data["sent_headline_keys"] = {}
+        nb_state.STATE.data["recent_titles"] = {}
 
     @staticmethod
     def _briefing():
         candidate = _cand("Fed holds rates steady", "https://a.example/1")
-        return news_bot.Briefing(
+        return nb_briefing.Briefing(
             message="body",
             pending=[
                 ("global_news", key)
-                for key in news_bot._headline_keys(candidate.title, candidate.url)
+                for key in nb_news_feeds._headline_keys(candidate.title, candidate.url)
             ],
             titles=[candidate.title],
         )
 
     def _run_job(self, send_succeeds):
-        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
-            news_bot, "send_telegram_message", return_value=send_succeeds
-        ), patch.object(news_bot.STATE, "save"):
-            return news_bot.job_daily_briefing()
+        with patch.object(nb_briefing, "compose_briefing", return_value=self._briefing()), patch.object(
+            nb_messaging, "send_telegram_message", return_value=send_succeeds
+        ), patch.object(nb_state.STATE, "save"):
+            return nb_briefing.job_daily_briefing()
 
     def _seen(self):
-        return news_bot.STATE.has_seen_headline(
-            "global_news", news_bot._cluster_key("Fed holds rates steady"), window_days=7
+        return nb_state.STATE.has_seen_headline(
+            "global_news", nb_news_feeds._cluster_key("Fed holds rates steady"), window_days=7
         )
 
     def test_failed_send_does_not_mark_headlines_seen(self):
@@ -1482,50 +1504,50 @@ class MarkOnSendTests(unittest.TestCase):
 
     def test_successful_send_records_titles_for_the_recent_window(self):
         self._run_job(send_succeeds=True)
-        self.assertIn("Fed holds rates steady", news_bot.STATE.recent_titles(window_days=7))
+        self.assertIn("Fed holds rates steady", nb_state.STATE.recent_titles(window_days=7))
 
     def test_failed_send_records_no_titles(self):
         self._run_job(send_succeeds=False)
-        self.assertEqual(news_bot.STATE.recent_titles(window_days=7), [])
+        self.assertEqual(nb_state.STATE.recent_titles(window_days=7), [])
 
     def test_collapsed_duplicates_are_marked_alongside_the_shown_headline(self):
         shown = _cand("Fed holds interest rates steady", "https://a.example/1")
         dupe = _cand("Federal Reserve keeps rates unchanged", "https://b.example/2")
-        selection = news_bot.Selection(candidate=shown, duplicates=[dupe], reason="")
-        pending = news_bot._pending_keys("global_news", [selection])
-        self.assertIn(("global_news", news_bot._cluster_key(dupe.title)), pending)
+        selection = nb_news_feeds.Selection(candidate=shown, duplicates=[dupe], reason="")
+        pending = nb_briefing._pending_keys("global_news", [selection])
+        self.assertIn(("global_news", nb_news_feeds._cluster_key(dupe.title)), pending)
 
     def test_every_news_section_contributes_pending_keys(self):
         """Regression guard: _is_duplicate_headline is read-only, so any section
         whose selections are not committed loses deduplication entirely."""
-        selection = news_bot.Selection(
+        selection = nb_news_feeds.Selection(
             candidate=_cand("Business story", "https://a.example/b"), duplicates=[], reason=""
         )
         with patch.object(
-            news_bot, "get_norwegian_morning_news", return_value=("n", [])
-        ), patch.object(news_bot, "get_global_news", return_value=("g", [])), patch.object(
-            news_bot, "get_business_and_stocks", return_value=("b", [selection])
+            nb_news_feeds, "get_norwegian_morning_news", return_value=("n", [])
+        ), patch.object(nb_news_feeds, "get_global_news", return_value=("g", [])), patch.object(
+            nb_market_data, "get_business_and_stocks", return_value=("b", [selection])
         ), patch.object(
-            news_bot, "build_trade_candidates_payload",
-            return_value=("t", news_bot.ScreenOutcome(), {}),
+            nb_screener, "build_trade_candidates_payload",
+            return_value=("t", nb_screener.ScreenOutcome(), {}),
         ), patch.object(
-            news_bot, "build_daily_intro", return_value="i"
+            nb_briefing, "build_daily_intro", return_value="i"
         ):
-            briefing = news_bot.compose_briefing(datetime(2026, 8, 13, 7, 0))
+            briefing = nb_briefing.compose_briefing(datetime(2026, 8, 13, 7, 0))
         sections = {section for section, _key in briefing.pending}
         self.assertIn("business_news", sections)
 
     def test_command_briefing_commits_only_on_success(self):
-        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
-            news_bot, "send_telegram_message", return_value=False
+        with patch.object(nb_briefing, "compose_briefing", return_value=self._briefing()), patch.object(
+            nb_messaging, "send_telegram_message", return_value=False
         ):
-            news_bot._send_briefing(datetime(2026, 8, 13, 7, 0), "chat-1")
+            nb_briefing._send_briefing(datetime(2026, 8, 13, 7, 0), "chat-1")
         self.assertFalse(self._seen())
 
-        with patch.object(news_bot, "compose_briefing", return_value=self._briefing()), patch.object(
-            news_bot, "send_telegram_message", return_value=True
+        with patch.object(nb_briefing, "compose_briefing", return_value=self._briefing()), patch.object(
+            nb_messaging, "send_telegram_message", return_value=True
         ):
-            news_bot._send_briefing(datetime(2026, 8, 13, 7, 0), "chat-1")
+            nb_briefing._send_briefing(datetime(2026, 8, 13, 7, 0), "chat-1")
         self.assertTrue(self._seen())
 
 
@@ -1546,8 +1568,8 @@ class FeedFairShareTests(unittest.TestCase):
             name = feed_url.split("//")[1].split(".")[0]
             return self._feed_items(name, counts[name])[:max_items]
 
-        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
-            items = news_bot._fetch_rss_from_feeds(
+        with patch.object(nb_news_feeds, "_fetch_rss_items", side_effect=fake_fetch):
+            items = nb_news_feeds._fetch_rss_from_feeds(
                 ["https://a.example/f", "https://b.example/f", "https://c.example/f"],
                 max_items=30,
             )
@@ -1561,8 +1583,8 @@ class FeedFairShareTests(unittest.TestCase):
             count = 1 if name == "a" else 100
             return self._feed_items(name, count)[:max_items]
 
-        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
-            items = news_bot._fetch_rss_from_feeds(
+        with patch.object(nb_news_feeds, "_fetch_rss_items", side_effect=fake_fetch):
+            items = nb_news_feeds._fetch_rss_from_feeds(
                 ["https://a.example/f", "https://b.example/f"], max_items=30
             )
         self.assertEqual(len(items), 30)
@@ -1573,57 +1595,57 @@ class FeedFairShareTests(unittest.TestCase):
                 return []
             return self._feed_items("ok", 10)[:max_items]
 
-        with patch.object(news_bot, "_fetch_rss_items", side_effect=fake_fetch):
-            items = news_bot._fetch_rss_from_feeds(
+        with patch.object(nb_news_feeds, "_fetch_rss_items", side_effect=fake_fetch):
+            items = nb_news_feeds._fetch_rss_from_feeds(
                 ["https://broken.example/f", "https://ok.example/f"], max_items=20
             )
         self.assertEqual(len(items), 10)
 
     def test_empty_feed_list_returns_empty(self):
-        self.assertEqual(news_bot._fetch_rss_from_feeds([], max_items=10), [])
+        self.assertEqual(nb_news_feeds._fetch_rss_from_feeds([], max_items=10), [])
 
 
 class TrustedDomainTests(unittest.TestCase):
     def test_bbc_co_uk_links_are_allowed(self):
         """BBC RSS links point at bbc.co.uk; an allowlist with only bbc.com
         silently dropped every BBC item."""
-        self.assertTrue(news_bot._source_allowed("https://www.bbc.co.uk/news/articles/abc"))
+        self.assertTrue(nb_news_feeds._source_allowed("https://www.bbc.co.uk/news/articles/abc"))
 
     def test_bbc_com_links_are_still_allowed(self):
-        self.assertTrue(news_bot._source_allowed("https://www.bbc.com/news/articles/abc"))
+        self.assertTrue(nb_news_feeds._source_allowed("https://www.bbc.com/news/articles/abc"))
 
     def test_untrusted_domain_is_still_rejected(self):
-        self.assertFalse(news_bot._source_allowed("https://not-a-real-outlet.example/x"))
+        self.assertFalse(nb_news_feeds._source_allowed("https://not-a-real-outlet.example/x"))
 
 
 class HealthReportTests(unittest.TestCase):
     def tearDown(self):
-        news_bot.RANKER_STATUS.update(
+        nb_state.RANKER_STATUS.update(
             {"path": "unknown", "latency_ms": None, "error": None, "error_at": None}
         )
 
     def test_health_report_includes_the_ranker_path(self):
-        news_bot.RANKER_STATUS.update({"path": "llm", "latency_ms": 1840, "error": None})
-        report = news_bot.build_health_report()
+        nb_state.RANKER_STATUS.update({"path": "llm", "latency_ms": 1840, "error": None})
+        report = nb_reports.build_health_report()
         self.assertIn("Ranker path: llm", report)
         self.assertIn("1840", report)
 
     def test_health_report_surfaces_the_last_ranker_error(self):
-        news_bot.RANKER_STATUS.update(
+        nb_state.RANKER_STATUS.update(
             {
                 "path": "heuristic",
                 "error": "APITimeoutError: timed out",
                 "error_at": "2026-08-13T07:00:01",
             }
         )
-        self.assertIn("APITimeoutError", news_bot.build_health_report())
+        self.assertIn("APITimeoutError", nb_reports.build_health_report())
 
     def test_health_report_omits_the_error_line_when_clean(self):
-        news_bot.RANKER_STATUS.update({"path": "heuristic", "latency_ms": None, "error": None})
-        self.assertNotIn("Last ranker error", news_bot.build_health_report())
+        nb_state.RANKER_STATUS.update({"path": "heuristic", "latency_ms": None, "error": None})
+        self.assertNotIn("Last ranker error", nb_reports.build_health_report())
 
     def test_health_report_retains_pre_existing_fields(self):
-        report = news_bot.build_health_report()
+        report = nb_reports.build_health_report()
         self.assertIn("Bot Health Check", report)
         self.assertIn("Last run status", report)
         self.assertIn("Timezone", report)
@@ -1631,32 +1653,32 @@ class HealthReportTests(unittest.TestCase):
 
 class TradeMetricsTests(unittest.TestCase):
     def tearDown(self):
-        news_bot.HISTORY_CACHE.clear()
+        nb_state.HISTORY_CACHE.clear()
 
     def _cache(self, symbol, history):
-        news_bot.HISTORY_CACHE[f"{symbol}|3mo|1d"] = (time.time(), history)
+        nb_state.HISTORY_CACHE[f"{symbol}|3mo|1d"] = (time.time(), history)
 
     def test_drops_bar_dated_today(self):
         today = datetime.now(timezone.utc).date()
         history = _history([100.0] * 40, last_date=today, tz="UTC")
-        trimmed = news_bot._drop_in_progress_bar(history)
+        trimmed = nb_indicators._drop_in_progress_bar(history)
         self.assertEqual(len(trimmed), 39)
         self.assertLess(trimmed.index[-1].date(), today)
 
     def test_keeps_bar_dated_before_today(self):
         yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
         history = _history([100.0] * 40, last_date=yesterday, tz="UTC")
-        trimmed = news_bot._drop_in_progress_bar(history)
+        trimmed = nb_indicators._drop_in_progress_bar(history)
         self.assertEqual(len(trimmed), 40)
 
     def test_returns_none_below_thirty_usable_bars(self):
         self._cache("SHORT", _history([100.0] * 29))
-        self.assertIsNone(news_bot._compute_trade_metrics("SHORT"))
+        self.assertIsNone(nb_indicators._compute_trade_metrics("SHORT"))
 
     def test_metrics_computed_on_known_fixture(self):
         closes = [100.0] * 35 + [100.0, 101.0, 102.0, 103.0, 104.0]
         self._cache("RISE", _history(closes))
-        metrics = news_bot._compute_trade_metrics("RISE")
+        metrics = nb_indicators._compute_trade_metrics("RISE")
         self.assertIsNotNone(metrics)
         self.assertEqual(metrics.symbol, "RISE")
         self.assertAlmostEqual(metrics.last_close, 104.0, places=4)
@@ -1677,13 +1699,13 @@ class TradeMetricsTests(unittest.TestCase):
     def test_session_reflects_last_kept_bar(self):
         last = datetime.now().date() - timedelta(days=3)
         self._cache("SESS", _history([100.0] * 40, last_date=last))
-        metrics = news_bot._compute_trade_metrics("SESS")
+        metrics = nb_indicators._compute_trade_metrics("SESS")
         self.assertEqual(metrics.session, last.strftime("%Y-%m-%d"))
 
     def test_enrichment_fields_are_populated(self):
         closes = [100.0] * 35 + [100.0, 101.0, 102.0, 103.0, 104.0]
         self._cache("ENR", _history(closes))
-        metrics = news_bot._compute_trade_metrics("ENR")
+        metrics = nb_indicators._compute_trade_metrics("ENR")
         self.assertGreater(metrics.ema20, 0.0)
         self.assertIsNotNone(metrics.rsi_14)
         self.assertGreaterEqual(metrics.resistance_level, metrics.support_level)
@@ -1692,19 +1714,19 @@ class TradeMetricsTests(unittest.TestCase):
     def test_volume_ratio_uses_prior_twenty_sessions(self):
         volumes = [1_000_000.0] * 39 + [2_000_000.0]
         self._cache("VOL", _history([100.0] * 40, volumes=volumes))
-        metrics = news_bot._compute_trade_metrics("VOL")
+        metrics = nb_indicators._compute_trade_metrics("VOL")
         self.assertAlmostEqual(metrics.volume_ratio, 2.0)
 
     def test_volume_ratio_is_unknown_when_baseline_is_unavailable(self):
         self._cache("NOVOL", _history([100.0] * 40, volumes=[0.0] * 40))
-        metrics = news_bot._compute_trade_metrics("NOVOL")
+        metrics = nb_indicators._compute_trade_metrics("NOVOL")
         self.assertIsNone(metrics.volume_ratio)
 
     def test_missing_volume_session_does_not_shrink_the_baseline_window(self):
         volumes = [1_000_000.0] * 40
         volumes[-2] = float("nan")
         self._cache("GAPVOL", _history([100.0] * 40, volumes=volumes))
-        metrics = news_bot._compute_trade_metrics("GAPVOL")
+        metrics = nb_indicators._compute_trade_metrics("GAPVOL")
         self.assertIsNone(metrics.volume_ratio)
         self.assertEqual(metrics.volume_trend, "unknown")
 
@@ -1714,17 +1736,17 @@ class PublishedPickTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = os.path.join(self.directory.name, "picks.db")
-        self.store = news_bot.TradeHistoryStore(self.path)
+        self.store = nb_history_store.TradeHistoryStore(self.path)
         self.addCleanup(self.store.close)
-        replacement = patch.object(news_bot, "TRADE_HISTORY", self.store)
+        replacement = patch.object(nb_history_store, "TRADE_HISTORY", self.store)
         replacement.start()
         self.addCleanup(replacement.stop)
 
     def _publish(self, symbol="AAA"):
         at = datetime(2026, 8, 7, 19, 0, tzinfo=timezone.utc)
-        with patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 2), \
-             patch.object(news_bot.SETTINGS, "trade_backtest_cost_bps", 10.0), \
-             patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"):
+        with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 2), \
+             patch.object(nb_config.SETTINGS, "trade_backtest_cost_bps", 10.0), \
+             patch.object(nb_config.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"):
             self.store.publish([_metrics(symbol=symbol, session="2026-08-06")], at)
         return self.store.published_picks()[0]
 
@@ -1742,7 +1764,7 @@ class PublishedPickTests(unittest.TestCase):
 
     def test_first_publication_is_immutable_and_survives_reopen_and_pruning(self):
         first = self._publish()
-        with patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 20):
+        with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 20):
             self.store.publish(
                 [_metrics(symbol="AAA", session="2026-08-06", last_close=999.0)],
                 datetime(2026, 8, 10, tzinfo=timezone.utc),
@@ -1758,7 +1780,7 @@ class PublishedPickTests(unittest.TestCase):
     def test_outcome_starts_after_actual_publication_not_old_signal(self):
         pick = self._publish()
         history = self._history()
-        outcome = news_bot._published_pick_outcome(pick, history, history)
+        outcome = nb_history_store._published_pick_outcome(pick, history, history)
         self.assertEqual(outcome["entry_session"], "2026-08-10")
         self.assertEqual(outcome["exit_session"], "2026-08-11")
         self.assertAlmostEqual(outcome["gross_return_pct"], 10.0)
@@ -1769,19 +1791,19 @@ class PublishedPickTests(unittest.TestCase):
         pick = self._publish()
         # Saturday in UTC is still Friday in New York.
         pick["published_at"] = "2026-08-08T01:00:00+00:00"
-        outcome = news_bot._published_pick_outcome(pick, self._history(), None)
+        outcome = nb_history_store._published_pick_outcome(pick, self._history(), None)
         self.assertEqual(outcome["entry_session"], "2026-08-10")
         self.assertIsNone(outcome["benchmark_return_pct"])
 
     def test_pending_and_missing_history_are_distinct(self):
         pick = self._publish()
         self.assertIsNone(
-            news_bot._published_pick_outcome(pick, self._history().iloc[:3], None)
+            nb_history_store._published_pick_outcome(pick, self._history().iloc[:3], None)
         )
         with self.assertRaises(ValueError):
-            news_bot._published_pick_outcome(pick, None, None)
+            nb_history_store._published_pick_outcome(pick, None, None)
         with self.assertRaises(ValueError):
-            news_bot._published_pick_outcome(pick, self._history().iloc[2:], None)
+            nb_history_store._published_pick_outcome(pick, self._history().iloc[2:], None)
 
     def test_unknown_timezone_and_duplicate_sessions_are_unavailable(self):
         pick = self._publish()
@@ -1790,7 +1812,7 @@ class PublishedPickTests(unittest.TestCase):
         naive.index = naive.index.tz_localize(None)
         for invalid in (naive, pd.concat([history, history.iloc[-1:]]), history.iloc[::-1]):
             with self.subTest(index=invalid.index), self.assertRaises(ValueError):
-                news_bot._published_pick_outcome(pick, invalid, None)
+                nb_history_store._published_pick_outcome(pick, invalid, None)
 
     def test_missing_holding_period_prices_do_not_shorten_horizon(self):
         pick = self._publish()
@@ -1798,7 +1820,7 @@ class PublishedPickTests(unittest.TestCase):
             history = self._history()
             history.loc[history.index[2], "Open"] = value
             with self.subTest(value=value), self.assertRaises(ValueError):
-                news_bot._published_pick_outcome(pick, history, None)
+                nb_history_store._published_pick_outcome(pick, history, None)
 
     def test_missing_or_invalid_benchmark_keeps_stock_outcome(self):
         pick = self._publish()
@@ -1807,33 +1829,33 @@ class PublishedPickTests(unittest.TestCase):
         invalid.loc[invalid.index[2], "Open"] = float("nan")
         for benchmark in (history.iloc[:3], invalid, history.drop(columns=["Open"])):
             with self.subTest(benchmark=benchmark):
-                outcome = news_bot._published_pick_outcome(pick, history, benchmark)
+                outcome = nb_history_store._published_pick_outcome(pick, history, benchmark)
                 self.assertAlmostEqual(outcome["net_return_pct"], 9.8)
                 self.assertIsNone(outcome["excess_return_pct"])
 
     def test_pending_report_does_not_persist_an_outcome(self):
         self._publish()
-        with patch.object(news_bot, "_fetch_ticker_history", return_value=self._history().iloc[:3]):
-            report = news_bot.build_published_pick_report()
+        with patch.object(nb_market_data, "_fetch_ticker_history", return_value=self._history().iloc[:3]):
+            report = nb_history_store.build_published_pick_report()
         self.assertIn("1 pending", report)
         self.assertIsNone(self.store.published_picks()[0]["outcome_json"])
 
     def test_completed_outcome_is_persisted_and_not_refetched(self):
         self._publish()
-        with patch.object(news_bot, "_fetch_ticker_history", return_value=self._history()) as fetch:
-            report = news_bot.build_published_pick_report()
+        with patch.object(nb_market_data, "_fetch_ticker_history", return_value=self._history()) as fetch:
+            report = nb_history_store.build_published_pick_report()
         self.assertEqual(fetch.call_count, 2)
         self.assertIn("1 completed", report)
         self.assertIn("+9.80%", report)
         self.assertIn("Benchmark coverage: 1/1", report)
-        with patch.object(news_bot, "_fetch_ticker_history") as fetch:
-            self.assertEqual(news_bot.build_published_pick_report(), report)
+        with patch.object(nb_market_data, "_fetch_ticker_history") as fetch:
+            self.assertEqual(nb_history_store.build_published_pick_report(), report)
         fetch.assert_not_called()
         self.assertIsNotNone(self.store.published_picks()[0]["outcome_json"])
 
     def test_completed_outcomes_cannot_be_overwritten_after_reopen(self):
         pick = self._publish()
-        outcome = news_bot._published_pick_outcome(pick, self._history(), None)
+        outcome = nb_history_store._published_pick_outcome(pick, self._history(), None)
         self.store.complete_pick(pick, outcome)
         self.store.close()
         self.store.complete_pick(pick, dict(outcome, net_return_pct=-100.0))
@@ -1852,11 +1874,11 @@ class PublishedPickTests(unittest.TestCase):
         self.assertEqual(json.loads(rows[1]["snapshot_json"])["rank"], 2)
 
     def test_publication_rejects_invalid_horizon_cost_and_unknown_timezone(self):
-        with patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 0):
+        with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 0):
             with self.assertRaises(ValueError):
                 self._publish_without_settings()
         for cost in (-1.0, float("inf"), float("nan")):
-            with patch.object(news_bot.SETTINGS, "trade_backtest_cost_bps", cost):
+            with patch.object(nb_config.SETTINGS, "trade_backtest_cost_bps", cost):
                 with self.subTest(cost=cost), self.assertRaises(ValueError):
                     self._publish_without_settings()
         with self.assertRaises(ValueError):
@@ -1868,38 +1890,38 @@ class PublishedPickTests(unittest.TestCase):
 
     def test_no_completed_claim_when_outcome_persistence_fails(self):
         self._publish()
-        with patch.object(news_bot, "_fetch_ticker_history", return_value=self._history()), \
+        with patch.object(nb_market_data, "_fetch_ticker_history", return_value=self._history()), \
              patch.object(self.store, "complete_pick", side_effect=sqlite3.OperationalError("disk")), \
              self.assertLogs("news_bot", level="WARNING"):
-            report = news_bot.build_published_pick_report()
+            report = nb_history_store.build_published_pick_report()
         self.assertIn("0 completed", report)
         self.assertIn("1 unavailable", report)
         self.assertIsNone(self.store.published_picks()[0]["outcome_json"])
 
     def test_provider_failure_keeps_report_available(self):
         self._publish()
-        with patch.object(news_bot, "_fetch_ticker_history", side_effect=news_bot.yf.exceptions.YFException("missing")), \
+        with patch.object(nb_market_data, "_fetch_ticker_history", side_effect=yfinance.exceptions.YFException("missing")), \
              self.assertLogs("news_bot", level="WARNING"):
-            report = news_bot.build_published_pick_report()
+            report = nb_history_store.build_published_pick_report()
         self.assertIn("1 unavailable", report)
 
     def test_report_counts_unavailable_data_without_turning_it_into_losses(self):
         self._publish()
-        with patch.object(news_bot, "_fetch_ticker_history", return_value=None), \
+        with patch.object(nb_market_data, "_fetch_ticker_history", return_value=None), \
              self.assertLogs("news_bot", level="WARNING"):
-            report = news_bot.build_published_pick_report()
+            report = nb_history_store.build_published_pick_report()
         self.assertIn("0 completed", report)
         self.assertIn("1 unavailable", report)
         self.assertNotIn("hit rate", report)
 
     def test_empty_ledger_does_not_fetch(self):
-        with patch.object(news_bot, "_fetch_ticker_history") as fetch:
-            report = news_bot.build_published_pick_report()
+        with patch.object(nb_market_data, "_fetch_ticker_history") as fetch:
+            report = nb_history_store.build_published_pick_report()
         self.assertIn("No published picks", report)
         fetch.assert_not_called()
 
     def test_report_window_is_100_with_at_most_ten_details(self):
-        with patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 2):
+        with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 2):
             self.store.publish(
                 [_metrics(symbol=f"S{index:03d}", session="2026-08-06") for index in range(105)],
                 datetime(2026, 8, 7, 19, 0, tzinfo=timezone.utc),
@@ -1908,10 +1930,10 @@ class PublishedPickTests(unittest.TestCase):
         self.assertEqual(len(picks), 100)
         for pick in picks:
             self.store.complete_pick(
-                pick, news_bot._published_pick_outcome(pick, self._history(), None),
+                pick, nb_history_store._published_pick_outcome(pick, self._history(), None),
             )
-        with patch.object(news_bot, "_fetch_ticker_history") as fetch:
-            report = news_bot.build_published_pick_report()
+        with patch.object(nb_market_data, "_fetch_ticker_history") as fetch:
+            report = nb_history_store.build_published_pick_report()
         fetch.assert_not_called()
         self.assertIn("Latest 100 recorded signals", report)
         self.assertIn("100 completed", report)
@@ -1923,46 +1945,46 @@ class PublishedPickTests(unittest.TestCase):
     def test_read_failure_is_explicit(self):
         with patch.object(self.store, "published_picks", side_effect=sqlite3.OperationalError("disk")), \
              self.assertLogs("news_bot", level="ERROR"):
-            report = news_bot.build_published_pick_report()
+            report = nb_history_store.build_published_pick_report()
         self.assertIn("ledger unavailable", report)
 
     def test_recommendations_record_only_shown_picks_on_success(self):
         metrics = [_metrics(symbol=f"S{i}", session="2026-08-06") for i in range(7)]
-        outcome = news_bot.ScreenOutcome(qualified=metrics)
-        with patch.object(news_bot, "build_trade_candidates_payload", return_value=("text", outcome, {})), \
-             patch.object(news_bot, "_broadcast_message", return_value=False), \
-             patch.object(news_bot, "send_candidate_charts"):
-            news_bot._handle_command("/recommendations", "chat")
+        outcome = nb_screener.ScreenOutcome(qualified=metrics)
+        with patch.object(nb_screener, "build_trade_candidates_payload", return_value=("text", outcome, {})), \
+             patch.object(nb_messaging, "_broadcast_message", return_value=False), \
+             patch.object(nb_charts, "send_candidate_charts"):
+            nb_commands._handle_command("/recommendations", "chat")
         self.assertEqual(self.store.published_picks(), [])
-        with patch.object(news_bot, "build_trade_candidates_payload", return_value=("text", outcome, {})), \
-             patch.object(news_bot, "_broadcast_message", return_value=True), \
-             patch.object(news_bot, "send_candidate_charts"):
-            news_bot._handle_command("/recommendations", "chat")
+        with patch.object(nb_screener, "build_trade_candidates_payload", return_value=("text", outcome, {})), \
+             patch.object(nb_messaging, "_broadcast_message", return_value=True), \
+             patch.object(nb_charts, "send_candidate_charts"):
+            nb_commands._handle_command("/recommendations", "chat")
         self.assertEqual({row["symbol"] for row in self.store.published_picks()}, {f"S{i}" for i in range(5)})
 
     def test_scheduled_and_now_briefings_record_only_after_delivery(self):
-        briefing = news_bot.Briefing(message="text", picks=[_metrics(session="2026-08-06")])
-        with patch.object(news_bot, "compose_briefing", return_value=briefing), \
-             patch.object(news_bot, "_broadcast_message", return_value=False), \
-             patch.object(news_bot.STATE, "save"):
-            self.assertFalse(news_bot.job_daily_briefing())
-            news_bot._send_briefing(datetime.now(), "chat")
+        briefing = nb_briefing.Briefing(message="text", picks=[_metrics(session="2026-08-06")])
+        with patch.object(nb_briefing, "compose_briefing", return_value=briefing), \
+             patch.object(nb_messaging, "_broadcast_message", return_value=False), \
+             patch.object(nb_state.STATE, "save"):
+            self.assertFalse(nb_briefing.job_daily_briefing())
+            nb_briefing._send_briefing(datetime.now(), "chat")
         self.assertEqual(self.store.published_picks(), [])
-        with patch.object(news_bot, "compose_briefing", return_value=briefing), \
-             patch.object(news_bot, "_broadcast_message", return_value=True), \
-             patch.object(news_bot.STATE, "save"):
-            self.assertTrue(news_bot.job_daily_briefing())
-            news_bot._send_briefing(datetime.now(), "chat")
+        with patch.object(nb_briefing, "compose_briefing", return_value=briefing), \
+             patch.object(nb_messaging, "_broadcast_message", return_value=True), \
+             patch.object(nb_state.STATE, "save"):
+            self.assertTrue(nb_briefing.job_daily_briefing())
+            nb_briefing._send_briefing(datetime.now(), "chat")
         self.assertEqual(len(self.store.published_picks()), 1)
 
     def test_composition_retains_only_rendered_metrics_without_rescreening(self):
         metrics = [_metrics(symbol=f"S{i}") for i in range(7)]
-        outcome = news_bot.ScreenOutcome(qualified=metrics)
-        with patch.object(news_bot, "get_norwegian_morning_news", return_value=("n", [])), \
-             patch.object(news_bot, "get_global_news", return_value=("g", [])), \
-             patch.object(news_bot, "get_business_and_stocks", return_value=("b", [])), \
-             patch.object(news_bot, "build_trade_candidates_payload", return_value=("candidates", outcome, {})) as payload:
-            briefing = news_bot.compose_briefing(datetime(2026, 8, 10, 7, 0))
+        outcome = nb_screener.ScreenOutcome(qualified=metrics)
+        with patch.object(nb_news_feeds, "get_norwegian_morning_news", return_value=("n", [])), \
+             patch.object(nb_news_feeds, "get_global_news", return_value=("g", [])), \
+             patch.object(nb_market_data, "get_business_and_stocks", return_value=("b", [])), \
+             patch.object(nb_screener, "build_trade_candidates_payload", return_value=("candidates", outcome, {})) as payload:
+            briefing = nb_briefing.compose_briefing(datetime(2026, 8, 10, 7, 0))
         self.assertIn("candidates", briefing.message)
         self.assertEqual(briefing.picks, metrics[:5])
         payload.assert_called_once_with()
@@ -1970,18 +1992,18 @@ class PublishedPickTests(unittest.TestCase):
     def test_publish_failure_is_logged_without_claiming_ledger_success(self):
         with patch.object(self.store, "publish", side_effect=sqlite3.OperationalError("disk")), \
              self.assertLogs("news_bot", level="ERROR") as logs:
-            news_bot._record_published_picks([_metrics()])
+            nb_history_store._record_published_picks([_metrics()])
         self.assertIn("published_picks_record_failed", "\n".join(logs.output))
 
     def test_pickperformance_command_is_separate_from_backtest(self):
-        with patch.object(news_bot, "build_published_pick_report", return_value="picks") as report, \
-             patch.object(news_bot, "build_trade_performance_report") as backtest, \
-             patch.object(news_bot, "_broadcast_message") as send:
-            news_bot._handle_command("/pickperformance", "chat")
+        with patch.object(nb_history_store, "build_published_pick_report", return_value="picks") as report, \
+             patch.object(nb_backtest_reports, "build_trade_performance_report") as backtest, \
+             patch.object(nb_messaging, "_broadcast_message") as send:
+            nb_commands._handle_command("/pickperformance", "chat")
         report.assert_called_once()
         backtest.assert_not_called()
         send.assert_called_once_with("picks", chat_id="chat")
-        self.assertIn("/pickperformance", news_bot._command_help_text())
+        self.assertIn("/pickperformance", nb_commands._command_help_text())
 
 
 class SignalDiagnosticsTests(unittest.TestCase):
@@ -2008,7 +2030,7 @@ class SignalDiagnosticsTests(unittest.TestCase):
             self._trade(symbol="BBB", date="2026-01-06", rank=2, net=1.0, count=3, excess=None),
             self._trade(symbol="CCC", date="2026-01-06", rank=3, net=1.0, count=3),
         ]
-        paired = news_bot._backtest_diagnostics(rows)["paired_ranking"]
+        paired = nb_backtest._backtest_diagnostics(rows)["paired_ranking"]
         self.assertEqual(paired["paired_dates"], 2)
         self.assertEqual(paired["avg_net_delta_pct"], 1.0)
         self.assertEqual(paired["median_net_delta_pct"], 1.0)
@@ -2023,14 +2045,14 @@ class SignalDiagnosticsTests(unittest.TestCase):
             "omitted_symbols": 0, "pending_outcomes": 0, "purged_outcomes": 0,
             "liquidity_rejected": 0, "top_n": 1,
             "diagnostics": {
-                "development": news_bot._backtest_diagnostics([
+                "development": nb_backtest._backtest_diagnostics([
                     self._trade(net=2.0), self._trade(symbol="BBB", rank=2, net=-1.0),
                 ]),
-                "holdout": news_bot._backtest_diagnostics([]),
+                "holdout": nb_backtest._backtest_diagnostics([]),
             },
         }
-        with patch.object(news_bot, "_run_walk_forward_backtest", return_value=result):
-            report = news_bot.build_trade_diagnostics_report()
+        with patch.object(nb_backtest_reports, "_run_walk_forward_backtest", return_value=result):
+            report = nb_backtest_reports.build_trade_diagnostics_report()
         self.assertIn("mean net delta +3.00 pp", report)
         self.assertIn("No completed qualifiers.", report)
 
@@ -2039,7 +2061,7 @@ class SignalDiagnosticsTests(unittest.TestCase):
             self._trade(count=3), self._trade(symbol="BBB", rank=2, count=3),
             self._trade(date="2026-01-06", count=1),
         ]
-        paired = news_bot._backtest_diagnostics(rows)["paired_ranking"]
+        paired = nb_backtest._backtest_diagnostics(rows)["paired_ranking"]
         self.assertEqual(paired["incomplete_dates"], 1)
         self.assertEqual(paired["no_comparison_dates"], 1)
         self.assertEqual(paired["paired_dates"], 0)
@@ -2053,8 +2075,8 @@ class SignalDiagnosticsTests(unittest.TestCase):
         ]
         rows[0]["qualifying_streak"] = 4
         rows[1]["qualifying_streak"] = 3
-        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
-            groups = news_bot._backtest_diagnostics(rows)["groups"]
+        with patch.object(nb_config.SETTINGS, "trade_min_volume_ratio", 1.2):
+            groups = nb_backtest._backtest_diagnostics(rows)["groups"]
         self.assertEqual(list(groups["rank"]), ["1", "2", "10"])
         for dimension, buckets in (
             ("momentum", ["<3%", "3-6%", ">=6%"]),
@@ -2070,28 +2092,28 @@ class SignalDiagnosticsTests(unittest.TestCase):
         self.assertEqual(groups["quarter"]["2026-Q1"]["benchmark_count"], 3)
 
     def test_empty_diagnostics_are_explicit(self):
-        result = news_bot._backtest_diagnostics([])
+        result = nb_backtest._backtest_diagnostics([])
         self.assertEqual(result["groups"], {})
         self.assertEqual(result["paired_ranking"]["paired_dates"], 0)
         self.assertIsNone(result["paired_ranking"]["selected_better_pct"])
 
     def test_diagnostics_command_dispatch_and_configuration_error(self):
-        with patch.object(news_bot, "build_trade_diagnostics_report", return_value="diagnostics") as build, \
-             patch.object(news_bot, "_broadcast_message") as send:
-            news_bot._handle_command("/diagnostics", "chat")
+        with patch.object(nb_backtest_reports, "build_trade_diagnostics_report", return_value="diagnostics") as build, \
+             patch.object(nb_messaging, "_broadcast_message") as send:
+            nb_commands._handle_command("/diagnostics", "chat")
         build.assert_called_once_with()
         send.assert_called_once_with("diagnostics", chat_id="chat")
-        self.assertIn("/diagnostics", news_bot._command_help_text())
-        with patch.object(news_bot, "_run_walk_forward_backtest", return_value={"error": "invalid_cost"}):
-            report = news_bot.build_trade_diagnostics_report()
+        self.assertIn("/diagnostics", nb_commands._command_help_text())
+        with patch.object(nb_backtest_reports, "_run_walk_forward_backtest", return_value={"error": "invalid_cost"}):
+            report = nb_backtest_reports.build_trade_diagnostics_report()
         self.assertIn("Diagnostics unavailable: invalid_cost", report)
 
 
 class EvaluationUniverseTests(unittest.TestCase):
     def test_broad_preset_is_fixed_unique_and_covers_four_markets_and_eleven_sectors(self):
-        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "broad-v1"), \
-             patch.object(news_bot, "_configured_stock_watchlist", side_effect=AssertionError("live list")):
-            name, stocks = news_bot._evaluation_stock_universe()
+        with patch.object(nb_config.SETTINGS, "trade_backtest_universe", "broad-v1"), \
+             patch.object(nb_screener, "_configured_stock_watchlist", side_effect=AssertionError("live list")):
+            name, stocks = nb_backtest_reports._evaluation_stock_universe()
         self.assertEqual(name, "broad-v1")
         self.assertEqual(len(stocks), 44)
         self.assertEqual(
@@ -2103,11 +2125,11 @@ class EvaluationUniverseTests(unittest.TestCase):
         self.assertEqual(list(stocks)[:2], ["MSFT", "JPM"])
 
     def test_configured_default_preserves_stock_only_lists_and_deduplicates(self):
-        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "configured"), \
-             patch.object(news_bot, "_configured_stock_watchlist", return_value=[
+        with patch.object(nb_config.SETTINGS, "trade_backtest_universe", "configured"), \
+             patch.object(nb_screener, "_configured_stock_watchlist", return_value=[
                  ("Alpha", "AAA"), ("Alpha duplicate", "AAA"), ("Beta", "BBB"),
              ]):
-            name, stocks = news_bot._evaluation_stock_universe()
+            name, stocks = nb_backtest_reports._evaluation_stock_universe()
         self.assertEqual(name, "configured")
         self.assertEqual(list(stocks), ["AAA", "BBB"])
 
@@ -2120,27 +2142,27 @@ class EvaluationUniverseTests(unittest.TestCase):
             "symbol,name,market,sector\nAAA,Alpha,US,Technology,extra\n",
             "symbol,name,market,sector\nAAA,Alpha,US,Technology\nAAA,Duplicate,US,Technology\n",
         )
-        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "broad-v1"):
+        with patch.object(nb_config.SETTINGS, "trade_backtest_universe", "broad-v1"):
             for manifest in manifests:
                 with self.subTest(manifest=manifest), patch("builtins.open", mock_open(read_data=manifest)):
                     with self.assertRaises(ValueError):
-                        news_bot._evaluation_stock_universe()
-        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "typo"), \
+                        nb_backtest_reports._evaluation_stock_universe()
+        with patch.object(nb_config.SETTINGS, "trade_backtest_universe", "typo"), \
              self.assertLogs("news_bot", level="ERROR"):
-            self.assertEqual(news_bot._run_walk_forward_backtest()["error"], "invalid_universe")
+            self.assertEqual(nb_backtest_reports._run_walk_forward_backtest()["error"], "invalid_universe")
 
     def test_manifest_missing_is_logged_and_reported(self):
-        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "broad-v1"), \
+        with patch.object(nb_config.SETTINGS, "trade_backtest_universe", "broad-v1"), \
              patch("builtins.open", side_effect=FileNotFoundError("manifest")), \
              self.assertLogs("news_bot", level="ERROR"):
-            report = news_bot.build_trade_performance_report()
+            report = nb_backtest_reports.build_trade_performance_report()
         self.assertIn("universe must be configured or broad-v1", report)
 
     def test_live_watchlist_is_unchanged_by_evaluation_preset(self):
-        original = news_bot._configured_watchlist()
-        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "broad-v1"):
-            news_bot._evaluation_stock_universe()
-            self.assertEqual(news_bot._configured_watchlist(), original)
+        original = nb_screener._configured_watchlist()
+        with patch.object(nb_config.SETTINGS, "trade_backtest_universe", "broad-v1"):
+            nb_backtest_reports._evaluation_stock_universe()
+            self.assertEqual(nb_screener._configured_watchlist(), original)
 
     def test_loader_uses_separate_limit_and_reports_market_sector_and_missing_data(self):
         stocks = {
@@ -2153,13 +2175,13 @@ class EvaluationUniverseTests(unittest.TestCase):
         invalid = history.copy()
         invalid.iloc[40, invalid.columns.get_loc("Open")] = float("nan")
         data = {"AAA": history, "CCC.NS": invalid, "SPY": history}
-        with patch.object(news_bot, "_evaluation_stock_universe", return_value=("broad-v1", stocks)), \
-             patch.object(news_bot.SETTINGS, "trade_universe_max", 1), \
-             patch.object(news_bot.SETTINGS, "trade_backtest_universe_max", 3), \
-             patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:SPY,.NS:NIFTY"), \
-             patch.object(news_bot, "_fetch_ticker_history", side_effect=lambda symbol, **kw: data.get(symbol)), \
+        with patch.object(nb_backtest_reports, "_evaluation_stock_universe", return_value=("broad-v1", stocks)), \
+             patch.object(nb_config.SETTINGS, "trade_universe_max", 1), \
+             patch.object(nb_config.SETTINGS, "trade_backtest_universe_max", 3), \
+             patch.object(nb_config.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:SPY,.NS:NIFTY"), \
+             patch.object(nb_market_data, "_fetch_ticker_history", side_effect=lambda symbol, **kw: data.get(symbol)), \
              self.assertLogs("news_bot", level="WARNING"):
-            result = news_bot._run_walk_forward_backtest()
+            result = nb_backtest_reports._run_walk_forward_backtest()
         self.assertEqual(result["tested_symbols"], 3)
         self.assertEqual(result["configured_symbols"], 4)
         self.assertEqual(result["omitted_symbols"], 1)
@@ -2176,9 +2198,9 @@ class EvaluationUniverseTests(unittest.TestCase):
                         sum(group[key]["trade_count"] for group in groups.values()),
                         result["cohorts"][cohort][key]["trade_count"],
                     )
-        with patch.object(news_bot, "_run_walk_forward_backtest", return_value=result):
-            report = news_bot.build_trade_performance_report()
-            diagnostics = news_bot.build_trade_diagnostics_report()
+        with patch.object(nb_backtest_reports, "_run_walk_forward_backtest", return_value=result):
+            report = nb_backtest_reports.build_trade_performance_report()
+            diagnostics = nb_backtest_reports.build_trade_diagnostics_report()
         for text in ("broad-v1", "Missing stock histories: BBB",
                      "Missing benchmarks: NIFTY", "Unusable stock histories: CCC.NS"):
             self.assertIn(text, report)
@@ -2186,18 +2208,18 @@ class EvaluationUniverseTests(unittest.TestCase):
         self.assertIn("Holdout by universe sector", report)
 
     def test_invalid_evaluation_limit_is_not_silently_clamped(self):
-        with patch.object(news_bot.SETTINGS, "trade_backtest_universe_max", 0), \
+        with patch.object(nb_config.SETTINGS, "trade_backtest_universe_max", 0), \
              self.assertLogs("news_bot", level="ERROR"):
-            self.assertEqual(news_bot._run_walk_forward_backtest()["error"], "invalid_universe")
+            self.assertEqual(nb_backtest_reports._run_walk_forward_backtest()["error"], "invalid_universe")
 
     def test_broad_loader_keeps_historical_liquidity_filter(self):
         stocks = {"AAA": {"name": "Alpha", "market": "US", "sector": "Technology"}}
         history = WalkForwardBacktestTests()._rising_history()
         history["Volume"] = 100.0
-        with patch.object(news_bot, "_evaluation_stock_universe", return_value=("broad-v1", stocks)), \
-             patch.object(news_bot.SETTINGS, "trade_backtest_min_avg_volume", 100000.0), \
-             patch.object(news_bot, "_fetch_ticker_history", return_value=history):
-            result = news_bot._run_walk_forward_backtest()
+        with patch.object(nb_backtest_reports, "_evaluation_stock_universe", return_value=("broad-v1", stocks)), \
+             patch.object(nb_config.SETTINGS, "trade_backtest_min_avg_volume", 100000.0), \
+             patch.object(nb_market_data, "_fetch_ticker_history", return_value=history):
+            result = nb_backtest_reports._run_walk_forward_backtest()
         self.assertEqual(result["coverage"]["market"]["US"]["usable"], 1)
         self.assertEqual(result["trade_count"], 0)
         self.assertGreater(result["liquidity_rejected"], 0)
@@ -2218,7 +2240,7 @@ class CostValidationTests(unittest.TestCase):
     def test_cost_stress_uses_identical_picks_and_preserves_original_rows(self):
         rows = [self._trade(), self._trade(selected=False, benchmark=None)]
         original = json.dumps(rows, sort_keys=True)
-        result = news_bot._backtest_cost_validation(rows, 10.0)
+        result = nb_backtest._backtest_cost_validation(rows, 10.0)
         self.assertEqual([row["cost_bps_per_side"] for row in result["scenarios"]], [10, 25, 50])
         for scenario, expected_net in zip(result["scenarios"], [0.8, 0.5, 0.0]):
             comparison = scenario["cohorts"]["development"]
@@ -2235,14 +2257,14 @@ class CostValidationTests(unittest.TestCase):
         year_crossing = dict(
             self._trade(date="2025-12-30", exit_date="2026-01-05"), quarter="2025-Q4",
         )
-        result = news_bot._backtest_cost_validation(
+        result = nb_backtest._backtest_cost_validation(
             [self._trade(), crossing, year_crossing], 10.0,
         )
         self.assertEqual(result["quarter_crossing_excluded"], 2)
         self.assertEqual(result["scenarios"][0]["cohorts"]["development"]["all"]["trade_count"], 1)
 
     def test_empty_cohorts_and_high_baseline_cost_are_explicit(self):
-        result = news_bot._backtest_cost_validation([], 75.0)
+        result = nb_backtest._backtest_cost_validation([], 75.0)
         self.assertEqual([row["cost_bps_per_side"] for row in result["scenarios"]], [75, 90, 115])
         for scenario in result["scenarios"]:
             for comparison in scenario["cohorts"].values():
@@ -2269,8 +2291,8 @@ class WalkForwardBacktestTests(unittest.TestCase):
     def test_walk_forward_uses_next_open_and_fixed_session_horizon(self):
         stock = self._rising_history()
         benchmark = self._rising_history(step=0.1)
-        with patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"):
-            result = news_bot._walk_forward_backtest(
+        with patch.object(nb_config.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"):
+            result = nb_backtest._walk_forward_backtest(
                 {"AAA": stock},
                 {"BENCH": benchmark},
                 horizon_sessions=5,
@@ -2300,8 +2322,8 @@ class WalkForwardBacktestTests(unittest.TestCase):
         original = self._rising_history()
         changed = original.copy()
         changed.loc[changed.index[45]:, ["Open", "High", "Low", "Close"]] *= 0.5
-        original_metrics = news_bot._backtest_metrics_by_session("AAA", original)[1]
-        changed_metrics = news_bot._backtest_metrics_by_session("AAA", changed)[1]
+        original_metrics = nb_backtest._backtest_metrics_by_session("AAA", original)[1]
+        changed_metrics = nb_backtest._backtest_metrics_by_session("AAA", changed)[1]
         session = original.index[35].strftime("%Y-%m-%d")
         self.assertAlmostEqual(
             original_metrics[session].week_momentum_pct,
@@ -2316,9 +2338,9 @@ class WalkForwardBacktestTests(unittest.TestCase):
         original = self._rising_history()
         changed = original.copy()
         changed.loc[changed.index[45]:, ["Open", "High", "Low", "Close"]] *= 0.5
-        with patch.object(news_bot.TRADE_HISTORY, "recent_qualifying_streak", side_effect=AssertionError("live history")):
+        with patch.object(nb_history_store.TRADE_HISTORY, "recent_qualifying_streak", side_effect=AssertionError("live history")):
             results = [
-                news_bot._walk_forward_backtest(
+                nb_backtest._walk_forward_backtest(
                     {"AAA": history}, {}, horizon_sessions=1, holdout_start="2026-02-01",
                 )
                 for history in (original, changed)
@@ -2329,7 +2351,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
         ]
         self.assertEqual(before[0]["signal_metrics"], before[1]["signal_metrics"])
         self.assertEqual(before[0]["qualifying_streak"], before[1]["qualifying_streak"])
-        metrics = news_bot._backtest_metrics_by_session("AAA", original)[1][before[0]["signal_session"]]
+        metrics = nb_backtest._backtest_metrics_by_session("AAA", original)[1][before[0]["signal_session"]]
         self.assertEqual(before[0]["signal_metrics"]["week_momentum_pct"], metrics.week_momentum_pct)
         self.assertEqual(before[0]["qualifier_count"], 1)
         for result in results:
@@ -2339,37 +2361,37 @@ class WalkForwardBacktestTests(unittest.TestCase):
                 self.assertEqual(sum(stats["trade_count"] for stats in groups.get("rank", {}).values()), count)
 
     def test_diagnostic_report_discloses_cohorts_coverage_and_no_optimization(self):
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             {"AAA": self._rising_history()}, {}, horizon_sessions=5,
         )
         result.update(
             horizon_sessions=5, cost_bps_per_side=10.0, tested_symbols=1,
             omitted_symbols=0, fetch_failures=0,
         )
-        with patch.object(news_bot, "_run_walk_forward_backtest", return_value=result):
-            report = news_bot.build_trade_diagnostics_report()
+        with patch.object(nb_backtest_reports, "_run_walk_forward_backtest", return_value=result):
+            report = nb_backtest_reports.build_trade_diagnostics_report()
         for text in ("Development", "Holdout", "ALL completed", "without both groups",
                      "coverage", "no threshold optimization", "Live rules are unchanged"):
             self.assertIn(text, report)
 
     def test_benchmark_map_uses_suffix_then_default(self):
         with patch.object(
-            news_bot.SETTINGS,
+            nb_config.SETTINGS,
             "trade_backtest_benchmarks",
             "DEFAULT:SPY,.NS:^NSEI",
         ):
-            self.assertEqual(news_bot._backtest_benchmark_for("ABC.NS"), "^NSEI")
-            self.assertEqual(news_bot._backtest_benchmark_for("AAPL"), "SPY")
-            self.assertIsNone(news_bot._backtest_benchmark_for("ABC.T"))
+            self.assertEqual(nb_benchmarks._backtest_benchmark_for("ABC.NS"), "^NSEI")
+            self.assertEqual(nb_benchmarks._backtest_benchmark_for("AAPL"), "SPY")
+            self.assertIsNone(nb_benchmarks._backtest_benchmark_for("ABC.T"))
 
     def test_default_benchmarks_use_symbols_yahoo_serves(self):
         # ^FTSEMIB and ^OSEAX return no price data from Yahoo, which silently
         # zeroed benchmark coverage for Italy and Norway. Yahoo serves these
         # two as plain exchange-suffixed tickers instead.
-        default = news_bot.AppSettings.model_fields["trade_backtest_benchmarks"].default
-        with patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", default):
-            self.assertEqual(news_bot._backtest_benchmark_for("ENI.MI"), "FTSEMIB.MI")
-            self.assertEqual(news_bot._backtest_benchmark_for("EQNR.OL"), "OSEBX.OL")
+        default = nb_config.AppSettings.model_fields["trade_backtest_benchmarks"].default
+        with patch.object(nb_config.SETTINGS, "trade_backtest_benchmarks", default):
+            self.assertEqual(nb_benchmarks._backtest_benchmark_for("ENI.MI"), "FTSEMIB.MI")
+            self.assertEqual(nb_benchmarks._backtest_benchmark_for("EQNR.OL"), "OSEBX.OL")
         self.assertNotIn("^FTSEMIB", default)
         self.assertNotIn("^OSEAX", default)
 
@@ -2381,11 +2403,11 @@ class WalkForwardBacktestTests(unittest.TestCase):
             self.assertEqual(interval, "1d")
             return data[symbol]
 
-        with patch.object(news_bot, "_configured_stock_watchlist", return_value=[("Alpha", "AAA")]), \
-             patch.object(news_bot, "_fetch_ticker_history", side_effect=fetch), \
-             patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"), \
-             patch.object(news_bot.SETTINGS, "trade_backtest_period", "2y"):
-            summary = news_bot._run_walk_forward_backtest(horizon_sessions=5)
+        with patch.object(nb_screener, "_configured_stock_watchlist", return_value=[("Alpha", "AAA")]), \
+             patch.object(nb_market_data, "_fetch_ticker_history", side_effect=fetch), \
+             patch.object(nb_config.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"), \
+             patch.object(nb_config.SETTINGS, "trade_backtest_period", "2y"):
+            summary = nb_backtest_reports._run_walk_forward_backtest(horizon_sessions=5)
         self.assertEqual(summary["configured_symbols"], 1)
         self.assertEqual(summary["tested_symbols"], 1)
         self.assertEqual(summary["usable_symbols"], 1)
@@ -2393,7 +2415,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
         self.assertEqual(summary["benchmark_count"], summary["trade_count"])
 
     def test_baseline_holds_every_liquid_stock_not_just_qualifiers(self):
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             {"UP": self._rising_history(), "DOWN": self._rising_history(step=-0.4)},
             {}, horizon_sessions=5, top_n=1,
         )
@@ -2412,21 +2434,21 @@ class WalkForwardBacktestTests(unittest.TestCase):
         histories = {"UP": self._rising_history(), "DOWN": self._rising_history(step=-0.4)}
         dates = histories["UP"].index.strftime("%Y-%m-%d").tolist()
         split = dates[60]
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             histories, {}, horizon_sessions=5, holdout_start=split,
         )
         development = result["baseline"]["development"]["stats"]
         # A hold that would cross into the holdout is dropped, not truncated.
         self.assertLess(development["signal_end"], split)
         self.assertGreater(result["purged_outcomes"], 0)
-        illiquid = news_bot._walk_forward_backtest(
+        illiquid = nb_backtest._walk_forward_backtest(
             histories, {}, horizon_sessions=5, min_avg_volume=10_000_000.0,
         )
         for cohort in ("development", "holdout"):
             self.assertEqual(illiquid["baseline"][cohort]["stats"]["trade_count"], 0)
 
     def test_walk_forward_report_discloses_overlap_and_universe_bias(self):
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             {"AAA": self._rising_history()},
             {"SPY": self._rising_history(step=0.1)},
             horizon_sessions=5,
@@ -2436,8 +2458,8 @@ class WalkForwardBacktestTests(unittest.TestCase):
             "tested_symbols": 1, "omitted_symbols": 0, "fetch_failures": 0,
             "min_avg_volume": 100000.0, "cost_bps_per_side": 10.0,
         })
-        with patch("news_bot._run_walk_forward_backtest", return_value=result):
-            report = news_bot.build_trade_performance_report()
+        with patch("newsbot.backtest_reports._run_walk_forward_backtest", return_value=result):
+            report = nb_backtest_reports.build_trade_performance_report()
         self.assertIn("Development", report)
         self.assertIn("Reserved holdout", report)
         self.assertIn("All qualifiers", report)
@@ -2457,7 +2479,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
     def test_split_purges_development_trades_that_touch_holdout(self):
         stock = self._rising_history()
         split = stock.index[60].strftime("%Y-%m-%d")
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             {"AAA": stock}, {}, horizon_sessions=5, holdout_start=split,
         )
         self.assertGreater(result["purged_outcomes"], 0)
@@ -2475,10 +2497,10 @@ class WalkForwardBacktestTests(unittest.TestCase):
         changed = original.copy()
         split = original.index[60].strftime("%Y-%m-%d")
         changed.loc[changed.index[60]:, ["Open", "High", "Low", "Close"]] *= 0.5
-        before = news_bot._walk_forward_backtest(
+        before = nb_backtest._walk_forward_backtest(
             {"AAA": original}, {}, horizon_sessions=5, holdout_start=split,
         )
-        after = news_bot._walk_forward_backtest(
+        after = nb_backtest._walk_forward_backtest(
             {"AAA": changed}, {}, horizon_sessions=5, holdout_start=split,
         )
         self.assertEqual(
@@ -2487,9 +2509,9 @@ class WalkForwardBacktestTests(unittest.TestCase):
 
     def test_auto_split_is_chronological_and_does_not_consult_returns(self):
         stock = self._rising_history()
-        dates = sorted(news_bot._backtest_metrics_by_session("AAA", stock)[1])
+        dates = sorted(nb_backtest._backtest_metrics_by_session("AAA", stock)[1])
         expected = dates[int(len(dates) * 0.75)]
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             {"AAA": stock}, {}, horizon_sessions=5,
         )
         self.assertEqual(result["holdout_start"], expected)
@@ -2497,7 +2519,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
 
     def test_all_qualifiers_and_top_picks_use_the_same_ranked_population(self):
         stocks = {f"S{i}": self._rising_history(step=0.5 + i * 0.1) for i in range(7)}
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             stocks, {}, horizon_sessions=5, top_n=5,
         )
         self.assertGreater(len(result["all_trades"]), len(result["trades"]))
@@ -2511,7 +2533,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
         stock = self._rising_history()
         stock["Volume"] = 50000.0
         stock.loc[stock.index[40]:, "Volume"] = 2000000.0
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             {"AAA": stock}, {}, horizon_sessions=5, min_avg_volume=100000.0,
         )
         dates = {trade["signal_session"] for trade in result["all_trades"]}
@@ -2521,10 +2543,10 @@ class WalkForwardBacktestTests(unittest.TestCase):
 
     def test_unknown_volume_fails_liquidity_but_can_be_explicitly_disabled(self):
         stock = self._rising_history().drop(columns=["Volume"])
-        filtered = news_bot._walk_forward_backtest(
+        filtered = nb_backtest._walk_forward_backtest(
             {"AAA": stock}, {}, horizon_sessions=5, min_avg_volume=100000.0,
         )
-        unfiltered = news_bot._walk_forward_backtest(
+        unfiltered = nb_backtest._walk_forward_backtest(
             {"AAA": stock}, {}, horizon_sessions=5, min_avg_volume=0.0,
         )
         self.assertEqual(filtered["trade_count"], 0)
@@ -2533,7 +2555,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
     def test_adverse_excursion_includes_entry_and_exit_session_lows(self):
         stock = self._rising_history()
         stock.loc[stock.index[30], "Low"] = 90.0
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             {"AAA": stock}, {}, horizon_sessions=5,
         )
         trade = next(
@@ -2556,7 +2578,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
                 "excess_return_pct": None, "adverse_excursion_pct": -5.0,
             },
         ]
-        stats = news_bot._summarize_backtest_trades(trades)
+        stats = nb_backtest._summarize_backtest_trades(trades)
         self.assertEqual(stats["avg_net_return_pct"], -1.0)
         self.assertEqual(stats["median_net_return_pct"], -1.0)
         self.assertEqual(stats["avg_win_pct"], 2.0)
@@ -2571,34 +2593,34 @@ class WalkForwardBacktestTests(unittest.TestCase):
     def test_invalid_split_and_liquidity_are_rejected(self):
         for split in ("2025-2-01", "2025-02-30"):
             with self.assertRaises(ValueError):
-                news_bot._walk_forward_backtest({}, {}, horizon_sessions=5, holdout_start=split)
+                nb_backtest._walk_forward_backtest({}, {}, horizon_sessions=5, holdout_start=split)
         with self.assertRaises(ValueError):
-            news_bot._walk_forward_backtest({}, {}, horizon_sessions=5, min_avg_volume=-1)
+            nb_backtest._walk_forward_backtest({}, {}, horizon_sessions=5, min_avg_volume=-1)
 
     def test_invalid_price_rows_are_not_dropped_to_shorten_horizon(self):
         stock = self._rising_history()
         stock.loc[stock.index[40], "Open"] = float("nan")
         with self.assertLogs("news_bot", level="WARNING"):
-            result = news_bot._walk_forward_backtest({"AAA": stock}, {}, horizon_sessions=5)
+            result = nb_backtest._walk_forward_backtest({"AAA": stock}, {}, horizon_sessions=5)
         self.assertEqual(result["usable_symbols"], 0)
         self.assertEqual(result["trade_count"], 0)
 
     def test_stock_evaluation_universe_excludes_fund_lists(self):
-        with patch.object(news_bot, "USA_STOCK_UNIVERSE", {"Alpha": "AAA"}), \
-             patch.object(news_bot, "INDIA_STOCK_UNIVERSE", {}), \
-             patch.object(news_bot, "NORWAY_STOCK_UNIVERSE", {}), \
-             patch.object(news_bot, "EU_STOCK_UNIVERSE", {}), \
-             patch.object(news_bot, "INDIA_MUTUAL_FUNDS", {"Fund": "FUND"}), \
-             patch.object(news_bot, "NORWAY_MUTUAL_FUNDS", {}):
-            self.assertEqual(news_bot._configured_stock_watchlist(), [("Alpha [USA Stock]", "AAA")])
-            self.assertIn(("Fund [India Fund]", "FUND"), news_bot._configured_watchlist())
+        with patch.object(nb_config, "USA_STOCK_UNIVERSE", {"Alpha": "AAA"}), \
+             patch.object(nb_config, "INDIA_STOCK_UNIVERSE", {}), \
+             patch.object(nb_config, "NORWAY_STOCK_UNIVERSE", {}), \
+             patch.object(nb_config, "EU_STOCK_UNIVERSE", {}), \
+             patch.object(nb_config, "INDIA_MUTUAL_FUNDS", {"Fund": "FUND"}), \
+             patch.object(nb_config, "NORWAY_MUTUAL_FUNDS", {}):
+            self.assertEqual(nb_screener._configured_stock_watchlist(), [("Alpha [USA Stock]", "AAA")])
+            self.assertIn(("Fund [India Fund]", "FUND"), nb_screener._configured_watchlist())
 
     def test_market_and_quarter_breakdowns_reconcile_with_holdout(self):
         stocks = {"AAA.NS": self._rising_history(), "BBB.DE": self._rising_history()}
         with patch.object(
-            news_bot.SETTINGS, "trade_backtest_benchmarks", ".NS:INDIA,.DE:GERMANY",
+            nb_config.SETTINGS, "trade_backtest_benchmarks", ".NS:INDIA,.DE:GERMANY",
         ):
-            result = news_bot._walk_forward_backtest(
+            result = nb_backtest._walk_forward_backtest(
                 stocks, {"INDIA": self._rising_history(step=0.1)}, horizon_sessions=5,
                 holdout_start="2025-03-10",
             )
@@ -2617,7 +2639,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
                 )
 
     def test_empty_holdout_is_explicit_not_a_success_result(self):
-        result = news_bot._walk_forward_backtest(
+        result = nb_backtest._walk_forward_backtest(
             {"AAA": self._rising_history()}, {}, horizon_sessions=5,
             holdout_start="2030-01-01",
         )
@@ -2627,16 +2649,16 @@ class WalkForwardBacktestTests(unittest.TestCase):
             "configured_symbols": 1, "fetch_failures": 0, "min_avg_volume": 100000,
             "cost_bps_per_side": 10.0,
         })
-        with patch.object(news_bot, "_run_walk_forward_backtest", return_value=result):
-            report = news_bot.build_trade_performance_report()
+        with patch.object(nb_backtest_reports, "_run_walk_forward_backtest", return_value=result):
+            report = nb_backtest_reports.build_trade_performance_report()
         self.assertIn("Top 5: no completed trades.", report)
         self.assertIn("No completed holdout trades.", report)
 
     def test_backtest_features_match_live_metrics_on_same_history(self):
         frame = self._rising_history()
-        expected = news_bot._backtest_metrics_by_session("AAA", frame)[1]
-        with patch.object(news_bot, "_fetch_ticker_history", return_value=frame):
-            live = news_bot._compute_trade_metrics("AAA")
+        expected = nb_backtest._backtest_metrics_by_session("AAA", frame)[1]
+        with patch.object(nb_market_data, "_fetch_ticker_history", return_value=frame):
+            live = nb_indicators._compute_trade_metrics("AAA")
         self.assertIsNotNone(live)
         replay = expected[live.session]
         for field in (
@@ -2644,13 +2666,13 @@ class WalkForwardBacktestTests(unittest.TestCase):
             "drawdown_pct", "atr_pct", "ema20", "rsi_14",
         ):
             self.assertAlmostEqual(getattr(live, field), getattr(replay, field))
-        self.assertEqual(news_bot._failed_gates(live), news_bot._failed_gates(replay))
+        self.assertEqual(nb_indicators._failed_gates(live), nb_indicators._failed_gates(replay))
 
     def test_invalid_config_reports_error_without_fetching(self):
-        with patch.object(news_bot.SETTINGS, "trade_backtest_holdout_start", "bad-date"), \
-             patch.object(news_bot, "_fetch_ticker_history") as fetch, \
+        with patch.object(nb_config.SETTINGS, "trade_backtest_holdout_start", "bad-date"), \
+             patch.object(nb_market_data, "_fetch_ticker_history") as fetch, \
              self.assertLogs("news_bot", level="ERROR"):
-            report = news_bot.build_trade_performance_report()
+            report = nb_backtest_reports.build_trade_performance_report()
         fetch.assert_not_called()
         self.assertIn("Backtest configuration is invalid", report)
 
@@ -2669,15 +2691,15 @@ def _metrics(**overrides):
         above_ema20=True,
     )
     base.update(overrides)
-    return news_bot.TradeMetrics(**base)
+    return nb_indicators.TradeMetrics(**base)
 
 
 class TradeGateTests(unittest.TestCase):
     def test_qualifying_metrics_fail_nothing(self):
-        self.assertEqual(news_bot._failed_gates(_metrics()), [])
+        self.assertEqual(nb_indicators._failed_gates(_metrics()), [])
 
     def test_declining_stock_is_rejected(self):
-        failed = news_bot._failed_gates(
+        failed = nb_indicators._failed_gates(
             _metrics(above_ema20=False, week_momentum_pct=-0.26, day_change_pct=-0.05)
         )
         self.assertEqual(failed[0], "trend")
@@ -2685,7 +2707,7 @@ class TradeGateTests(unittest.TestCase):
         self.assertIn("momentum_1d", failed)
 
     def test_flat_stock_is_rejected(self):
-        failed = news_bot._failed_gates(
+        failed = nb_indicators._failed_gates(
             _metrics(above_ema20=False, week_momentum_pct=0.0, day_change_pct=0.0)
         )
         self.assertTrue(failed)
@@ -2693,7 +2715,7 @@ class TradeGateTests(unittest.TestCase):
     def test_volume_spike_alone_cannot_admit(self):
         """The primary defect: risk criteria plus volume used to reach the
         passing score with negative momentum. Volume no longer admits at all."""
-        failed = news_bot._failed_gates(
+        failed = nb_indicators._failed_gates(
             _metrics(
                 above_ema20=False,
                 week_momentum_pct=-0.26,
@@ -2708,20 +2730,20 @@ class TradeGateTests(unittest.TestCase):
     def test_day_change_of_exactly_zero_fails_momentum_1d(self):
         """The gate uses strict `<=` against the default 0.0 threshold, so an
         exactly-flat day must fail rather than pass on a boundary tie."""
-        with patch.object(news_bot.SETTINGS, "trade_min_day_change_pct", 0.0):
-            failed = news_bot._failed_gates(_metrics(day_change_pct=0.0))
+        with patch.object(nb_config.SETTINGS, "trade_min_day_change_pct", 0.0):
+            failed = nb_indicators._failed_gates(_metrics(day_change_pct=0.0))
         self.assertIn("momentum_1d", failed)
 
     def test_high_volatility_is_rejected(self):
-        with patch.object(news_bot.SETTINGS, "trade_max_atr_pct", 4.5):
-            self.assertEqual(news_bot._failed_gates(_metrics(atr_pct=9.0)), ["volatility"])
+        with patch.object(nb_config.SETTINGS, "trade_max_atr_pct", 4.5):
+            self.assertEqual(nb_indicators._failed_gates(_metrics(atr_pct=9.0)), ["volatility"])
 
     def test_deep_drawdown_is_rejected(self):
-        with patch.object(news_bot.SETTINGS, "trade_max_drawdown_pct", 8.0):
-            self.assertEqual(news_bot._failed_gates(_metrics(drawdown_pct=20.0)), ["drawdown"])
+        with patch.object(nb_config.SETTINGS, "trade_max_drawdown_pct", 8.0):
+            self.assertEqual(nb_indicators._failed_gates(_metrics(drawdown_pct=20.0)), ["drawdown"])
 
     def test_gate_order_is_stable(self):
-        failed = news_bot._failed_gates(
+        failed = nb_indicators._failed_gates(
             _metrics(above_ema20=False, week_momentum_pct=-1.0, atr_pct=99.0)
         )
         self.assertEqual(failed, ["trend", "momentum_5d", "volatility"])
@@ -2732,7 +2754,7 @@ class TradeRankingTests(unittest.TestCase):
         low = _metrics(symbol="LOW", week_momentum_pct=1.0)
         high = _metrics(symbol="HIGH", week_momentum_pct=9.0)
         self.assertEqual(
-            [m.symbol for m in sorted([low, high], key=news_bot._rank_key)],
+            [m.symbol for m in sorted([low, high], key=nb_ranking._rank_key)],
             ["HIGH", "LOW"],
         )
 
@@ -2740,7 +2762,7 @@ class TradeRankingTests(unittest.TestCase):
         quiet = _metrics(symbol="QUIET", week_momentum_pct=3.0, volume_ratio=1.0)
         busy = _metrics(symbol="BUSY", week_momentum_pct=3.0, volume_ratio=2.0)
         self.assertEqual(
-            [m.symbol for m in sorted([quiet, busy], key=news_bot._rank_key)],
+            [m.symbol for m in sorted([quiet, busy], key=nb_ranking._rank_key)],
             ["BUSY", "QUIET"],
         )
 
@@ -2748,7 +2770,7 @@ class TradeRankingTests(unittest.TestCase):
         calm = _metrics(symbol="CALM", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=1.0)
         wild = _metrics(symbol="WILD", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=4.0)
         self.assertEqual(
-            [m.symbol for m in sorted([calm, wild], key=news_bot._rank_key)],
+            [m.symbol for m in sorted([calm, wild], key=nb_ranking._rank_key)],
             ["CALM", "WILD"],
         )
 
@@ -2756,7 +2778,7 @@ class TradeRankingTests(unittest.TestCase):
         a = _metrics(symbol="AAA")
         b = _metrics(symbol="BBB")
         self.assertEqual(
-            [m.symbol for m in sorted([b, a], key=news_bot._rank_key)],
+            [m.symbol for m in sorted([b, a], key=nb_ranking._rank_key)],
             ["AAA", "BBB"],
         )
 
@@ -2767,12 +2789,12 @@ class TradeRankingTests(unittest.TestCase):
         on the other side."""
         today = datetime.now(timezone.utc)
         yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-        news_bot.TRADE_HISTORY.record(
+        nb_history_store.TRADE_HISTORY.record(
             _metrics(symbol="STREAKY", session=yesterday, week_momentum_pct=3.0,
                      volume_ratio=1.5, atr_pct=4.0),
             qualified=True, failed_gate=None,
         )
-        news_bot.TRADE_HISTORY.record(
+        nb_history_store.TRADE_HISTORY.record(
             _metrics(symbol="STREAKY", session=today.strftime("%Y-%m-%d"),
                      week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=4.0),
             qualified=True, failed_gate=None,
@@ -2782,7 +2804,7 @@ class TradeRankingTests(unittest.TestCase):
         streaky_but_wilder = _metrics(symbol="STREAKY", week_momentum_pct=3.0,
                                        volume_ratio=1.5, atr_pct=4.0)
         self.assertEqual(
-            [m.symbol for m in sorted([calm_no_streak, streaky_but_wilder], key=news_bot._rank_key)],
+            [m.symbol for m in sorted([calm_no_streak, streaky_but_wilder], key=nb_ranking._rank_key)],
             ["STREAKY", "CALMNOSTREAK"],
         )
 
@@ -2790,7 +2812,7 @@ class TradeRankingTests(unittest.TestCase):
         calm = _metrics(symbol="CALM2", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=1.0)
         wild = _metrics(symbol="WILD2", week_momentum_pct=3.0, volume_ratio=1.5, atr_pct=4.0)
         self.assertEqual(
-            [m.symbol for m in sorted([calm, wild], key=news_bot._rank_key)],
+            [m.symbol for m in sorted([calm, wild], key=nb_ranking._rank_key)],
             ["CALM2", "WILD2"],
         )
 
@@ -2798,39 +2820,39 @@ class TradeRankingTests(unittest.TestCase):
 class SignalEnrichmentTests(unittest.TestCase):
     def test_rsi_is_100_when_no_losses(self):
         closes = pd.Series([100.0 + i for i in range(20)])
-        self.assertEqual(news_bot._compute_rsi_14(closes), 100.0)
+        self.assertEqual(nb_indicators._compute_rsi_14(closes), 100.0)
 
     def test_rsi_is_0_when_no_gains(self):
         closes = pd.Series([120.0 - i for i in range(20)])
-        self.assertEqual(news_bot._compute_rsi_14(closes), 0.0)
+        self.assertEqual(nb_indicators._compute_rsi_14(closes), 0.0)
 
     def test_rsi_none_below_minimum_bars(self):
-        self.assertIsNone(news_bot._compute_rsi_14(pd.Series([100.0] * 14)))
+        self.assertIsNone(nb_indicators._compute_rsi_14(pd.Series([100.0] * 14)))
 
     def test_volume_trend_rising(self):
         volumes = pd.Series([1_000_000.0] * 15 + [2_000_000.0] * 5)
-        self.assertEqual(news_bot._compute_volume_trend(volumes), "rising")
+        self.assertEqual(nb_indicators._compute_volume_trend(volumes), "rising")
 
     def test_volume_trend_falling(self):
         volumes = pd.Series([2_000_000.0] * 15 + [1_000_000.0] * 5)
-        self.assertEqual(news_bot._compute_volume_trend(volumes), "falling")
+        self.assertEqual(nb_indicators._compute_volume_trend(volumes), "falling")
 
     def test_volume_trend_flat_when_unchanged(self):
         volumes = pd.Series([1_000_000.0] * 20)
-        self.assertEqual(news_bot._compute_volume_trend(volumes), "flat")
+        self.assertEqual(nb_indicators._compute_volume_trend(volumes), "flat")
 
     def test_volume_trend_unknown_below_minimum_bars(self):
-        self.assertEqual(news_bot._compute_volume_trend(pd.Series([1_000_000.0] * 10)), "unknown")
+        self.assertEqual(nb_indicators._compute_volume_trend(pd.Series([1_000_000.0] * 10)), "unknown")
 
     def test_rsi_label_flags_overbought_and_oversold(self):
-        self.assertIn("overbought", news_bot._rsi_label(75.0))
-        self.assertIn("oversold", news_bot._rsi_label(20.0))
-        self.assertNotIn("bought", news_bot._rsi_label(50.0))
-        self.assertEqual(news_bot._rsi_label(None), "n/a")
+        self.assertIn("overbought", nb_screener._rsi_label(75.0))
+        self.assertIn("oversold", nb_screener._rsi_label(20.0))
+        self.assertNotIn("bought", nb_screener._rsi_label(50.0))
+        self.assertEqual(nb_screener._rsi_label(None), "n/a")
 
     def test_entry_exit_sketch_computes_reward_risk(self):
         metrics = _metrics(last_close=100.0, support_level=90.0, resistance_level=120.0, ema20=95.0)
-        sketch = news_bot._entry_exit_sketch(metrics)
+        sketch = nb_screener._entry_exit_sketch(metrics)
         self.assertIn("90.00", sketch)
         self.assertIn("95.00", sketch)
         # reward 20 (120-100), risk 10 (100-90) -> 2.0:1
@@ -2838,13 +2860,13 @@ class SignalEnrichmentTests(unittest.TestCase):
 
     def test_entry_exit_sketch_handles_zero_risk(self):
         metrics = _metrics(last_close=90.0, support_level=90.0, resistance_level=120.0, ema20=95.0)
-        sketch = news_bot._entry_exit_sketch(metrics)
+        sketch = nb_screener._entry_exit_sketch(metrics)
         self.assertIn("n/a", sketch)
 
 
 class TradeHistoryStoreTests(unittest.TestCase):
     def _store(self):
-        store = news_bot.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "history.db"))
+        store = nb_history_store.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "history.db"))
         self.addCleanup(store.close)
         return store
 
@@ -2889,7 +2911,7 @@ class TradeHistoryStoreTests(unittest.TestCase):
         )
         connection.commit()
         connection.close()
-        store = news_bot.TradeHistoryStore(path)
+        store = nb_history_store.TradeHistoryStore(path)
         self.addCleanup(store.close)
         store.record(
             _metrics(symbol="NOVOL", session="2026-08-10", volume_ratio=None),
@@ -3000,24 +3022,24 @@ class WeeklyTopPicksReportTests(unittest.TestCase):
                 "latest_atr_pct": 2.1, "latest_drawdown_pct": 3.0,
             },
         ]
-        with patch.object(news_bot.TRADE_HISTORY, "weekly_top_picks", return_value=fake_picks):
-            report = news_bot.build_weekly_top_picks()
+        with patch.object(nb_history_store.TRADE_HISTORY, "weekly_top_picks", return_value=fake_picks):
+            report = nb_reports.build_weekly_top_picks()
         self.assertIn("Weekly Top Picks", report)
         self.assertIn("AAA", report)
         self.assertIn("qualified 4/5", report)
         self.assertIn("Informational only", report)
 
     def test_report_handles_no_picks_gracefully(self):
-        with patch.object(news_bot.TRADE_HISTORY, "weekly_top_picks", return_value=[]):
-            report = news_bot.build_weekly_top_picks()
+        with patch.object(nb_history_store.TRADE_HISTORY, "weekly_top_picks", return_value=[]):
+            report = nb_reports.build_weekly_top_picks()
         self.assertIn("No symbol has qualified enough sessions", report)
         self.assertIn("/recommendations", report)
 
     def test_report_passes_lookback_and_top_n_through(self):
-        with patch.object(news_bot.TRADE_HISTORY, "weekly_top_picks", return_value=[]) as mock_picks:
-            news_bot.build_weekly_top_picks(lookback_days=10, top_n=3)
+        with patch.object(nb_history_store.TRADE_HISTORY, "weekly_top_picks", return_value=[]) as mock_picks:
+            nb_reports.build_weekly_top_picks(lookback_days=10, top_n=3)
         mock_picks.assert_called_once_with(
-            lookback_days=10, top_n=3, min_qualifying_days=news_bot.SETTINGS.trade_weekly_top_picks_min_qualifying_days
+            lookback_days=10, top_n=3, min_qualifying_days=nb_config.SETTINGS.trade_weekly_top_picks_min_qualifying_days
         )
 
 
@@ -3030,7 +3052,7 @@ class TickerAnalysisTests(unittest.TestCase):
         )
 
     def test_empty_symbol_returns_usage(self):
-        self.assertIn("Usage", news_bot.build_ticker_analysis("   "))
+        self.assertIn("Usage", nb_reports.build_ticker_analysis("   "))
 
     def test_report_includes_expected_sections(self):
         info = {
@@ -3044,9 +3066,9 @@ class TickerAnalysisTests(unittest.TestCase):
             "operatingCashflow": 110_000_000_000, "netIncomeToCommon": 95_000_000_000,
             "beta": 1.3,
         }
-        with patch("news_bot._compute_trade_metrics", return_value=self._metrics()), \
-             patch("news_bot._fetch_ticker_fundamentals", return_value=info):
-            report = news_bot.build_ticker_analysis("aapl")
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=self._metrics()), \
+             patch("newsbot.market_data._fetch_ticker_fundamentals", return_value=info):
+            report = nb_reports.build_ticker_analysis("aapl")
         self.assertIn("Apple Inc.", report)
         self.assertIn("Company", report)
         self.assertIn("Price &amp; Technicals", report)
@@ -3061,9 +3083,9 @@ class TickerAnalysisTests(unittest.TestCase):
         self.assertIn("more volatile than the market", report)
 
     def test_report_degrades_gracefully_with_no_data(self):
-        with patch("news_bot._compute_trade_metrics", return_value=None), \
-             patch("news_bot._fetch_ticker_fundamentals", return_value={}):
-            report = news_bot.build_ticker_analysis("ZZZZ")
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=None), \
+             patch("newsbot.market_data._fetch_ticker_fundamentals", return_value={}):
+            report = nb_reports.build_ticker_analysis("ZZZZ")
         self.assertIn("ZZZZ", report)
         self.assertIn("Not enough price history", report)
         self.assertIn("n/a", report)
@@ -3072,28 +3094,28 @@ class TickerAnalysisTests(unittest.TestCase):
 
 class CommandDispatchTests(unittest.TestCase):
     def test_analyze_without_argument_sends_usage(self):
-        with patch("news_bot.send_telegram_message") as mock_send:
-            news_bot._handle_command("/analyze", "123")
+        with patch("newsbot.messaging.send_telegram_message") as mock_send:
+            nb_commands._handle_command("/analyze", "123")
         mock_send.assert_called_once()
         self.assertIn("Usage", mock_send.call_args[0][0])
 
     def test_analyze_with_argument_dispatches_to_ticker_analysis(self):
-        with patch("news_bot.build_ticker_analysis", return_value="report") as mock_build, \
-             patch("news_bot.send_telegram_message") as mock_send:
-            news_bot._handle_command("/analyze aapl", "123")
+        with patch("newsbot.reports.build_ticker_analysis", return_value="report") as mock_build, \
+             patch("newsbot.messaging.send_telegram_message") as mock_send:
+            nb_commands._handle_command("/analyze aapl", "123")
         mock_build.assert_called_once_with("aapl")
         mock_send.assert_called_once_with("report", chat_id="123")
 
     def test_performance_command_dispatches(self):
-        with patch("news_bot.build_trade_performance_report", return_value="perf") as mock_build, \
-             patch("news_bot.send_telegram_message") as mock_send:
-            news_bot._handle_command("/performance", "123")
+        with patch("newsbot.backtest_reports.build_trade_performance_report", return_value="perf") as mock_build, \
+             patch("newsbot.messaging.send_telegram_message") as mock_send:
+            nb_commands._handle_command("/performance", "123")
         mock_build.assert_called_once()
         mock_send.assert_called_once_with("perf", chat_id="123")
 
     def test_unknown_command_help_text_mentions_new_commands(self):
-        with patch("news_bot.send_telegram_message") as mock_send:
-            news_bot._handle_command("/bogus", "123")
+        with patch("newsbot.messaging.send_telegram_message") as mock_send:
+            nb_commands._handle_command("/bogus", "123")
         help_text = mock_send.call_args[0][0]
         self.assertIn("/analyze", help_text)
         self.assertIn("/performance", help_text)
@@ -3105,25 +3127,25 @@ class CommandDispatchTests(unittest.TestCase):
         """Removed in favor of /news, /recommendations and /stocks: both now
         fall through to the help text like any other unrecognized command."""
         for command in ("/morning", "/evening"):
-            with patch("news_bot.send_telegram_message") as mock_send:
-                news_bot._handle_command(command, "123")
+            with patch("newsbot.messaging.send_telegram_message") as mock_send:
+                nb_commands._handle_command(command, "123")
             self.assertIn("Supported commands", mock_send.call_args[0][0])
 
     def test_news_command_sends_only_news_no_quotes_or_candidates(self):
         with patch(
-            "news_bot.get_norwegian_morning_news", return_value=("norway\n\n", [])
+            "newsbot.news_feeds.get_norwegian_morning_news", return_value=("norway\n\n", [])
         ) as mock_norway, patch(
-            "news_bot.get_global_news", return_value=("global\n\n", [])
+            "newsbot.news_feeds.get_global_news", return_value=("global\n\n", [])
         ) as mock_global, patch(
-            "news_bot._business_news_section", return_value=("business", [])
+            "newsbot.market_data._business_news_section", return_value=("business", [])
         ) as mock_business, patch(
-            "news_bot.get_trade_candidates"
+            "newsbot.screener.get_trade_candidates"
         ) as mock_candidates, patch(
-            "news_bot._collect_live_quotes"
+            "newsbot.market_data._collect_live_quotes"
         ) as mock_quotes, patch(
-            "news_bot.send_telegram_message"
+            "newsbot.messaging.send_telegram_message"
         ) as mock_send:
-            news_bot._handle_command("/news", "123")
+            nb_commands._handle_command("/news", "123")
         mock_norway.assert_called_once()
         mock_global.assert_called_once()
         mock_business.assert_called_once()
@@ -3137,22 +3159,22 @@ class CommandDispatchTests(unittest.TestCase):
     def test_recommendations_command_sends_only_trade_candidates(self):
         # Goes through build_trade_candidates_payload now, so the screen runs
         # once and its result is reused to chart the top candidates.
-        outcome = news_bot.ScreenOutcome(checked=0, analysed=0)
+        outcome = nb_screener.ScreenOutcome(checked=0, analysed=0)
         with patch(
-            "news_bot.build_trade_candidates_payload",
+            "newsbot.screener.build_trade_candidates_payload",
             return_value=("candidates only", outcome, {}),
         ) as mock_candidates, patch(
-            "news_bot.send_candidate_charts"
+            "newsbot.charts.send_candidate_charts"
         ) as mock_charts, patch(
-            "news_bot.get_norwegian_morning_news"
+            "newsbot.news_feeds.get_norwegian_morning_news"
         ) as mock_norway, patch(
-            "news_bot.get_global_news"
+            "newsbot.news_feeds.get_global_news"
         ) as mock_global, patch(
-            "news_bot._business_news_section"
+            "newsbot.market_data._business_news_section"
         ) as mock_business, patch(
-            "news_bot.send_telegram_message"
+            "newsbot.messaging.send_telegram_message"
         ) as mock_send:
-            news_bot._handle_command("/recommendations", "123")
+            nb_commands._handle_command("/recommendations", "123")
         mock_candidates.assert_called_once()
         mock_charts.assert_called_once()
         mock_norway.assert_not_called()
@@ -3162,9 +3184,9 @@ class CommandDispatchTests(unittest.TestCase):
 
     def test_stocks_command_dispatches_to_weekly_top_picks(self):
         with patch(
-            "news_bot.build_weekly_top_picks", return_value="weekly picks"
-        ) as mock_build, patch("news_bot.send_telegram_message") as mock_send:
-            news_bot._handle_command("/stocks", "123")
+            "newsbot.reports.build_weekly_top_picks", return_value="weekly picks"
+        ) as mock_build, patch("newsbot.messaging.send_telegram_message") as mock_send:
+            nb_commands._handle_command("/stocks", "123")
         mock_build.assert_called_once_with()
         mock_send.assert_called_once_with("weekly picks", chat_id="123")
 
@@ -3175,7 +3197,7 @@ class ScreenUniverseDeadlineTests(unittest.TestCase):
     already finished by the time the loop got around to looking at it."""
 
     def _qualifying(self, symbol):
-        return news_bot.TradeMetrics(
+        return nb_indicators.TradeMetrics(
             symbol=symbol, session="2026-08-13", last_close=100.0,
             day_change_pct=1.0, week_momentum_pct=5.0, volume_ratio=1.6,
             drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
@@ -3186,20 +3208,20 @@ class ScreenUniverseDeadlineTests(unittest.TestCase):
         # per loop iteration to check it. Returning a huge value from the
         # second call onward simulates a deadline that has already expired
         # by the time the (single) in-flight future finishes.
-        with patch.object(news_bot.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
-            news_bot.time, "time", side_effect=[0.0] + [1e12] * 20
-        ), patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
-            outcome, _labels = news_bot._screen_universe([("Alpha", "AAA")])
+        with patch.object(nb_config.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
+            time, "time", side_effect=[0.0] + [1e12] * 20
+        ), patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            outcome, _labels = nb_screener._screen_universe([("Alpha", "AAA")])
 
         self.assertTrue(outcome.deadline_hit)
         self.assertEqual(outcome.analysed, 1)
         self.assertEqual([m.symbol for m in outcome.qualified], ["AAA"])
 
     def test_deadline_hit_rendering_shows_analysed_of_checked(self):
-        with patch.object(news_bot.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
-            news_bot.time, "time", side_effect=[0.0] + [1e12] * 20
-        ), patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
-            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        with patch.object(nb_config.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
+            time, "time", side_effect=[0.0] + [1e12] * 20
+        ), patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
 
         self.assertIn("AAA", result)
         self.assertIn("1 of 1 passed", result)
@@ -3209,11 +3231,11 @@ class ScreenUniverseDeadlineTests(unittest.TestCase):
 class CandidateUniverseTests(unittest.TestCase):
     def setUp(self):
         self._patches = [
-            patch.object(news_bot, "USA_STOCK_UNIVERSE", {"Apple": "AAPL"}),
-            patch.object(news_bot, "INDIA_STOCK_UNIVERSE", {"Infosys": "INFY.NS"}),
-            patch.object(news_bot, "NORWAY_STOCK_UNIVERSE", {"Equinor": "EQNR.OL"}),
-            patch.object(news_bot, "INDIA_MUTUAL_FUNDS", {}),
-            patch.object(news_bot, "NORWAY_MUTUAL_FUNDS", {}),
+            patch.object(nb_config, "USA_STOCK_UNIVERSE", {"Apple": "AAPL"}),
+            patch.object(nb_config, "INDIA_STOCK_UNIVERSE", {"Infosys": "INFY.NS"}),
+            patch.object(nb_config, "NORWAY_STOCK_UNIVERSE", {"Equinor": "EQNR.OL"}),
+            patch.object(nb_config, "INDIA_MUTUAL_FUNDS", {}),
+            patch.object(nb_config, "NORWAY_MUTUAL_FUNDS", {}),
         ]
         for p in self._patches:
             p.start()
@@ -3226,8 +3248,8 @@ class CandidateUniverseTests(unittest.TestCase):
         """Regression: the watchlist used to be appended after ~67 screener
         names and then truncated away entirely."""
         screener = {f"Mover {i}": f"SCR{i}" for i in range(67)}
-        with patch.object(news_bot, "_build_live_universe", return_value=screener):
-            universe = news_bot._build_candidate_universe(30)
+        with patch.object(nb_market_data, "_build_live_universe", return_value=screener):
+            universe = nb_screener._build_candidate_universe(30)
         symbols = [symbol for _, symbol in universe]
         self.assertEqual(len(symbols), 30)
         for expected in ("AAPL", "INFY.NS", "EQNR.OL"):
@@ -3235,38 +3257,38 @@ class CandidateUniverseTests(unittest.TestCase):
 
     def test_watchlist_entries_come_first(self):
         screener = {f"Mover {i}": f"SCR{i}" for i in range(10)}
-        with patch.object(news_bot, "_build_live_universe", return_value=screener):
-            universe = news_bot._build_candidate_universe(10)
+        with patch.object(nb_market_data, "_build_live_universe", return_value=screener):
+            universe = nb_screener._build_candidate_universe(10)
         self.assertEqual(
             [symbol for _, symbol in universe[:3]], ["AAPL", "INFY.NS", "EQNR.OL"]
         )
 
     def test_screener_not_called_when_watchlist_fills_budget(self):
-        with patch.object(news_bot, "_build_live_universe") as mock_live:
-            universe = news_bot._build_candidate_universe(3)
+        with patch.object(nb_market_data, "_build_live_universe") as mock_live:
+            universe = nb_screener._build_candidate_universe(3)
         mock_live.assert_not_called()
         self.assertEqual(len(universe), 3)
 
     def test_oversized_watchlist_truncates_and_warns(self):
-        with patch.object(news_bot, "USA_STOCK_UNIVERSE", {f"N{i}": f"S{i}" for i in range(10)}):
-            with patch.object(news_bot, "_build_live_universe") as mock_live:
-                with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
-                    universe = news_bot._build_candidate_universe(4)
+        with patch.object(nb_config, "USA_STOCK_UNIVERSE", {f"N{i}": f"S{i}" for i in range(10)}):
+            with patch.object(nb_market_data, "_build_live_universe") as mock_live:
+                with self.assertLogs(nb_logsetup.LOGGER, level="WARNING") as logs:
+                    universe = nb_screener._build_candidate_universe(4)
         mock_live.assert_not_called()
         self.assertEqual(len(universe), 4)
         self.assertTrue(any("watchlist_truncated" in line for line in logs.output))
 
     def test_symbol_in_both_appears_once_with_watchlist_label(self):
         screener = {"Apple Inc Screener Name": "AAPL", "Other": "OTHR"}
-        with patch.object(news_bot, "_build_live_universe", return_value=screener):
-            universe = news_bot._build_candidate_universe(10)
+        with patch.object(nb_market_data, "_build_live_universe", return_value=screener):
+            universe = nb_screener._build_candidate_universe(10)
         apple_labels = [label for label, symbol in universe if symbol == "AAPL"]
         self.assertEqual(len(apple_labels), 1)
         self.assertIn("[USA Stock]", apple_labels[0])
 
     def test_labels_carry_market_suffix(self):
-        with patch.object(news_bot, "_build_live_universe", return_value={}):
-            universe = news_bot._build_candidate_universe(10)
+        with patch.object(nb_market_data, "_build_live_universe", return_value={}):
+            universe = nb_screener._build_candidate_universe(10)
         labels = dict((symbol, label) for label, symbol in universe)
         self.assertEqual(labels["AAPL"], "Apple [USA Stock]")
         self.assertEqual(labels["EQNR.OL"], "Equinor [Norway Stock]")
@@ -3274,7 +3296,7 @@ class CandidateUniverseTests(unittest.TestCase):
 
 class TradeRenderingTests(unittest.TestCase):
     def _qualifying(self, symbol, momentum, volume=1.6):
-        return news_bot.TradeMetrics(
+        return nb_indicators.TradeMetrics(
             symbol=symbol, session="2026-08-13", last_close=100.0,
             day_change_pct=1.0, week_momentum_pct=momentum, volume_ratio=volume,
             drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
@@ -3282,60 +3304,60 @@ class TradeRenderingTests(unittest.TestCase):
 
     def test_session_is_shown_per_candidate(self):
         """Exchanges differ, so the session belongs on the row, not a header."""
-        with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
-            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+            result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("from the 2026-08-13 close", result)
         self.assertNotIn("Score", result)
 
     def test_thresholds_are_spelled_out(self):
         """The blocker counts are unactionable without the thresholds."""
-        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
-            with patch.object(news_bot.SETTINGS, "trade_max_atr_pct", 4.5):
-                with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
-                    result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        with patch.object(nb_config.SETTINGS, "trade_min_volume_ratio", 1.2):
+            with patch.object(nb_config.SETTINGS, "trade_max_atr_pct", 4.5):
+                with patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+                    result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("daily swing under 4.5%", result)
         self.assertIn("within", result)
 
     def test_header_discloses_truncation(self):
         universe = {f"Name{i}": f"SYM{i}" for i in range(7)}
         with patch(
-            "news_bot._compute_trade_metrics",
+            "newsbot.indicators._compute_trade_metrics",
             side_effect=lambda symbol: self._qualifying(symbol, momentum=5.0),
         ):
-            result = news_bot.get_trade_candidates(universe=universe, top_n=2)
+            result = nb_screener.get_trade_candidates(universe=universe, top_n=2)
         self.assertIn("7 of 7 passed", result)
         self.assertIn("5 more passed but are not shown", result)
 
     def test_no_truncation_notice_when_all_shown(self):
-        with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
-            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0)):
+            result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("1 of 1 passed", result)
         self.assertNotIn("not shown", result)
 
     def test_volume_confirmation_marker(self):
-        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
-            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0, volume=2.0)):
-                confirmed = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
-            with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("BBB", 5.0, volume=0.5)):
-                unconfirmed = news_bot.get_trade_candidates(universe={"Beta": "BBB"}, top_n=1)
+        with patch.object(nb_config.SETTINGS, "trade_min_volume_ratio", 1.2):
+            with patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("AAA", 5.0, volume=2.0)):
+                confirmed = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+            with patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("BBB", 5.0, volume=0.5)):
+                unconfirmed = nb_screener.get_trade_candidates(universe={"Beta": "BBB"}, top_n=1)
         self.assertIn("volume 2.0\u00d7 normal \u2713", confirmed)
         self.assertIn("volume 0.5\u00d7 normal", unconfirmed)
         self.assertNotIn("\u2713", unconfirmed)
 
     def test_blockers_use_plain_language_not_gate_names(self):
-        rejected = news_bot.TradeMetrics(
+        rejected = nb_indicators.TradeMetrics(
             symbol="AAA", session="2026-08-13", last_close=100.0,
             day_change_pct=-1.0, week_momentum_pct=-1.0, volume_ratio=1.0,
             drawdown_pct=1.0, atr_pct=1.0, above_ema20=False,
         )
-        with patch("news_bot._compute_trade_metrics", return_value=rejected):
-            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=rejected):
+            result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("none qualified today", result)
         self.assertIn("1 \u00b7 below their 20-day average", result)
         # Attributed to the first failing gate only, though momentum also failed.
         self.assertNotIn("too weak over 5 days", result)
         # Internal gate identifiers must never reach the reader.
-        for gate in news_bot.TRADE_GATES:
+        for gate in nb_indicators.TRADE_GATES:
             self.assertNotIn(gate, result)
 
     def test_blockers_are_ordered_by_count(self):
@@ -3344,14 +3366,14 @@ class TradeRenderingTests(unittest.TestCase):
             base = dict(session="2026-08-13", last_close=100.0, volume_ratio=1.0,
                         drawdown_pct=1.0, above_ema20=True)
             if symbol in ("A1", "A2", "A3"):   # volatility
-                return news_bot.TradeMetrics(symbol=symbol, day_change_pct=1.0,
+                return nb_indicators.TradeMetrics(symbol=symbol, day_change_pct=1.0,
                     week_momentum_pct=5.0, atr_pct=99.0, **base)
-            return news_bot.TradeMetrics(symbol=symbol, day_change_pct=-1.0,   # momentum_1d
+            return nb_indicators.TradeMetrics(symbol=symbol, day_change_pct=-1.0,   # momentum_1d
                 week_momentum_pct=5.0, atr_pct=1.0, **base)
 
         universe = {n: n for n in ("A1", "A2", "A3", "B1")}
-        with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
-            result = news_bot.get_trade_candidates(universe=universe, top_n=5)
+        with patch("newsbot.indicators._compute_trade_metrics", side_effect=side_effect):
+            result = nb_screener.get_trade_candidates(universe=universe, top_n=5)
         self.assertLess(result.index("too volatile"), result.index("fell on the day"))
 
     def test_no_data_is_counted_among_the_blockers(self):
@@ -3360,14 +3382,14 @@ class TradeRenderingTests(unittest.TestCase):
                 return self._qualifying("AAA", 5.0)
             if symbol == "BBB":
                 return None
-            return news_bot.TradeMetrics(
+            return nb_indicators.TradeMetrics(
                 symbol=symbol, session="2026-08-13", last_close=100.0,
                 day_change_pct=-1.0, week_momentum_pct=-1.0, volume_ratio=1.0,
                 drawdown_pct=1.0, atr_pct=1.0, above_ema20=False,
             )
 
-        with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
-            result = news_bot.get_trade_candidates(
+        with patch("newsbot.indicators._compute_trade_metrics", side_effect=side_effect):
+            result = nb_screener.get_trade_candidates(
                 universe={"A": "AAA", "B": "BBB", "C": "CCC"}, top_n=3
             )
         self.assertIn("1 of 3 passed", result)
@@ -3378,20 +3400,20 @@ class TradeRenderingTests(unittest.TestCase):
         def side_effect(symbol):
             return self._qualifying(symbol, {"AAA": 1.0, "BBB": 9.0}[symbol])
 
-        with patch("news_bot._compute_trade_metrics", side_effect=side_effect):
-            result = news_bot.get_trade_candidates(universe={"A": "AAA", "B": "BBB"}, top_n=2)
+        with patch("newsbot.indicators._compute_trade_metrics", side_effect=side_effect):
+            result = nb_screener.get_trade_candidates(universe={"A": "AAA", "B": "BBB"}, top_n=2)
         self.assertLess(result.index("BBB"), result.index("AAA"))
 
     def test_signal_enrichment_lines_appear_for_a_qualifying_candidate(self):
-        metrics = news_bot.TradeMetrics(
+        metrics = nb_indicators.TradeMetrics(
             symbol="ENR", session="2026-08-13", last_close=100.0,
             day_change_pct=1.0, week_momentum_pct=5.0, volume_ratio=1.6,
             drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
             ema20=95.0, rsi_14=72.0, support_level=90.0, resistance_level=110.0,
             volume_trend="rising",
         )
-        with patch("news_bot._compute_trade_metrics", return_value=metrics):
-            result = news_bot.get_trade_candidates(universe={"Enrich": "ENR"}, top_n=1)
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=metrics):
+            result = nb_screener.get_trade_candidates(universe={"Enrich": "ENR"}, top_n=1)
         self.assertIn("RSI 72 (overbought)", result)
         self.assertIn("volume rising", result)
         self.assertIn("zone 90.00–95.00", result)
@@ -3403,30 +3425,30 @@ class TradeChecksHeadingTests(unittest.TestCase):
     """The checks heading must not claim candidates passed when none did."""
 
     def _qualifying(self, symbol):
-        return news_bot.TradeMetrics(
+        return nb_indicators.TradeMetrics(
             symbol=symbol, session="2026-08-13", last_close=100.0,
             day_change_pct=1.0, week_momentum_pct=5.0, volume_ratio=1.6,
             drawdown_pct=1.0, atr_pct=1.0, above_ema20=True,
         )
 
     def test_heading_is_neutral_when_nothing_qualified(self):
-        with patch("news_bot._compute_trade_metrics", return_value=None):
-            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=None):
+            result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("The five checks", result)
         self.assertNotIn("Every candidate passed", result)
 
     def test_heading_claims_passage_only_when_something_qualified(self):
-        with patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
-            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("Every candidate passed all five", result)
 
     def test_deadline_notice_survives_an_all_qualifying_run(self):
         """It used to live inside the blocker list, which returns early when
         nothing failed -- so a fully-qualifying truncated run lost the notice."""
-        with patch.object(news_bot.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
-            news_bot.time, "time", side_effect=[0.0] + [1e12] * 20
-        ), patch("news_bot._compute_trade_metrics", return_value=self._qualifying("AAA")):
-            result = news_bot.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
+        with patch.object(nb_config.SETTINGS, "trade_total_deadline_seconds", 1), patch.object(
+            time, "time", side_effect=[0.0] + [1e12] * 20
+        ), patch("newsbot.indicators._compute_trade_metrics", return_value=self._qualifying("AAA")):
+            result = nb_screener.get_trade_candidates(universe={"Alpha": "AAA"}, top_n=1)
         self.assertIn("Ran out of time", result)
         self.assertNotIn("didn't qualify", result)
 
@@ -3440,22 +3462,22 @@ def _record(name, level=logging.INFO, msg="hello world", args=None, exc_info=Non
 
 class LogBandTests(unittest.TestCase):
     def test_app_logger_resolves_to_app_band(self):
-        self.assertEqual(news_bot._band_for("news_bot.app"), "APP")
+        self.assertEqual(nb_logsetup._band_for("news_bot.app"), "APP")
 
     def test_sys_logger_resolves_to_sys_band(self):
-        self.assertEqual(news_bot._band_for("news_bot.sys"), "SYS")
+        self.assertEqual(nb_logsetup._band_for("news_bot.sys"), "SYS")
 
     def test_bare_parent_logger_resolves_to_sys_band(self):
         """A missed call site should land somewhere sane, not be mistaken
         for a third-party library."""
-        self.assertEqual(news_bot._band_for("news_bot"), "SYS")
+        self.assertEqual(nb_logsetup._band_for("news_bot"), "SYS")
 
     def test_third_party_logger_resolves_to_infra_band(self):
-        self.assertEqual(news_bot._band_for("apscheduler.scheduler"), "INFRA")
-        self.assertEqual(news_bot._band_for("urllib3.connectionpool"), "INFRA")
+        self.assertEqual(nb_logsetup._band_for("apscheduler.scheduler"), "INFRA")
+        self.assertEqual(nb_logsetup._band_for("urllib3.connectionpool"), "INFRA")
 
     def test_line_layout_is_two_spaces_between_padded_fields(self):
-        line = news_bot.BandedFormatter(colour=False).format(
+        line = nb_logsetup.BandedFormatter(colour=False).format(
             _record("news_bot.app", msg="briefing_start at=x")
         )
         # timestamp(19) + 2 + band(5) + 2 + level(5) + 2 + message
@@ -3465,31 +3487,31 @@ class LogBandTests(unittest.TestCase):
         )
 
     def test_warning_renders_as_warn_and_critical_as_error(self):
-        fmt = news_bot.BandedFormatter(colour=False)
+        fmt = nb_logsetup.BandedFormatter(colour=False)
         self.assertIn("WARN ", fmt.format(_record("news_bot.sys", logging.WARNING)))
         self.assertIn("ERROR", fmt.format(_record("news_bot.sys", logging.CRITICAL)))
 
     def test_infra_lines_carry_the_originating_logger_name(self):
-        line = news_bot.BandedFormatter(colour=False).format(
+        line = nb_logsetup.BandedFormatter(colour=False).format(
             _record("apscheduler.scheduler", msg="Scheduler started")
         )
         self.assertIn("apscheduler.scheduler | Scheduler started", line)
 
     def test_app_and_sys_lines_omit_the_logger_name(self):
-        fmt = news_bot.BandedFormatter(colour=False)
+        fmt = nb_logsetup.BandedFormatter(colour=False)
         for name in ("news_bot.app", "news_bot.sys"):
             self.assertNotIn(name, fmt.format(_record(name, msg="telegram_sent chunks=1")))
 
     def test_event_prefix_is_gone(self):
         """`event=` was only ever true for app records; it mislabelled every
         library message."""
-        line = news_bot.BandedFormatter(colour=False).format(_record("news_bot.app"))
+        line = nb_logsetup.BandedFormatter(colour=False).format(_record("news_bot.app"))
         self.assertNotIn("event=", line)
 
     def test_standard_levels_render_their_own_tags(self):
         """The four standard levels must render exactly as before the
         threshold-ladder change: DEBUG, INFO, WARN, ERROR (CRITICAL->ERROR)."""
-        fmt = news_bot.BandedFormatter(colour=False)
+        fmt = nb_logsetup.BandedFormatter(colour=False)
         self.assertIn("DEBUG", fmt.format(_record("news_bot.sys", logging.DEBUG)))
         self.assertIn("INFO ", fmt.format(_record("news_bot.sys", logging.INFO)))
         self.assertIn("WARN ", fmt.format(_record("news_bot.sys", logging.WARNING)))
@@ -3501,23 +3523,23 @@ class LogBandTests(unittest.TestCase):
         tag must be ERROR so it matches the >= ERROR colour check -- not the
         old dict-lookup fallback of "INFO", which would render as bold red
         text reading "INFO"."""
-        line = news_bot.BandedFormatter(colour=False).format(
+        line = nb_logsetup.BandedFormatter(colour=False).format(
             _record("news_bot.sys", 45)
         )
         self.assertIn("ERROR", line)
-        coloured = news_bot.BandedFormatter(colour=True).format(
+        coloured = nb_logsetup.BandedFormatter(colour=True).format(
             _record("news_bot.sys", 45)
         )
-        self.assertIn(news_bot._ANSI["error"], coloured)
+        self.assertIn(nb_logsetup._ANSI["error"], coloured)
 
     def test_custom_level_between_info_and_warning_renders_info_tag(self):
-        line = news_bot.BandedFormatter(colour=False).format(
+        line = nb_logsetup.BandedFormatter(colour=False).format(
             _record("news_bot.sys", 25)
         )
         self.assertIn("INFO ", line)
 
     def test_custom_level_below_debug_floors_at_debug_tag(self):
-        line = news_bot.BandedFormatter(colour=False).format(
+        line = nb_logsetup.BandedFormatter(colour=False).format(
             _record("news_bot.sys", 5)
         )
         self.assertIn("DEBUG", line)
@@ -3532,11 +3554,11 @@ def _strip_ansi(text):
 
 class LogColourTests(unittest.TestCase):
     def test_colour_off_emits_no_escapes(self):
-        line = news_bot.BandedFormatter(colour=False).format(_record("news_bot.app"))
+        line = nb_logsetup.BandedFormatter(colour=False).format(_record("news_bot.app"))
         self.assertNotIn("\033[", line)
 
     def test_colour_on_emits_escapes(self):
-        line = news_bot.BandedFormatter(colour=True).format(_record("news_bot.app"))
+        line = nb_logsetup.BandedFormatter(colour=True).format(_record("news_bot.app"))
         self.assertIn("\033[", line)
 
     def test_stripping_colour_reproduces_the_plain_line_exactly(self):
@@ -3551,101 +3573,101 @@ class LogColourTests(unittest.TestCase):
             _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning"),
             _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error"),
         ]
-        plain = news_bot.BandedFormatter(colour=False)
-        fancy = news_bot.BandedFormatter(colour=True)
+        plain = nb_logsetup.BandedFormatter(colour=False)
+        fancy = nb_logsetup.BandedFormatter(colour=True)
         for record in cases:
             with self.subTest(name=record.name, level=record.levelno):
                 self.assertEqual(_strip_ansi(fancy.format(record)), plain.format(record))
 
     def test_infra_lines_are_dimmed_whole(self):
-        line = news_bot.BandedFormatter(colour=True).format(
+        line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("apscheduler.scheduler", msg="Scheduler started")
         )
-        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
-        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+        self.assertTrue(line.startswith(nb_logsetup._ANSI["dim"]))
+        self.assertTrue(line.endswith(nb_logsetup._ANSI["reset"]))
 
     def test_error_level_is_coloured_independently_of_band(self):
         """An error must stay obvious without losing which band it came from."""
-        line = news_bot.BandedFormatter(colour=True).format(
+        line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("news_bot.app", logging.ERROR)
         )
-        self.assertIn(news_bot._ANSI["error"], line)
-        self.assertIn(news_bot._ANSI["app"], line)
+        self.assertIn(nb_logsetup._ANSI["error"], line)
+        self.assertIn(nb_logsetup._ANSI["app"], line)
 
     def test_message_body_is_never_coloured(self):
-        line = news_bot.BandedFormatter(colour=True).format(
+        line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("news_bot.app", logging.WARNING, msg="telegram_sent chunks=3")
         )
-        self.assertIn(f"{news_bot._ANSI['reset']}  telegram_sent chunks=3", line)
+        self.assertIn(f"{nb_logsetup._ANSI['reset']}  telegram_sent chunks=3", line)
 
     def test_infra_warning_renders_dim_whole(self):
         """INFRA+WARNING must stay dimmed across the whole line."""
-        line = news_bot.BandedFormatter(colour=True).format(
+        line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning")
         )
-        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
-        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+        self.assertTrue(line.startswith(nb_logsetup._ANSI["dim"]))
+        self.assertTrue(line.endswith(nb_logsetup._ANSI["reset"]))
 
     def test_infra_error_renders_dim_whole(self):
         """INFRA+ERROR must stay dimmed across the whole line."""
-        line = news_bot.BandedFormatter(colour=True).format(
+        line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
         )
-        self.assertTrue(line.startswith(news_bot._ANSI["dim"]))
-        self.assertTrue(line.endswith(news_bot._ANSI["reset"]))
+        self.assertTrue(line.startswith(nb_logsetup._ANSI["dim"]))
+        self.assertTrue(line.endswith(nb_logsetup._ANSI["reset"]))
 
     def test_infra_error_distinguishable_from_info(self):
         """INFRA+ERROR must be visually distinct from INFRA+INFO, even while dimmed."""
-        info_line = news_bot.BandedFormatter(colour=True).format(
+        info_line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("apscheduler.scheduler", logging.INFO, msg="Scheduler started")
         )
-        error_line = news_bot.BandedFormatter(colour=True).format(
+        error_line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
         )
         # Both must be dimmed
-        self.assertTrue(info_line.startswith(news_bot._ANSI["dim"]))
-        self.assertTrue(error_line.startswith(news_bot._ANSI["dim"]))
+        self.assertTrue(info_line.startswith(nb_logsetup._ANSI["dim"]))
+        self.assertTrue(error_line.startswith(nb_logsetup._ANSI["dim"]))
         # Error line must contain the error colour
-        self.assertIn(news_bot._ANSI["error"], error_line)
+        self.assertIn(nb_logsetup._ANSI["error"], error_line)
         # Info line must not contain the error colour
-        self.assertNotIn(news_bot._ANSI["error"], info_line)
+        self.assertNotIn(nb_logsetup._ANSI["error"], info_line)
 
     def test_infra_error_severity_colour_confined_to_level_tag(self):
         """On INFRA lines, severity colour must not bleed into the message body."""
-        line = news_bot.BandedFormatter(colour=True).format(
+        line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("apscheduler.scheduler", logging.ERROR, msg="Scheduler error")
         )
         # Find the level tag close and extract everything after it
         # Format for INFRA+ERROR: \033[2m...{timestamp}  INFRA  \033[1;31mERROR\033[0m\033[2m  message\033[0m
-        level_tag_close = f"{news_bot._ANSI['error']}ERROR\033[0m\033[2m"
+        level_tag_close = f"{nb_logsetup._ANSI['error']}ERROR\033[0m\033[2m"
         parts = line.split(level_tag_close)
         self.assertEqual(len(parts), 2, "Should have exactly one ERROR tag")
         after_level = parts[1]
         # Message body should have no error or warn colour codes
-        self.assertNotIn(news_bot._ANSI["error"], after_level)
-        self.assertNotIn(news_bot._ANSI["warn"], after_level)
+        self.assertNotIn(nb_logsetup._ANSI["error"], after_level)
+        self.assertNotIn(nb_logsetup._ANSI["warn"], after_level)
 
     def test_infra_warning_severity_colour_confined_to_level_tag(self):
         """On INFRA lines, severity colour must not bleed into the message body."""
-        line = news_bot.BandedFormatter(colour=True).format(
+        line = nb_logsetup.BandedFormatter(colour=True).format(
             _record("apscheduler.scheduler", logging.WARNING, msg="Scheduler warning")
         )
         # Find the level tag close and extract everything after it
         # Format for INFRA+WARNING: \033[2m...{timestamp}  INFRA  \033[33mWARN \033[0m\033[2m  message\033[0m
-        level_tag_close = f"{news_bot._ANSI['warn']}WARN \033[0m\033[2m"
+        level_tag_close = f"{nb_logsetup._ANSI['warn']}WARN \033[0m\033[2m"
         parts = line.split(level_tag_close)
         self.assertEqual(len(parts), 2, "Should have exactly one WARN tag")
         after_level = parts[1]
         # Message body should have no error or warn colour codes
-        self.assertNotIn(news_bot._ANSI["error"], after_level)
-        self.assertNotIn(news_bot._ANSI["warn"], after_level)
+        self.assertNotIn(nb_logsetup._ANSI["error"], after_level)
+        self.assertNotIn(nb_logsetup._ANSI["warn"], after_level)
 
 
 class LogConfigTests(unittest.TestCase):
     def setUp(self):
         self._root_handlers = list(logging.getLogger().handlers)
         self._root_level = logging.getLogger().level
-        self._app_level = news_bot.LOGGER.level
+        self._app_level = nb_logsetup.LOGGER.level
 
     def tearDown(self):
         root = logging.getLogger()
@@ -3654,29 +3676,29 @@ class LogConfigTests(unittest.TestCase):
         for handler in self._root_handlers:
             root.addHandler(handler)
         root.setLevel(self._root_level)
-        news_bot.LOGGER.setLevel(self._app_level)
-        news_bot._LOGGING_CONFIGURED = True
+        nb_logsetup.LOGGER.setLevel(self._app_level)
+        nb_logsetup._LOGGING_CONFIGURED = True
 
     def _configure(self, **overrides):
         settings = {"log_level": "INFO", "log_level_libraries": "WARNING", "log_color": False}
         settings.update(overrides)
-        news_bot._LOGGING_CONFIGURED = False
-        with patch.multiple(news_bot.SETTINGS, **settings):
-            news_bot._configure_logging()
+        nb_logsetup._LOGGING_CONFIGURED = False
+        with patch.multiple(nb_config.SETTINGS, **settings):
+            nb_logsetup._configure_logging()
 
     def test_resolve_level_accepts_known_names(self):
-        self.assertEqual(news_bot._resolve_level("DEBUG"), (logging.DEBUG, None))
-        self.assertEqual(news_bot._resolve_level("warning"), (logging.WARNING, None))
+        self.assertEqual(nb_logsetup._resolve_level("DEBUG"), (logging.DEBUG, None))
+        self.assertEqual(nb_logsetup._resolve_level("warning"), (logging.WARNING, None))
 
     def test_resolve_level_reports_an_unknown_name(self):
         """logging.getLevelName("BOGUS") returns the string "Level BOGUS"
         rather than raising, so a typo would otherwise configure nonsense."""
-        level, rejected = news_bot._resolve_level("BOGUS")
+        level, rejected = nb_logsetup._resolve_level("BOGUS")
         self.assertEqual(level, logging.INFO)
         self.assertEqual(rejected, "BOGUS")
 
     def test_invalid_level_warns_and_names_the_ignored_value(self):
-        with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
+        with self.assertLogs(nb_logsetup.LOGGER, level="WARNING") as logs:
             self._configure(log_level="BOGUS")
         self.assertTrue(any("log_level_invalid" in line for line in logs.output))
         self.assertTrue(any("BOGUS" in line for line in logs.output))
@@ -3684,17 +3706,17 @@ class LogConfigTests(unittest.TestCase):
     def test_resolve_level_treats_empty_string_as_unset(self):
         """LOG_LEVEL= with nothing after the `=` means "use the default",
         not a typo -- it must not be reported as a rejected value."""
-        self.assertEqual(news_bot._resolve_level(""), (logging.INFO, None))
+        self.assertEqual(nb_logsetup._resolve_level(""), (logging.INFO, None))
 
     def test_resolve_level_treats_whitespace_only_as_unset(self):
-        self.assertEqual(news_bot._resolve_level("   "), (logging.INFO, None))
+        self.assertEqual(nb_logsetup._resolve_level("   "), (logging.INFO, None))
 
     def test_empty_log_level_does_not_warn(self):
-        with self.assertLogs(news_bot.SYS_LOG, level="DEBUG") as logs:
+        with self.assertLogs(nb_logsetup.SYS_LOG, level="DEBUG") as logs:
             self._configure(log_level="", log_level_libraries="WARNING")
             # Emit a sentinel so assertLogs has something to capture even
             # when, as expected, no log_level_invalid warning fires.
-            news_bot.SYS_LOG.debug("sentinel")
+            nb_logsetup.SYS_LOG.debug("sentinel")
         self.assertFalse(any("log_level_invalid" in line for line in logs.output))
 
     def test_handler_writes_to_stdout_not_stderr(self):
@@ -3707,14 +3729,14 @@ class LogConfigTests(unittest.TestCase):
 
     def test_configuring_twice_installs_one_handler(self):
         self._configure()
-        news_bot._configure_logging()  # second call, flag already set
+        nb_logsetup._configure_logging()  # second call, flag already set
         self.assertEqual(len(logging.getLogger().handlers), 1)
 
     def test_app_debug_does_not_unleash_library_debug(self):
         """urllib3 emits a line per socket at DEBUG; the app must be able to
         go verbose without that."""
         self._configure(log_level="DEBUG", log_level_libraries="WARNING")
-        self.assertTrue(news_bot.SYS_LOG.isEnabledFor(logging.DEBUG))
+        self.assertTrue(nb_logsetup.SYS_LOG.isEnabledFor(logging.DEBUG))
         self.assertFalse(logging.getLogger("urllib3.connectionpool").isEnabledFor(logging.DEBUG))
 
     def test_library_level_can_be_lowered_on_its_own(self):
@@ -3726,28 +3748,32 @@ class LogRoutingTests(unittest.TestCase):
     def test_business_events_go_to_the_app_logger(self):
         # Both credentials blanked so this can never reach the network, even
         # if a real .env is present.
-        with patch.object(news_bot.SETTINGS, "telegram_token", ""), patch.object(
-            news_bot.SETTINGS, "telegram_chat_id", ""
+        with patch.object(nb_config.SETTINGS, "telegram_token", ""), patch.object(
+            nb_config.SETTINGS, "telegram_chat_id", ""
         ):
-            with self.assertLogs(news_bot.APP_LOG, level="WARNING") as logs:
-                sent = news_bot.send_telegram_message("x")
+            with self.assertLogs(nb_logsetup.APP_LOG, level="WARNING") as logs:
+                sent = nb_messaging.send_telegram_message("x")
         self.assertFalse(sent)
         self.assertTrue(any("telegram_skipped" in line for line in logs.output))
 
     def test_plumbing_events_go_to_the_sys_logger(self):
-        with self.assertLogs(news_bot.SYS_LOG, level="WARNING") as logs:
-            with patch.object(news_bot.SETTINGS, "news_topic_weights", "nonsense:1.0"):
-                news_bot._resolve_topic_weights()
+        with self.assertLogs(nb_logsetup.SYS_LOG, level="WARNING") as logs:
+            with patch.object(nb_config.SETTINGS, "news_topic_weights", "nonsense:1.0"):
+                nb_news_feeds._resolve_topic_weights()
         self.assertTrue(any("topic_weight_unknown" in line for line in logs.output))
 
     def test_no_call_site_uses_the_bare_parent_logger(self):
         """Every emitter must pick a band explicitly.
 
-        Resolved via news_bot.__file__ rather than a relative path, so the
+        Resolved via the package's own path rather than a relative path, so the
         test does not depend on the working directory.
         """
-        with open(news_bot.__file__, encoding="utf-8") as handle:
-            source = handle.read()
+        package_dir = os.path.dirname(nb_config.__file__)
+        source = ""
+        for filename in sorted(os.listdir(package_dir)):
+            if filename.endswith(".py"):
+                with open(os.path.join(package_dir, filename), encoding="utf-8") as handle:
+                    source += handle.read()
         for level in ("debug", "info", "warning", "error"):
             self.assertNotIn(f"LOGGER.{level}(", source)
 
@@ -3763,19 +3789,19 @@ class StickyUniverseTests(unittest.TestCase):
 
     def setUp(self):
         self._patches = [
-            patch.object(news_bot, "USA_STOCK_UNIVERSE", {"Apple": "AAPL"}),
-            patch.object(news_bot, "INDIA_STOCK_UNIVERSE", {}),
-            patch.object(news_bot, "NORWAY_STOCK_UNIVERSE", {}),
-            patch.object(news_bot, "EU_STOCK_UNIVERSE", {}),
-            patch.object(news_bot, "INDIA_MUTUAL_FUNDS", {}),
-            patch.object(news_bot, "NORWAY_MUTUAL_FUNDS", {}),
+            patch.object(nb_config, "USA_STOCK_UNIVERSE", {"Apple": "AAPL"}),
+            patch.object(nb_config, "INDIA_STOCK_UNIVERSE", {}),
+            patch.object(nb_config, "NORWAY_STOCK_UNIVERSE", {}),
+            patch.object(nb_config, "EU_STOCK_UNIVERSE", {}),
+            patch.object(nb_config, "INDIA_MUTUAL_FUNDS", {}),
+            patch.object(nb_config, "NORWAY_MUTUAL_FUNDS", {}),
         ]
         for p in self._patches:
             p.start()
             self.addCleanup(p.stop)
 
     def test_recently_tracked_symbols_rank_by_qualifying_count(self):
-        store = news_bot.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "sticky.db"))
+        store = nb_history_store.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "sticky.db"))
         self.addCleanup(store.close)
         store.record(_metrics(symbol="ONCE", session="2026-08-12"), qualified=True, failed_gate=None)
         store.record(_metrics(symbol="OFTEN", session="2026-08-11"), qualified=True, failed_gate=None)
@@ -3785,17 +3811,17 @@ class StickyUniverseTests(unittest.TestCase):
         )
 
     def test_recently_tracked_symbols_excludes_stale_rows(self):
-        store = news_bot.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "sticky.db"))
+        store = nb_history_store.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "sticky.db"))
         self.addCleanup(store.close)
         store.record(_metrics(symbol="OLD", session="2026-07-01"), qualified=True, failed_gate=None)
         self.assertEqual(store.recently_tracked_symbols(days=10, today="2026-08-13"), [])
 
     def test_tracked_symbols_are_rescreened_before_fresh_movers(self):
         screener = {f"Mover {i}": f"SCR{i}" for i in range(20)}
-        with patch.object(news_bot.TRADE_HISTORY, "recently_tracked_symbols",
+        with patch.object(nb_history_store.TRADE_HISTORY, "recently_tracked_symbols",
                           return_value=["STICKY1", "STICKY2"]), \
-             patch.object(news_bot, "_build_live_universe", return_value=screener):
-            universe = news_bot._build_candidate_universe(20)
+             patch.object(nb_market_data, "_build_live_universe", return_value=screener):
+            universe = nb_screener._build_candidate_universe(20)
         symbols = [symbol for _, symbol in universe]
         self.assertEqual(symbols[:3], ["AAPL", "STICKY1", "STICKY2"])
 
@@ -3804,27 +3830,27 @@ class StickyUniverseTests(unittest.TestCase):
         keeps TRADE_DISCOVERY_MIN_SLOTS however many symbols are tracked."""
         tracked = [f"STK{i}" for i in range(50)]
         screener = {f"Mover {i}": f"SCR{i}" for i in range(20)}
-        with patch.object(news_bot.SETTINGS, "trade_discovery_min_slots", 4), \
-             patch.object(news_bot.TRADE_HISTORY, "recently_tracked_symbols", return_value=tracked), \
-             patch.object(news_bot, "_build_live_universe", return_value=screener):
-            universe = news_bot._build_candidate_universe(20)
+        with patch.object(nb_config.SETTINGS, "trade_discovery_min_slots", 4), \
+             patch.object(nb_history_store.TRADE_HISTORY, "recently_tracked_symbols", return_value=tracked), \
+             patch.object(nb_market_data, "_build_live_universe", return_value=screener):
+            universe = nb_screener._build_candidate_universe(20)
         symbols = [symbol for _, symbol in universe]
         self.assertEqual(len(symbols), 20)
         self.assertEqual(len([s for s in symbols if s.startswith("SCR")]), 4)
 
     def test_tracked_symbol_already_on_the_watchlist_is_not_duplicated(self):
-        with patch.object(news_bot.TRADE_HISTORY, "recently_tracked_symbols",
+        with patch.object(nb_history_store.TRADE_HISTORY, "recently_tracked_symbols",
                           return_value=["AAPL"]), \
-             patch.object(news_bot, "_build_live_universe", return_value={}):
-            universe = news_bot._build_candidate_universe(10)
+             patch.object(nb_market_data, "_build_live_universe", return_value={}):
+            universe = nb_screener._build_candidate_universe(10)
         self.assertEqual([symbol for _, symbol in universe].count("AAPL"), 1)
 
     def test_retention_floor_outlasts_history_readers(self):
-        with patch.object(news_bot.SETTINGS, "trade_history_retention_days", 14), \
-             patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 30), \
-             patch.object(news_bot.SETTINGS, "trade_sticky_universe_days", 10), \
-             patch.object(news_bot.SETTINGS, "trade_weekly_top_picks_lookback_days", 7):
-            self.assertEqual(news_bot._effective_history_retention_days(), 21)
+        with patch.object(nb_config.SETTINGS, "trade_history_retention_days", 14), \
+             patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 30), \
+             patch.object(nb_config.SETTINGS, "trade_sticky_universe_days", 10), \
+             patch.object(nb_config.SETTINGS, "trade_weekly_top_picks_lookback_days", 7):
+            self.assertEqual(nb_screener._effective_history_retention_days(), 21)
 
 
 class RankingQualityTests(unittest.TestCase):
@@ -3834,16 +3860,16 @@ class RankingQualityTests(unittest.TestCase):
         extended = _metrics(symbol="EXTENDED", week_momentum_pct=9.0, rsi_14=85.0)
         healthy = _metrics(symbol="HEALTHY", week_momentum_pct=3.0, rsi_14=55.0)
         self.assertEqual(
-            [m.symbol for m in sorted([extended, healthy], key=news_bot._rank_key)],
+            [m.symbol for m in sorted([extended, healthy], key=nb_ranking._rank_key)],
             ["HEALTHY", "EXTENDED"],
         )
 
     def test_unconfirmed_volume_sorts_below_a_confirmed_name(self):
-        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
+        with patch.object(nb_config.SETTINGS, "trade_min_volume_ratio", 1.2):
             thin = _metrics(symbol="THIN", week_momentum_pct=9.0, volume_ratio=0.4)
             confirmed = _metrics(symbol="CONFIRMED", week_momentum_pct=3.0, volume_ratio=2.0)
             self.assertEqual(
-                [m.symbol for m in sorted([thin, confirmed], key=news_bot._rank_key)],
+                [m.symbol for m in sorted([thin, confirmed], key=nb_ranking._rank_key)],
                 ["CONFIRMED", "THIN"],
             )
 
@@ -3851,13 +3877,13 @@ class RankingQualityTests(unittest.TestCase):
         unknown = _metrics(symbol="UNKNOWN", week_momentum_pct=9.0, rsi_14=None)
         known = _metrics(symbol="KNOWN", week_momentum_pct=3.0, rsi_14=50.0)
         self.assertEqual(
-            [m.symbol for m in sorted([unknown, known], key=news_bot._rank_key)],
+            [m.symbol for m in sorted([unknown, known], key=nb_ranking._rank_key)],
             ["UNKNOWN", "KNOWN"],
         )
 
     def test_neither_flag_disqualifies_anything(self):
         """These tiers reorder the list, they never shorten it."""
-        self.assertEqual(news_bot._failed_gates(_metrics(rsi_14=95.0, volume_ratio=0.1)), [])
+        self.assertEqual(nb_indicators._failed_gates(_metrics(rsi_14=95.0, volume_ratio=0.1)), [])
 
 
 class WatchlistReportTests(unittest.TestCase):
@@ -3867,54 +3893,54 @@ class WatchlistReportTests(unittest.TestCase):
         nowhere -- the command never showed the watchlist at all."""
         passing = _metrics(symbol="AAPL")
         failing = _metrics(symbol="MSFT", above_ema20=False)
-        outcome = news_bot.ScreenOutcome(
+        outcome = nb_screener.ScreenOutcome(
             checked=2,
             analysed=2,
             qualified=[passing],
             rejected=[(failing, ["trend"])],
         )
-        with patch.object(news_bot, "_configured_watchlist",
+        with patch.object(nb_screener, "_configured_watchlist",
                           return_value=[("Apple [USA Stock]", "AAPL"), ("Microsoft [USA Stock]", "MSFT")]), \
-             patch.object(news_bot, "_screen_universe",
+             patch.object(nb_screener, "_screen_universe",
                           return_value=(outcome, {"AAPL": "Apple", "MSFT": "Microsoft"})):
-            report = news_bot.build_watchlist_report()
+            report = nb_screener.build_watchlist_report()
         self.assertIn("AAPL", report)
         self.assertIn("MSFT", report)
         self.assertIn("Holding off", report)
-        self.assertIn(news_bot.TRADE_GATE_LABELS["trend"], report)
+        self.assertIn(nb_screener.TRADE_GATE_LABELS["trend"], report)
 
     def test_explains_how_to_configure_when_watchlist_is_empty(self):
-        with patch.object(news_bot, "_configured_watchlist", return_value=[]), \
-             patch.object(news_bot, "_screen_universe") as mock_screen:
-            report = news_bot.build_watchlist_report()
+        with patch.object(nb_screener, "_configured_watchlist", return_value=[]), \
+             patch.object(nb_screener, "_screen_universe") as mock_screen:
+            report = nb_screener.build_watchlist_report()
         mock_screen.assert_not_called()
         self.assertIn("USA_STOCK_UNIVERSE", report)
 
     def test_screens_only_configured_symbols(self):
         """It must not depend on whatever the screeners surfaced today."""
         entries = [("Apple [USA Stock]", "AAPL")]
-        outcome = news_bot.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAPL")])
-        with patch.object(news_bot, "_configured_watchlist", return_value=entries), \
-             patch.object(news_bot, "_build_live_universe") as mock_live, \
-             patch.object(news_bot, "_screen_universe", return_value=(outcome, {"AAPL": "Apple"})) as mock_screen:
-            news_bot.build_watchlist_report()
+        outcome = nb_screener.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAPL")])
+        with patch.object(nb_screener, "_configured_watchlist", return_value=entries), \
+             patch.object(nb_market_data, "_build_live_universe") as mock_live, \
+             patch.object(nb_screener, "_screen_universe", return_value=(outcome, {"AAPL": "Apple"})) as mock_screen:
+            nb_screener.build_watchlist_report()
         mock_live.assert_not_called()
         self.assertEqual(mock_screen.call_args[0][0], entries)
 
     def test_flags_configured_symbols_the_universe_cap_left_out(self):
         entries = [(f"N{i} [USA Stock]", f"S{i}") for i in range(6)]
-        outcome = news_bot.ScreenOutcome(checked=2, analysed=2)
-        with patch.object(news_bot.SETTINGS, "trade_universe_max", 2), \
-             patch.object(news_bot, "_configured_watchlist", return_value=entries), \
-             patch.object(news_bot, "_screen_universe", return_value=(outcome, {})):
-            report = news_bot.build_watchlist_report()
+        outcome = nb_screener.ScreenOutcome(checked=2, analysed=2)
+        with patch.object(nb_config.SETTINGS, "trade_universe_max", 2), \
+             patch.object(nb_screener, "_configured_watchlist", return_value=entries), \
+             patch.object(nb_screener, "_screen_universe", return_value=(outcome, {})):
+            report = nb_screener.build_watchlist_report()
         self.assertIn("TRADE_UNIVERSE_MAX", report)
         self.assertIn("4 configured symbol(s) not analysed", report)
 
     def test_watchlist_command_dispatches_to_the_report(self):
-        with patch("news_bot.build_watchlist_report", return_value="wl") as mock_build, \
-             patch("news_bot.send_telegram_message") as mock_send:
-            news_bot._handle_command("/watchlist", "123")
+        with patch("newsbot.screener.build_watchlist_report", return_value="wl") as mock_build, \
+             patch("newsbot.messaging.send_telegram_message") as mock_send:
+            nb_commands._handle_command("/watchlist", "123")
         mock_build.assert_called_once()
         mock_send.assert_called_once_with("wl", chat_id="123")
 
@@ -3941,18 +3967,18 @@ class RsiSeriesTests(unittest.TestCase):
         worse than no chart."""
         close = _chart_frame()["Close"]
         self.assertAlmostEqual(
-            float(news_bot._rsi_series(close).iloc[-1]),
-            news_bot._compute_rsi_14(close),
+            float(nb_indicators._rsi_series(close).iloc[-1]),
+            nb_indicators._compute_rsi_14(close),
             places=6,
         )
 
     def test_series_is_none_for_a_series_too_short_to_measure(self):
-        self.assertIsNone(news_bot._rsi_series(pd.Series([1.0, 2.0, 3.0])))
+        self.assertIsNone(nb_indicators._rsi_series(pd.Series([1.0, 2.0, 3.0])))
 
     def test_unbroken_gains_map_to_100_like_the_scalar(self):
         rising = pd.Series([100.0 + i for i in range(40)])
-        self.assertEqual(float(news_bot._rsi_series(rising).iloc[-1]), 100.0)
-        self.assertEqual(news_bot._compute_rsi_14(rising), 100.0)
+        self.assertEqual(float(nb_indicators._rsi_series(rising).iloc[-1]), 100.0)
+        self.assertEqual(nb_indicators._compute_rsi_14(rising), 100.0)
 
 
 class ChartRenderTests(unittest.TestCase):
@@ -3966,69 +3992,69 @@ class ChartRenderTests(unittest.TestCase):
     def test_renders_a_png(self):
         frame = _chart_frame()
         metrics = self._metrics_for("AAPL", frame)
-        with patch.object(news_bot, "_fetch_ticker_history", return_value=frame):
-            image = news_bot.render_candidate_charts([(metrics, "Apple")])
+        with patch.object(nb_market_data, "_fetch_ticker_history", return_value=frame):
+            image = nb_charts.render_candidate_charts([(metrics, "Apple")])
         self.assertIsNotNone(image)
         self.assertTrue(image.startswith(b"\x89PNG"), "not a PNG payload")
 
     def test_no_candidates_renders_nothing(self):
-        self.assertIsNone(news_bot.render_candidate_charts([]))
+        self.assertIsNone(nb_charts.render_candidate_charts([]))
 
     def test_symbol_without_enough_history_is_skipped(self):
         short = _chart_frame(rows=10)
         metrics = self._metrics_for("TINY", short)
-        with patch.object(news_bot, "_fetch_ticker_history", return_value=short):
-            self.assertIsNone(news_bot.render_candidate_charts([(metrics, "Tiny")]))
+        with patch.object(nb_market_data, "_fetch_ticker_history", return_value=short):
+            self.assertIsNone(nb_charts.render_candidate_charts([(metrics, "Tiny")]))
 
     def test_render_failure_degrades_to_none_rather_than_raising(self):
         """Charts decorate the text; they must never take it down."""
         frame = _chart_frame()
         metrics = self._metrics_for("AAPL", frame)
-        with patch.object(news_bot, "_fetch_ticker_history", side_effect=RuntimeError("boom")):
-            self.assertIsNone(news_bot.render_candidate_charts([(metrics, "Apple")]))
+        with patch.object(nb_market_data, "_fetch_ticker_history", side_effect=RuntimeError("boom")):
+            self.assertIsNone(nb_charts.render_candidate_charts([(metrics, "Apple")]))
 
 
 class CandidateChartDeliveryTests(unittest.TestCase):
     def _screen_outcome(self, count):
         qualified = [_metrics(symbol=f"SYM{i}") for i in range(count)]
-        return news_bot.ScreenOutcome(checked=count, analysed=count, qualified=qualified)
+        return nb_screener.ScreenOutcome(checked=count, analysed=count, qualified=qualified)
 
     def test_sends_only_the_configured_number_of_charts(self):
         outcome = self._screen_outcome(6)
-        with patch.object(news_bot.SETTINGS, "trade_chart_count", 3), \
-             patch.object(news_bot, "render_candidate_charts", return_value=b"\x89PNGdata") as mock_render, \
-             patch.object(news_bot, "send_telegram_photo", return_value=True) as mock_send:
-            self.assertTrue(news_bot.send_candidate_charts(outcome, {}))
+        with patch.object(nb_config.SETTINGS, "trade_chart_count", 3), \
+             patch.object(nb_charts, "render_candidate_charts", return_value=b"\x89PNGdata") as mock_render, \
+             patch.object(nb_messaging, "send_telegram_photo", return_value=True) as mock_send:
+            self.assertTrue(nb_charts.send_candidate_charts(outcome, {}))
         charted = [m.symbol for m, _name in mock_render.call_args[0][0]]
         self.assertEqual(charted, ["SYM0", "SYM1", "SYM2"])
         mock_send.assert_called_once()
 
     def test_disabled_setting_sends_nothing(self):
-        with patch.object(news_bot.SETTINGS, "trade_chart_enabled", False), \
-             patch.object(news_bot, "send_telegram_photo") as mock_send:
-            self.assertFalse(news_bot.send_candidate_charts(self._screen_outcome(3), {}))
+        with patch.object(nb_config.SETTINGS, "trade_chart_enabled", False), \
+             patch.object(nb_messaging, "send_telegram_photo") as mock_send:
+            self.assertFalse(nb_charts.send_candidate_charts(self._screen_outcome(3), {}))
         mock_send.assert_not_called()
 
     def test_nothing_qualified_sends_nothing(self):
-        with patch.object(news_bot, "send_telegram_photo") as mock_send:
-            self.assertFalse(news_bot.send_candidate_charts(self._screen_outcome(0), {}))
+        with patch.object(nb_messaging, "send_telegram_photo") as mock_send:
+            self.assertFalse(nb_charts.send_candidate_charts(self._screen_outcome(0), {}))
         mock_send.assert_not_called()
 
     def test_unrenderable_charts_send_nothing(self):
-        with patch.object(news_bot, "render_candidate_charts", return_value=None), \
-             patch.object(news_bot, "send_telegram_photo") as mock_send:
-            self.assertFalse(news_bot.send_candidate_charts(self._screen_outcome(3), {}))
+        with patch.object(nb_charts, "render_candidate_charts", return_value=None), \
+             patch.object(nb_messaging, "send_telegram_photo") as mock_send:
+            self.assertFalse(nb_charts.send_candidate_charts(self._screen_outcome(3), {}))
         mock_send.assert_not_called()
 
     def test_charts_never_go_to_slack(self):
         """An incoming webhook cannot upload a file, so Slack deliberately
         keeps receiving only the text rendering."""
-        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), \
-             patch.object(news_bot, "render_candidate_charts", return_value=b"\x89PNGdata"), \
-             patch.object(news_bot, "_telegram_post_photo") as mock_photo, \
-             patch.object(news_bot, "send_slack_message") as mock_slack, \
-             patch.object(news_bot, "_slack_post") as mock_post:
-            news_bot.send_candidate_charts(self._screen_outcome(2), {}, chat_id="123")
+        with patch.object(nb_config.SETTINGS, "telegram_token", "token"), \
+             patch.object(nb_charts, "render_candidate_charts", return_value=b"\x89PNGdata"), \
+             patch.object(nb_messaging, "_telegram_post_photo") as mock_photo, \
+             patch.object(nb_messaging, "send_slack_message") as mock_slack, \
+             patch.object(nb_messaging, "_slack_post") as mock_post:
+            nb_charts.send_candidate_charts(self._screen_outcome(2), {}, chat_id="123")
         mock_photo.assert_called_once()
         mock_slack.assert_not_called()
         mock_post.assert_not_called()
@@ -4036,32 +4062,32 @@ class CandidateChartDeliveryTests(unittest.TestCase):
     def test_caption_is_truncated_to_telegram_limit(self):
         """Telegram rejects a caption over 1024 characters, which would fail
         the whole upload rather than trimming it."""
-        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), \
-             patch.object(news_bot, "_telegram_post_photo") as mock_post:
-            news_bot.send_telegram_photo(b"png", caption="x" * 2000, chat_id="123")
+        with patch.object(nb_config.SETTINGS, "telegram_token", "token"), \
+             patch.object(nb_messaging, "_telegram_post_photo") as mock_post:
+            nb_messaging.send_telegram_photo(b"png", caption="x" * 2000, chat_id="123")
         mock_post.assert_called_once()
         self.assertLessEqual(len(mock_post.call_args[0][2]), 1024)
 
     def test_upload_is_skipped_without_a_token(self):
-        with patch.object(news_bot.SETTINGS, "telegram_token", ""), \
-             patch.object(news_bot, "_telegram_post_photo") as mock_post:
-            self.assertFalse(news_bot.send_telegram_photo(b"png", chat_id="123"))
+        with patch.object(nb_config.SETTINGS, "telegram_token", ""), \
+             patch.object(nb_messaging, "_telegram_post_photo") as mock_post:
+            self.assertFalse(nb_messaging.send_telegram_photo(b"png", chat_id="123"))
         mock_post.assert_not_called()
 
     def test_photo_upload_failure_is_swallowed(self):
-        with patch.object(news_bot.SETTINGS, "telegram_token", "token"), \
-             patch.object(news_bot, "_telegram_post_photo", side_effect=RuntimeError("down")):
-            self.assertFalse(news_bot.send_telegram_photo(b"png", chat_id="123"))
+        with patch.object(nb_config.SETTINGS, "telegram_token", "token"), \
+             patch.object(nb_messaging, "_telegram_post_photo", side_effect=RuntimeError("down")):
+            self.assertFalse(nb_messaging.send_telegram_photo(b"png", chat_id="123"))
 
 
 class RecommendationsChartWiringTests(unittest.TestCase):
     def test_text_is_sent_before_charts_and_screening_runs_once(self):
-        outcome = news_bot.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAA")])
-        with patch.object(news_bot, "build_trade_candidates_payload",
+        outcome = nb_screener.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAA")])
+        with patch.object(nb_screener, "build_trade_candidates_payload",
                           return_value=("picks", outcome, {"AAA": "Alpha"})) as mock_payload, \
-             patch.object(news_bot, "send_candidate_charts") as mock_charts, \
-             patch("news_bot.send_telegram_message") as mock_send:
-            news_bot._handle_command("/recommendations", "123")
+             patch.object(nb_charts, "send_candidate_charts") as mock_charts, \
+             patch("newsbot.messaging.send_telegram_message") as mock_send:
+            nb_commands._handle_command("/recommendations", "123")
         mock_payload.assert_called_once()
         mock_send.assert_called_once_with("picks", chat_id="123")
         mock_charts.assert_called_once()
@@ -4069,10 +4095,10 @@ class RecommendationsChartWiringTests(unittest.TestCase):
 
     def test_get_trade_candidates_still_returns_just_text(self):
         """Back-compat: the briefing path only ever wanted the string."""
-        outcome = news_bot.ScreenOutcome(checked=0, analysed=0)
-        with patch.object(news_bot, "_build_candidate_universe", return_value=[]), \
-             patch.object(news_bot, "_screen_universe", return_value=(outcome, {})):
-            result = news_bot.get_trade_candidates()
+        outcome = nb_screener.ScreenOutcome(checked=0, analysed=0)
+        with patch.object(nb_screener, "_build_candidate_universe", return_value=[]), \
+             patch.object(nb_screener, "_screen_universe", return_value=(outcome, {})):
+            result = nb_screener.get_trade_candidates()
         self.assertIsInstance(result, str)
 
 
@@ -4080,8 +4106,8 @@ class SlackPhotoUploadTests(unittest.TestCase):
     """Slack's external-upload flow: reserve a URL, PUT bytes, complete."""
 
     def setUp(self):
-        self._token = patch.object(news_bot.SETTINGS, "slack_bot_token", "xoxb-test")
-        self._channel = patch.object(news_bot.SETTINGS, "slack_channel_id", "C123")
+        self._token = patch.object(nb_config.SETTINGS, "slack_bot_token", "xoxb-test")
+        self._channel = patch.object(nb_config.SETTINGS, "slack_channel_id", "C123")
         self._token.start(); self._channel.start()
         self.addCleanup(self._token.stop); self.addCleanup(self._channel.stop)
 
@@ -4105,8 +4131,8 @@ class SlackPhotoUploadTests(unittest.TestCase):
                 return self._response({"ok": True})
             raise AssertionError(f"unexpected url {url}")
 
-        with patch.object(news_bot.requests, "post", side_effect=fake_post):
-            self.assertTrue(news_bot.send_slack_photo(b"\x89PNGdata", title="T", comment="C"))
+        with patch.object(requests, "post", side_effect=fake_post):
+            self.assertTrue(nb_messaging.send_slack_photo(b"\x89PNGdata", title="T", comment="C"))
         self.assertEqual(
             calls,
             [
@@ -4119,26 +4145,26 @@ class SlackPhotoUploadTests(unittest.TestCase):
     def test_application_error_is_a_failure_despite_http_200(self):
         """Slack answers ok:false with HTTP 200, so raise_for_status alone
         would read a missing scope as success."""
-        with patch.object(news_bot.requests, "post",
+        with patch.object(requests, "post",
                           return_value=self._response({"ok": False, "error": "missing_scope"})):
-            self.assertFalse(news_bot.send_slack_photo(b"png"))
+            self.assertFalse(nb_messaging.send_slack_photo(b"png"))
 
     def test_skipped_without_a_bot_token(self):
-        with patch.object(news_bot.SETTINGS, "slack_bot_token", ""), \
-             patch.object(news_bot.requests, "post") as mock_post:
-            self.assertFalse(news_bot.send_slack_photo(b"png"))
+        with patch.object(nb_config.SETTINGS, "slack_bot_token", ""), \
+             patch.object(requests, "post") as mock_post:
+            self.assertFalse(nb_messaging.send_slack_photo(b"png"))
         mock_post.assert_not_called()
 
     def test_skipped_without_a_channel_id(self):
-        with patch.object(news_bot.SETTINGS, "slack_channel_id", ""), \
-             patch.object(news_bot.requests, "post") as mock_post:
-            self.assertFalse(news_bot.send_slack_photo(b"png"))
+        with patch.object(nb_config.SETTINGS, "slack_channel_id", ""), \
+             patch.object(requests, "post") as mock_post:
+            self.assertFalse(nb_messaging.send_slack_photo(b"png"))
         mock_post.assert_not_called()
 
     def test_missing_upload_target_is_a_failure(self):
-        with patch.object(news_bot.requests, "post",
+        with patch.object(requests, "post",
                           return_value=self._response({"ok": True})):
-            self.assertFalse(news_bot.send_slack_photo(b"png"))
+            self.assertFalse(nb_messaging.send_slack_photo(b"png"))
 
     def test_channel_id_and_file_id_reach_the_completion_call(self):
         seen = {}
@@ -4151,8 +4177,8 @@ class SlackPhotoUploadTests(unittest.TestCase):
                 return self._response({"ok": True})
             return self._response({})
 
-        with patch.object(news_bot.requests, "post", side_effect=fake_post):
-            news_bot.send_slack_photo(b"png", title="Candidates", comment="hello")
+        with patch.object(requests, "post", side_effect=fake_post):
+            nb_messaging.send_slack_photo(b"png", title="Candidates", comment="hello")
         self.assertEqual(seen["channel_id"], "C123")
         self.assertIn("F9", seen["files"])
         self.assertEqual(seen["initial_comment"], "hello")
@@ -4160,37 +4186,37 @@ class SlackPhotoUploadTests(unittest.TestCase):
 
 class DualChannelChartDeliveryTests(unittest.TestCase):
     def _screen_outcome(self):
-        return news_bot.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAA")])
+        return nb_screener.ScreenOutcome(checked=1, analysed=1, qualified=[_metrics(symbol="AAA")])
 
     def test_chart_is_rendered_once_and_sent_to_both(self):
-        with patch.object(news_bot, "render_candidate_charts", return_value=b"png") as mock_render, \
-             patch.object(news_bot, "send_telegram_photo", return_value=True) as mock_tg, \
-             patch.object(news_bot, "send_slack_photo", return_value=True) as mock_slack:
-            self.assertTrue(news_bot.send_candidate_charts(self._screen_outcome(), {}))
+        with patch.object(nb_charts, "render_candidate_charts", return_value=b"png") as mock_render, \
+             patch.object(nb_messaging, "send_telegram_photo", return_value=True) as mock_tg, \
+             patch.object(nb_messaging, "send_slack_photo", return_value=True) as mock_slack:
+            self.assertTrue(nb_charts.send_candidate_charts(self._screen_outcome(), {}))
         mock_render.assert_called_once()
         self.assertEqual(mock_tg.call_args[0][0], b"png")
         self.assertEqual(mock_slack.call_args[0][0], b"png")
 
     def test_slack_failure_does_not_cost_telegram_its_chart(self):
-        with patch.object(news_bot, "render_candidate_charts", return_value=b"png"), \
-             patch.object(news_bot, "send_telegram_photo", return_value=True) as mock_tg, \
-             patch.object(news_bot, "send_slack_photo", return_value=False):
-            self.assertTrue(news_bot.send_candidate_charts(self._screen_outcome(), {}))
+        with patch.object(nb_charts, "render_candidate_charts", return_value=b"png"), \
+             patch.object(nb_messaging, "send_telegram_photo", return_value=True) as mock_tg, \
+             patch.object(nb_messaging, "send_slack_photo", return_value=False):
+            self.assertTrue(nb_charts.send_candidate_charts(self._screen_outcome(), {}))
         mock_tg.assert_called_once()
 
     def test_telegram_failure_does_not_cost_slack_its_chart(self):
-        with patch.object(news_bot, "render_candidate_charts", return_value=b"png"), \
-             patch.object(news_bot, "send_telegram_photo", return_value=False), \
-             patch.object(news_bot, "send_slack_photo", return_value=True) as mock_slack:
-            self.assertTrue(news_bot.send_candidate_charts(self._screen_outcome(), {}))
+        with patch.object(nb_charts, "render_candidate_charts", return_value=b"png"), \
+             patch.object(nb_messaging, "send_telegram_photo", return_value=False), \
+             patch.object(nb_messaging, "send_slack_photo", return_value=True) as mock_slack:
+            self.assertTrue(nb_charts.send_candidate_charts(self._screen_outcome(), {}))
         mock_slack.assert_called_once()
 
     def test_webhook_only_install_is_unchanged(self):
         """No bot token configured: Telegram still gets its chart, Slack
         keeps receiving only the text."""
-        with patch.object(news_bot.SETTINGS, "slack_bot_token", ""), \
-             patch.object(news_bot, "render_candidate_charts", return_value=b"png"), \
-             patch.object(news_bot, "send_telegram_photo", return_value=True), \
-             patch.object(news_bot.requests, "post") as mock_post:
-            self.assertTrue(news_bot.send_candidate_charts(self._screen_outcome(), {}))
+        with patch.object(nb_config.SETTINGS, "slack_bot_token", ""), \
+             patch.object(nb_charts, "render_candidate_charts", return_value=b"png"), \
+             patch.object(nb_messaging, "send_telegram_photo", return_value=True), \
+             patch.object(requests, "post") as mock_post:
+            self.assertTrue(nb_charts.send_candidate_charts(self._screen_outcome(), {}))
         mock_post.assert_not_called()
