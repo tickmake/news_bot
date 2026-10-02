@@ -1,0 +1,45 @@
+symbol,name,market,sector
+MSFT,Microsoft,US,Technology
+JPM,JPMorgan Chase,US,Financials
+JNJ,Johnson & Johnson,US,Health care
+XOM,Exxon Mobil,US,Energy
+PG,Procter & Gamble,US,Consumer staples
+HD,Home Depot,US,Consumer discretionary
+CAT,Caterpillar,US,Industrials
+LIN,Linde,US,Materials
+NEE,NextEra Energy,US,Utilities
+AMT,American Tower,US,Real estate
+VZ,Verizon,US,Communication services
+SAP.DE,SAP,Europe,Technology
+SIE.DE,Siemens,Europe,Industrials
+ALV.DE,Allianz,Europe,Financials
+ASML.AS,ASML,Europe,Technology
+MC.PA,LVMH,Europe,Consumer discretionary
+TTE.PA,TotalEnergies,Europe,Energy
+OR.PA,L'Oreal,Europe,Consumer staples
+SAN.PA,Sanofi,Europe,Health care
+AIR.PA,Airbus,Europe,Industrials
+ENEL.MI,Enel,Europe,Utilities
+ISP.MI,Intesa Sanpaolo,Europe,Financials
+IBE.MC,Iberdrola,Europe,Utilities
+ITX.MC,Inditex,Europe,Consumer discretionary
+ABI.BR,Anheuser-Busch InBev,Europe,Consumer staples
+INFY.NS,Infosys,India,Technology
+HDFCBANK.NS,HDFC Bank,India,Financials
+SUNPHARMA.NS,Sun Pharmaceutical,India,Health care
+ONGC.NS,Oil and Natural Gas Corporation,India,Energy
+HINDUNILVR.NS,Hindustan Unilever,India,Consumer staples
+MARUTI.NS,Maruti Suzuki,India,Consumer discretionary
+LT.NS,Larsen & Toubro,India,Industrials
+ULTRACEMCO.NS,UltraTech Cement,India,Materials
+NTPC.NS,NTPC,India,Utilities
+DLF.NS,DLF,India,Real estate
+BHARTIARTL.NS,Bharti Airtel,India,Communication services
+EQNR.OL,Equinor,Norway,Energy
+DNB.OL,DNB Bank,Norway,Financials
+TEL.OL,Telenor,Norway,Communication services
+MOWI.OL,Mowi,Norway,Consumer staples
+ORK.OL,Orkla,Norway,Consumer staples
+NHY.OL,Norsk Hydro,Norway,Materials
+YAR.OL,Yara International,Norway,Materials
+TOM.OL,Tomra Systems,Norway,Industrials

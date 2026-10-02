@@ -138,13 +138,20 @@ services:
       - TRADE_UNIVERSE_MAX=${TRADE_UNIVERSE_MAX:-30}
       - TRADE_HISTORY_RETENTION_DAYS=${TRADE_HISTORY_RETENTION_DAYS:-14}
       - TRADE_OUTCOME_LOOKBACK_DAYS=${TRADE_OUTCOME_LOOKBACK_DAYS:-5}
+      - TRADE_BACKTEST_PERIOD=${TRADE_BACKTEST_PERIOD:-2y}
+      - TRADE_BACKTEST_UNIVERSE=${TRADE_BACKTEST_UNIVERSE:-configured}
+      - TRADE_BACKTEST_UNIVERSE_MAX=${TRADE_BACKTEST_UNIVERSE_MAX:-100}
+      - TRADE_BACKTEST_COST_BPS=${TRADE_BACKTEST_COST_BPS:-10}
+      - TRADE_BACKTEST_HOLDOUT_START=${TRADE_BACKTEST_HOLDOUT_START:-}
+      - TRADE_BACKTEST_MIN_AVG_VOLUME=${TRADE_BACKTEST_MIN_AVG_VOLUME:-100000}
+      - TRADE_BACKTEST_BENCHMARKS=${TRADE_BACKTEST_BENCHMARKS:-DEFAULT:SPY,.NS:^NSEI,.BO:^BSESN,.OL:^OSEAX,.DE:^GDAXI,.PA:^FCHI,.AS:^AEX,.MI:^FTSEMIB,.MC:^IBEX,.BR:^BFX,.L:^FTSE,.SW:^SSMI,.ST:^OMX,.CO:^OMXC25,.HE:^OMXH25}
       - TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS=${TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS:-7}
       - TRADE_WEEKLY_TOP_PICKS_MIN_QUALIFYING_DAYS=${TRADE_WEEKLY_TOP_PICKS_MIN_QUALIFYING_DAYS:-2}
-      # Universe continuity. /stocks and /performance read recorded history,
-      # so they need symbols re-screened across several sessions; discovery
-      # alone churns almost completely day to day. Tracked symbols are carried
-      # forward for this many days, while discovery keeps a reserved slot
-      # count so new names still surface.
+      # Universe continuity. /stocks reads recorded history, so it needs
+      # symbols re-screened across several sessions; discovery alone churns
+      # almost completely day to day. Tracked symbols are carried forward for
+      # this many days, while discovery keeps a reserved slot count so new
+      # names still surface.
       - TRADE_STICKY_UNIVERSE_DAYS=${TRADE_STICKY_UNIVERSE_DAYS:-10}
       - TRADE_DISCOVERY_MIN_SLOTS=${TRADE_DISCOVERY_MIN_SLOTS:-10}
       # Charts on /recommendations. Telegram-only by construction: an incoming

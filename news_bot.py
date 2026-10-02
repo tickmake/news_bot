@@ -1,23 +1,28 @@
 import copy
+import csv
 import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
+import statistics
 import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import escape, unescape
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 from urllib.parse import urlparse
 import defusedxml.ElementTree as ET
+import pandas as pd
 
 from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -314,7 +319,6 @@ class AppSettings(BaseSettings):
     # note was taken while the model was short-circuiting to an empty array,
     # so it timed a no-op. 14 leaves headroom on both models.
     news_ranker_max_candidates: int = 14
-    trade_min_score: int = 3
     trade_min_week_momentum_pct: float = 1.0
     trade_min_day_change_pct: float = 0.0
     trade_min_volume_ratio: float = 1.2
@@ -326,17 +330,27 @@ class AppSettings(BaseSettings):
     trade_total_deadline_seconds: int = 45
     trade_history_db_file: str = ".news_bot_trade_history.db"
     trade_history_retention_days: int = 14
+    # Legacy variable name; this is the fixed backtest holding period in sessions.
     trade_outcome_lookback_days: int = 5
+    trade_backtest_period: str = "2y"
+    trade_backtest_universe: str = "configured"
+    trade_backtest_universe_max: int = 100
+    trade_backtest_cost_bps: float = 10.0
+    trade_backtest_holdout_start: str = ""
+    trade_backtest_min_avg_volume: float = 100000.0
+    trade_backtest_benchmarks: str = (
+        "DEFAULT:SPY,.NS:^NSEI,.BO:^BSESN,.OL:^OSEAX,.DE:^GDAXI,"
+        ".PA:^FCHI,.AS:^AEX,.MI:^FTSEMIB,.MC:^IBEX,.BR:^BFX,"
+        ".L:^FTSE,.SW:^SSMI,.ST:^OMX,.CO:^OMXC25,.HE:^OMXH25"
+    )
     trade_weekly_top_picks_lookback_days: int = 7
     trade_weekly_top_picks_min_qualifying_days: int = 2
     trade_weekly_top_picks_count: int = 5
-    # Universe continuity. /stocks and /performance are pure reads over
-    # recorded history, so they only have anything to say about symbols
-    # that get re-screened across more than one session. Screener
-    # discovery returns a near-different set of movers every day, so
-    # without carrying recently-seen symbols forward both commands report
-    # "nothing yet" indefinitely. Discovery keeps a reserved slot count so
-    # the sticky set can never crowd out fresh names entirely.
+    # Universe continuity. /stocks reads recorded history, so it only has
+    # anything to say about symbols re-screened across more than one session.
+    # Discovery churns almost completely day to day; keeping recent symbols
+    # around gives history-based weekly picks enough observations. Discovery
+    # retains reserved slots so it can never crowd out fresh names entirely.
     trade_sticky_universe_days: int = 10
     trade_discovery_min_slots: int = 10
     # Technical-analysis charts attached to /recommendations. Telegram
@@ -440,6 +454,37 @@ DEFAULT_EU_STOCK_UNIVERSE: Dict[str, str] = {
     "Inditex": "ITX.MC",
     "Anheuser-Busch InBev": "ABI.BR",
 }
+
+
+def _evaluation_stock_universe() -> Tuple[str, Dict[str, Dict[str, str]]]:
+    preset = SETTINGS.trade_backtest_universe.strip()
+    if preset == "configured":
+        return preset, {
+            symbol: {"symbol": symbol, "name": label, "market": "configured", "sector": "unclassified"}
+            for label, symbol in _configured_stock_watchlist()
+        }
+    if preset != "broad-v1":
+        raise ValueError("TRADE_BACKTEST_UNIVERSE must be configured or broad-v1")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation_universe.csv")
+    with open(path, newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        if reader.fieldnames != ["symbol", "name", "market", "sector"]:
+            raise ValueError("invalid evaluation universe columns")
+        stocks = {}
+        for row in reader:
+            if set(row) != set(reader.fieldnames) or any(
+                not isinstance(value, str) or not value.strip() for value in row.values()
+            ):
+                raise ValueError("empty evaluation universe field")
+            row = {key: value.strip() for key, value in row.items()}
+            symbol = row["symbol"]
+            if symbol in stocks:
+                raise ValueError(f"duplicate evaluation stock: {symbol}")
+            stocks[symbol] = row
+    if not stocks:
+        raise ValueError("empty evaluation universe")
+    return preset, stocks
+
 
 USA_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.usa_stock_universe, {})
 INDIA_STOCK_UNIVERSE = _parse_instrument_env(SETTINGS.india_stock_universe, {})
@@ -2291,12 +2336,13 @@ def _compute_volume_trend(volume_series: Any) -> str:
     volume-ratio tie-breaker that already exists in `_rank_key`.
     """
     try:
-        if len(volume_series) < 20:
-            return "flat"
-        recent_avg = float(volume_series.tail(5).mean())
-        prior_avg = float(volume_series.tail(20).head(15).mean())
+        recent_sessions = volume_series.tail(20)
+        if len(recent_sessions) < 20 or recent_sessions.isna().any():
+            return "unknown"
+        recent_avg = float(recent_sessions.tail(5).mean())
+        prior_avg = float(recent_sessions.head(15).mean())
         if prior_avg <= 0:
-            return "flat"
+            return "unknown"
         change = (recent_avg - prior_avg) / prior_avg
         if change >= 0.15:
             return "rising"
@@ -2305,7 +2351,7 @@ def _compute_volume_trend(volume_series: Any) -> str:
         return "flat"
     except Exception as exc:
         SYS_LOG.debug("volume_trend_compute_failed detail=%s", exc)
-        return "flat"
+        return "unknown"
 
 
 @dataclass(frozen=True)
@@ -2317,7 +2363,7 @@ class TradeMetrics:
     last_close: float
     day_change_pct: float
     week_momentum_pct: float
-    volume_ratio: float
+    volume_ratio: Optional[float]
     drawdown_pct: float
     atr_pct: float
     above_ema20: bool
@@ -2328,7 +2374,7 @@ class TradeMetrics:
     rsi_14: Optional[float] = None
     support_level: float = 0.0
     resistance_level: float = 0.0
-    volume_trend: str = "flat"
+    volume_trend: str = "unknown"
 
 
 def _drop_in_progress_bar(history: Any) -> Any:
@@ -2388,14 +2434,20 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
 
         ema_20 = float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
 
-        volume_ratio = 1.0
-        volume_trend = "flat"
+        volume_ratio: Optional[float] = None
+        volume_trend = "unknown"
         if "Volume" in history:
-            volume_series = history["Volume"].dropna()
-            if len(volume_series) >= 20:
-                avg_volume_20 = float(volume_series.tail(20).mean())
-                if avg_volume_20 > 0:
-                    volume_ratio = float(volume_series.iloc[-1]) / avg_volume_20
+            volume_series = history["Volume"]
+            if len(volume_series) >= 21:
+                # Compare the completed session with the *previous* 20
+                # sessions; including today's volume in its own baseline
+                # suppresses the very spike this ratio is meant to reveal.
+                prior_volumes = volume_series.iloc[-21:-1]
+                last_volume = volume_series.iloc[-1]
+                if not prior_volumes.isna().any() and pd.notna(last_volume):
+                    avg_volume_20 = float(prior_volumes.mean())
+                    if avg_volume_20 > 0:
+                        volume_ratio = float(last_volume) / avg_volume_20
             volume_trend = _compute_volume_trend(volume_series)
 
         resistance_level = float(close_series.tail(20).max())
@@ -2469,14 +2521,16 @@ def _failed_gates(metrics: TradeMetrics) -> List[str]:
     return failed
 
 
-def _rank_key(metrics: TradeMetrics) -> Tuple[bool, bool, float, float, int, float, str]:
+def _rank_key(
+    metrics: TradeMetrics, qualifying_streak: Optional[int] = None
+) -> Tuple[bool, bool, float, float, int, float, str]:
     """Ordering for qualifying candidates: momentum, then confirmation,
     then consistency, then calm.
 
-    An ordinal rule rather than a weighted composite. Choosing weights needs
-    backtesting this codebase has no harness for, and arbitrary weights
-    presented as precision are worse than an explicit ordering. Symbol sorts
-    last so identical metrics always produce the same output.
+    An ordinal rule rather than a weighted composite keeps the ordering
+    explainable; `/performance` now provides a historical validation path
+    before changing these priorities. Symbol sorts last so identical metrics
+    always produce the same output.
 
     The qualifying streak (how many recent sessions running, today included,
     this symbol has passed every gate) sits after volume and before ATR: it
@@ -2497,26 +2551,573 @@ def _rank_key(metrics: TradeMetrics) -> Tuple[bool, bool, float, float, int, flo
     # Both now sort *down* rather than out, which keeps every currently
     # qualifying symbol qualifying.
     overbought = metrics.rsi_14 is not None and metrics.rsi_14 >= 70
-    unconfirmed = metrics.volume_ratio < SETTINGS.trade_min_volume_ratio
+    unconfirmed = (
+        metrics.volume_ratio is None
+        or metrics.volume_ratio < SETTINGS.trade_min_volume_ratio
+    )
+    streak = (
+        TRADE_HISTORY.recent_qualifying_streak(metrics.symbol)
+        if qualifying_streak is None
+        else qualifying_streak
+    )
     return (
         overbought,
         unconfirmed,
         -metrics.week_momentum_pct,
-        -metrics.volume_ratio,
-        -TRADE_HISTORY.recent_qualifying_streak(metrics.symbol),
+        -(metrics.volume_ratio if metrics.volume_ratio is not None else 0.0),
+        -streak,
         metrics.atr_pct,
         metrics.symbol,
     )
+
+
+def _backtest_benchmark_for(symbol: str) -> Optional[str]:
+    """Resolve a market proxy from the configured suffix map.
+
+    DEFAULT is used only for symbols without an exchange suffix. An unknown
+    suffix has no benchmark rather than inheriting an unrelated market proxy.
+    Users can override the map because Yahoo's index symbols vary by exchange
+    and the defaults are only broad-market approximations.
+    """
+    mappings: Dict[str, str] = {}
+    for entry in SETTINGS.trade_backtest_benchmarks.split(","):
+        if ":" not in entry:
+            continue
+        suffix, ticker = entry.split(":", 1)
+        suffix, ticker = suffix.strip().upper(), ticker.strip()
+        if suffix and ticker:
+            mappings[suffix] = ticker
+    for suffix in sorted((key for key in mappings if key != "DEFAULT"), key=len, reverse=True):
+        if symbol.upper().endswith(suffix):
+            return mappings[suffix]
+    if "." not in symbol:
+        return mappings.get("DEFAULT")
+    return None
+
+
+def _matched_benchmark_return(
+    history: Any, entry_date: str, exit_date: str,
+    positions: Optional[Dict[str, int]] = None,
+) -> Optional[float]:
+    if history is None or len(history) == 0:
+        return None
+    if positions is None:
+        positions = {
+            date.strftime("%Y-%m-%d"): index
+            for index, date in enumerate(history.index)
+        }
+    if len(positions) != len(history) or any(column not in history for column in ("Open", "Close")):
+        SYS_LOG.warning("benchmark_history_unusable reason=duplicate_dates_or_missing_prices")
+        return None
+    entry, exit_position = positions.get(entry_date), positions.get(exit_date)
+    if entry is None or exit_position is None:
+        return None
+    try:
+        entry_price = float(history.iloc[entry]["Open"])
+        exit_price = float(history.iloc[exit_position]["Close"])
+    except (TypeError, ValueError) as exc:
+        SYS_LOG.warning("benchmark_history_unusable reason=nonnumeric_prices detail=%s", exc)
+        return None
+    if (
+        not math.isfinite(entry_price) or not math.isfinite(exit_price)
+        or entry_price <= 0 or exit_price <= 0
+    ):
+        SYS_LOG.warning("benchmark_history_unusable reason=invalid_prices")
+        return None
+    return (exit_price / entry_price - 1.0) * 100.0
+
+
+def _backtest_metrics_by_session(symbol: str, history: Any) -> Tuple[Any, Dict[str, TradeMetrics]]:
+    """Calculate the screener's daily features using data available at each close."""
+    if history is None or len(history) == 0:
+        return None, {}
+
+    columns = ("Open", "High", "Low", "Close", "Volume")
+    if any(column not in history for column in columns[:4]):
+        SYS_LOG.warning("backtest_history_unusable symbol=%s reason=missing_ohlc", symbol)
+        return None, {}
+    frame = history.copy()
+    if not frame.index.is_monotonic_increasing or frame.index.has_duplicates:
+        SYS_LOG.warning("backtest_history_unusable symbol=%s reason=unordered_or_duplicate_sessions", symbol)
+        return None, {}
+    for column in columns:
+        if column in frame:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    prices = frame[list(columns[:4])]
+    if (
+        prices.isna().any().any()
+        or prices.isin([float("inf"), float("-inf")]).any().any()
+        or (prices <= 0).any().any()
+        or (frame["High"] < frame["Low"]).any()
+    ):
+        # Dropping invalid rows would turn missing prices into shorter trading
+        # horizons and silently report the wrong entry/exit sessions.
+        SYS_LOG.warning("backtest_history_unusable symbol=%s reason=invalid_ohlc", symbol)
+        return None, {}
+    if len(frame) < 30:
+        return frame, {}
+
+    close = frame["Close"]
+    high = frame["High"]
+    low = frame["Low"]
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr_pct = true_range.rolling(14, min_periods=14).mean() / close * 100.0
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    gains = close.diff().clip(lower=0.0)
+    losses = -close.diff().clip(upper=0.0)
+    avg_gain = gains.rolling(14, min_periods=14).mean()
+    avg_loss = losses.rolling(14, min_periods=14).mean()
+    rs = avg_gain / avg_loss
+    rsi = (100.0 - (100.0 / (1.0 + rs))).where(avg_loss != 0.0, 100.0)
+    volume = frame["Volume"] if "Volume" in frame else pd.Series(float("nan"), index=frame.index)
+    average_prior_volume = volume.shift(1).rolling(20, min_periods=20).mean()
+    volume_ratio = volume / average_prior_volume
+    recent_volume = volume.rolling(5, min_periods=5).mean()
+    prior_volume = volume.shift(5).rolling(15, min_periods=15).mean()
+    volume_change = (recent_volume - prior_volume) / prior_volume
+    support = close.rolling(20, min_periods=20).min()
+    resistance = close.rolling(20, min_periods=20).max()
+
+    metrics_by_session: Dict[str, TradeMetrics] = {}
+    for position in range(29, len(frame)):
+        values = (
+            close.iloc[position],
+            close.iloc[position - 1],
+            close.iloc[position - 5],
+            atr_pct.iloc[position],
+            ema20.iloc[position],
+            support.iloc[position],
+            resistance.iloc[position],
+        )
+        if any(
+            pd.isna(value) or not math.isfinite(float(value))
+            for value in values
+        ):
+            continue
+        last_close, prior_close, week_close, atr_value, ema_value, support_value, resistance_value = (
+            float(value) for value in values
+        )
+        if prior_close == 0 or week_close == 0 or resistance_value == 0:
+            continue
+        ratio = volume_ratio.iloc[position]
+        rsi_value = rsi.iloc[position]
+        volume_delta = volume_change.iloc[position]
+        if (
+            pd.isna(volume_delta)
+            or pd.isna(prior_volume.iloc[position])
+            or prior_volume.iloc[position] <= 0
+        ):
+            trend = "unknown"
+        elif volume_delta >= 0.15:
+            trend = "rising"
+        elif volume_delta <= -0.15:
+            trend = "falling"
+        else:
+            trend = "flat"
+        session = frame.index[position].strftime("%Y-%m-%d")
+        metrics_by_session[session] = TradeMetrics(
+            symbol=symbol,
+            session=session,
+            last_close=last_close,
+            day_change_pct=(last_close - prior_close) / prior_close * 100.0,
+            week_momentum_pct=(last_close - week_close) / week_close * 100.0,
+            volume_ratio=(
+                float(ratio) if pd.notna(ratio) and math.isfinite(float(ratio)) else None
+            ),
+            drawdown_pct=(resistance_value - last_close) / resistance_value * 100.0,
+            atr_pct=atr_value,
+            above_ema20=last_close > ema_value,
+            ema20=ema_value,
+            rsi_14=float(rsi_value) if pd.notna(rsi_value) else None,
+            support_level=support_value,
+            resistance_level=resistance_value,
+            volume_trend=trend,
+        )
+    return frame, metrics_by_session
+
+
+def _summarize_backtest_trades(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per-trade descriptive statistics; overlapping signals are not independent."""
+    returns = [trade["net_return_pct"] for trade in trades]
+    wins = [value for value in returns if value > 0]
+    losses = [value for value in returns if value < 0]
+    matched = [trade for trade in trades if trade["excess_return_pct"] is not None]
+    dates = sorted({trade["signal_session"] for trade in trades})
+    return {
+        "trade_count": len(trades),
+        "signal_days": len(dates),
+        "symbol_count": len({trade["symbol"] for trade in trades}),
+        "signal_start": dates[0] if dates else None,
+        "signal_end": dates[-1] if dates else None,
+        "hit_rate_pct": len(wins) / len(returns) * 100.0 if returns else None,
+        "avg_net_return_pct": statistics.mean(returns) if returns else None,
+        "median_net_return_pct": statistics.median(returns) if returns else None,
+        "avg_win_pct": statistics.mean(wins) if wins else None,
+        "avg_loss_pct": statistics.mean(losses) if losses else None,
+        "worst_return_pct": min(returns) if returns else None,
+        "avg_adverse_excursion_pct": (
+            statistics.mean(trade["adverse_excursion_pct"] for trade in trades)
+            if trades else None
+        ),
+        "worst_adverse_excursion_pct": (
+            min(trade["adverse_excursion_pct"] for trade in trades) if trades else None
+        ),
+        "benchmark_count": len(matched),
+        "avg_matched_net_return_pct": (
+            statistics.mean(trade["net_return_pct"] for trade in matched) if matched else None
+        ),
+        "avg_benchmark_return_pct": (
+            statistics.mean(trade["benchmark_return_pct"] for trade in matched) if matched else None
+        ),
+        "avg_excess_return_pct": (
+            statistics.mean(trade["excess_return_pct"] for trade in matched) if matched else None
+        ),
+        "excess_hit_rate_pct": (
+            sum(trade["excess_return_pct"] > 0 for trade in matched) / len(matched) * 100.0
+            if matched else None
+        ),
+    }
+
+
+def _backtest_cohort_summary(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def compare(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "all": _summarize_backtest_trades(rows),
+            "top": _summarize_backtest_trades([trade for trade in rows if trade["selected"]]),
+        }
+
+    result = compare(trades)
+    result["by_market"] = {
+        market: compare([trade for trade in trades if trade["market"] == market])
+        for market in sorted({trade["market"] for trade in trades})
+    }
+    result["by_quarter"] = {
+        quarter: compare([trade for trade in trades if trade["quarter"] == quarter])
+        for quarter in sorted({trade["quarter"] for trade in trades})
+    }
+    return result
+
+
+def _backtest_diagnostics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Descriptive slices, not optimized thresholds or causal estimates."""
+    groups: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    by_date: Dict[str, List[Dict[str, Any]]] = {}
+    for trade in trades:
+        features = trade["signal_metrics"]
+        volume, rsi = features["volume_ratio"], features["rsi_14"]
+        momentum, atr = features["week_momentum_pct"], features["atr_pct"]
+        streak = trade["qualifying_streak"]
+        buckets = {
+            "rank": str(trade["rank"]),
+            "momentum": "<3%" if momentum < 3 else "3-6%" if momentum < 6 else ">=6%",
+            "volume": (
+                "unknown" if volume is None else
+                "confirmed" if volume >= SETTINGS.trade_min_volume_ratio else "unconfirmed"
+            ),
+            "RSI": "unknown" if rsi is None else "<70" if rsi < 70 else ">=70",
+            "ATR": "<2%" if atr < 2 else ">=2%",
+            "streak": "1" if streak == 1 else "2-3" if streak < 4 else ">=4",
+            "stock": trade["symbol"],
+            "quarter": trade["quarter"],
+        }
+        for dimension, bucket in buckets.items():
+            groups.setdefault(dimension, {}).setdefault(bucket, []).append(trade)
+        by_date.setdefault(trade["signal_session"], []).append(trade)
+
+    net_deltas: List[float] = []
+    excess_deltas: List[float] = []
+    incomplete_dates = no_comparison_dates = 0
+    for rows in by_date.values():
+        # Do not compare a date if a qualifier's outcome was pending or purged.
+        if len(rows) != rows[0]["qualifier_count"]:
+            incomplete_dates += 1
+            continue
+        selected = [row for row in rows if row["selected"]]
+        others = [row for row in rows if not row["selected"]]
+        if not selected or not others:
+            no_comparison_dates += 1
+            continue
+        net_deltas.append(
+            statistics.mean(row["net_return_pct"] for row in selected)
+            - statistics.mean(row["net_return_pct"] for row in others)
+        )
+        if all(row["excess_return_pct"] is not None for row in rows):
+            excess_deltas.append(
+                statistics.mean(row["excess_return_pct"] for row in selected)
+                - statistics.mean(row["excess_return_pct"] for row in others)
+            )
+    return {
+        "groups": {
+            dimension: {
+                bucket: _summarize_backtest_trades(rows)
+                for bucket, rows in sorted(
+                    buckets.items(),
+                    key=lambda item: int(item[0]) if dimension == "rank" else item[0],
+                )
+            }
+            for dimension, buckets in groups.items()
+        },
+        "paired_ranking": {
+            "paired_dates": len(net_deltas),
+            "avg_net_delta_pct": statistics.mean(net_deltas) if net_deltas else None,
+            "median_net_delta_pct": statistics.median(net_deltas) if net_deltas else None,
+            "selected_better_pct": (
+                sum(delta > 0 for delta in net_deltas) / len(net_deltas) * 100
+                if net_deltas else None
+            ),
+            "benchmark_paired_dates": len(excess_deltas),
+            "avg_excess_delta_pct": statistics.mean(excess_deltas) if excess_deltas else None,
+            "incomplete_dates": incomplete_dates,
+            "no_comparison_dates": no_comparison_dates,
+        },
+    }
+
+
+def _backtest_cost_validation(
+    trades: List[Dict[str, Any]], cost_bps_per_side: float,
+) -> Dict[str, Any]:
+    """Stress identical picks, excluding holds crossing chronological block boundaries."""
+    rows = [
+        trade for trade in trades
+        if trade["quarter"] == (
+            f"{trade['exit_session'][:4]}-Q"
+            f"{(int(trade['exit_session'][5:7]) - 1) // 3 + 1}"
+        )
+    ]
+    scenarios = []
+    for extra_cost in (0.0, 15.0, 40.0):
+        cost = cost_bps_per_side + extra_cost
+        adjusted = []
+        for trade in rows:
+            net = trade["gross_return_pct"] - 2.0 * cost / 100.0
+            adjusted.append({
+                **trade,
+                "net_return_pct": net,
+                "excess_return_pct": (
+                    net - trade["benchmark_return_pct"]
+                    if trade["benchmark_return_pct"] is not None else None
+                ),
+            })
+        scenarios.append({
+            "cost_bps_per_side": cost,
+            "cohorts": {
+                cohort: _backtest_cohort_summary([
+                    trade for trade in adjusted if trade["cohort"] == cohort
+                ])
+                for cohort in ("development", "holdout")
+            },
+        })
+    return {
+        "quarter_crossing_excluded": len(trades) - len(rows),
+        "scenarios": scenarios,
+    }
+
+
+def _walk_forward_backtest(
+    histories: Dict[str, Any],
+    benchmark_histories: Dict[str, Any],
+    *,
+    horizon_sessions: int,
+    top_n: int = 5,
+    cost_bps_per_side: float = 10.0,
+    holdout_start: Optional[str] = None,
+    min_avg_volume: float = 0.0,
+) -> Dict[str, Any]:
+    """Backtest current gates/ranking without using future bars in a signal.
+
+    A signal is formed at a completed close, entered at the next session's
+    open, and exited at that session's close after `horizon_sessions` bars.
+    """
+    if horizon_sessions < 1:
+        raise ValueError("horizon_sessions must be at least 1")
+    if top_n < 1:
+        raise ValueError("top_n must be at least 1")
+    if not math.isfinite(cost_bps_per_side) or cost_bps_per_side < 0:
+        raise ValueError("cost_bps_per_side must be finite and nonnegative")
+    if not math.isfinite(min_avg_volume) or min_avg_volume < 0:
+        raise ValueError("min_avg_volume must be finite and nonnegative")
+    if holdout_start:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", holdout_start):
+            raise ValueError("holdout_start must be YYYY-MM-DD")
+        datetime.strptime(holdout_start, "%Y-%m-%d")
+
+    frames: Dict[str, Any] = {}
+    session_positions: Dict[str, Dict[str, int]] = {}
+    liquidity_by_session: Dict[Tuple[str, str], bool] = {}
+    metrics_by_day: Dict[str, List[TradeMetrics]] = {}
+    streak_by_signal: Dict[Tuple[str, str], int] = {}
+    for symbol, history in histories.items():
+        frame, daily_metrics = _backtest_metrics_by_session(symbol, history)
+        if frame is None or not daily_metrics:
+            continue
+        frames[symbol] = frame
+        session_positions[symbol] = {
+            row.strftime("%Y-%m-%d"): index for index, row in enumerate(frame.index)
+        }
+        avg_volume = (
+            frame["Volume"].shift(1).rolling(20, min_periods=20).mean()
+            if "Volume" in frame else None
+        )
+        streak = 0
+        for session, metrics in daily_metrics.items():
+            position = session_positions[symbol][session]
+            prior_volume = float(avg_volume.iloc[position]) if avg_volume is not None else float("nan")
+            liquidity_by_session[(session, symbol)] = (
+                min_avg_volume == 0
+                or (math.isfinite(prior_volume) and prior_volume >= min_avg_volume)
+            )
+            qualifies = not _failed_gates(metrics)
+            streak = streak + 1 if qualifies else 0
+            streak_by_signal[(session, symbol)] = streak
+            metrics_by_day.setdefault(session, []).append(metrics)
+
+    benchmark_frames: Dict[str, Any] = {}
+    benchmark_positions: Dict[str, Dict[str, int]] = {}
+    for symbol, history in benchmark_histories.items():
+        if history is None or len(history) == 0 or "Open" not in history or "Close" not in history:
+            continue
+        benchmark_frames[symbol] = history
+        benchmark_positions[symbol] = {
+            row.strftime("%Y-%m-%d"): index for index, row in enumerate(history.index)
+        }
+
+    signal_dates = sorted(metrics_by_day)
+    split = holdout_start
+    if not split and signal_dates:
+        split = signal_dates[min(len(signal_dates) - 1, int(len(signal_dates) * 0.75))]
+    trades: List[Dict[str, Any]] = []
+    liquidity_rejected = 0
+    pending_outcomes = 0
+    purged_outcomes = 0
+    transaction_cost_pct = 2.0 * cost_bps_per_side / 100.0
+    for signal_session in sorted(metrics_by_day):
+        qualifiers = [
+            metrics for metrics in metrics_by_day[signal_session] if not _failed_gates(metrics)
+        ]
+        candidates = [
+            metrics for metrics in qualifiers if liquidity_by_session[(signal_session, metrics.symbol)]
+        ]
+        liquidity_rejected += len(qualifiers) - len(candidates)
+        candidates.sort(
+            key=lambda metrics: _rank_key(
+                metrics, streak_by_signal[(signal_session, metrics.symbol)]
+            )
+        )
+        for rank, metrics in enumerate(candidates, 1):
+            frame = frames[metrics.symbol]
+            signal_position = session_positions[metrics.symbol].get(signal_session)
+            if signal_position is None:
+                continue
+            entry_position = signal_position + 1
+            exit_position = signal_position + horizon_sessions
+            if exit_position >= len(frame):
+                pending_outcomes += 1
+                continue
+            entry_row, exit_row = frame.iloc[entry_position], frame.iloc[exit_position]
+            entry_price = float(entry_row["Open"])
+            exit_price = float(exit_row["Close"])
+            if (
+                not math.isfinite(entry_price)
+                or not math.isfinite(exit_price)
+                or entry_price <= 0
+                or exit_price <= 0
+            ):
+                continue
+            gross_return = (exit_price / entry_price - 1.0) * 100.0
+            net_return = gross_return - transaction_cost_pct
+            entry_date = frame.index[entry_position].strftime("%Y-%m-%d")
+            exit_date = frame.index[exit_position].strftime("%Y-%m-%d")
+            # Development returns must not include prices from the reserved
+            # holdout. Warm-up features may legitimately use earlier bars.
+            if split and signal_session < split <= exit_date:
+                purged_outcomes += 1
+                continue
+            benchmark_symbol = _backtest_benchmark_for(metrics.symbol)
+            benchmark = benchmark_frames.get(benchmark_symbol or "")
+            benchmark_return = _matched_benchmark_return(
+                benchmark, entry_date, exit_date,
+                benchmark_positions.get(benchmark_symbol or ""),
+            )
+            trades.append(
+                {
+                    "symbol": metrics.symbol,
+                    "rank": rank,
+                    "qualifier_count": len(candidates),
+                    "signal_metrics": {
+                        "week_momentum_pct": metrics.week_momentum_pct,
+                        "volume_ratio": metrics.volume_ratio,
+                        "rsi_14": metrics.rsi_14,
+                        "atr_pct": metrics.atr_pct,
+                    },
+                    "qualifying_streak": streak_by_signal[(signal_session, metrics.symbol)],
+                    "selected": rank <= top_n,
+                    "cohort": "holdout" if split and signal_session >= split else "development",
+                    "market": benchmark_symbol or f"unmapped:{metrics.symbol.rsplit('.', 1)[-1]}",
+                    "quarter": f"{signal_session[:4]}-Q{(int(signal_session[5:7]) - 1) // 3 + 1}",
+                    "signal_session": signal_session,
+                    "entry_session": entry_date,
+                    "exit_session": exit_date,
+                    "gross_return_pct": gross_return,
+                    "net_return_pct": net_return,
+                    "adverse_excursion_pct": min(
+                        0.0,
+                        (float(frame.iloc[entry_position:exit_position + 1]["Low"].min())
+                         / entry_price - 1.0) * 100.0,
+                    ),
+                    "benchmark_symbol": benchmark_symbol,
+                    "benchmark_return_pct": benchmark_return,
+                    "excess_return_pct": (
+                        net_return - benchmark_return
+                        if benchmark_return is not None
+                        else None
+                    ),
+                }
+            )
+
+    selected_trades = [trade for trade in trades if trade["selected"]]
+    return {
+        **_summarize_backtest_trades(selected_trades),
+        "usable_symbols": len(frames),
+        "usable_stock_symbols": sorted(frames),
+        "holdout_start": split,
+        "split_mode": "fixed" if holdout_start else "automatic",
+        "top_n": top_n,
+        "liquidity_rejected": liquidity_rejected,
+        "pending_outcomes": pending_outcomes,
+        "purged_outcomes": purged_outcomes,
+        "cohorts": {
+            cohort: _backtest_cohort_summary(
+                [trade for trade in trades if trade["cohort"] == cohort]
+            )
+            for cohort in ("development", "holdout")
+        },
+        "diagnostics": {
+            cohort: _backtest_diagnostics(
+                [trade for trade in trades if trade["cohort"] == cohort]
+            )
+            for cohort in ("development", "holdout")
+        },
+        "cost_validation": _backtest_cost_validation(trades, cost_bps_per_side),
+        "trades": selected_trades,
+        "all_trades": trades,
+    }
 
 
 class TradeHistoryStore:
     """Remembers what the screener measured each session, for every symbol it
     looked at -- not just the ones that qualified.
 
-    Nothing before this persisted between runs: `_compute_trade_metrics`
-    recomputes from a fresh yfinance pull every time, so there was no way to
-    see a streak of qualifying days or check whether a past qualifying day
-    actually paid off. One row per (symbol, session_date); a same-day rerun
+    `_compute_trade_metrics` recomputes from a fresh yfinance pull every time,
+    so history supplies streaks and weekly consistency. One row per
+    (symbol, session_date); a same-day rerun
     (e.g. /now after the scheduled run) overwrites its row rather than
     duplicating it, so re-running never inflates a streak.
     """
@@ -2533,15 +3134,13 @@ class TradeHistoryStore:
         # down -- a new connection per screener worker thread.
         if self._conn is None:
             conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS trade_metrics_history (
+            table_definition = """
                     symbol TEXT NOT NULL,
                     session_date TEXT NOT NULL,
                     last_close REAL NOT NULL,
                     day_change_pct REAL NOT NULL,
                     week_momentum_pct REAL NOT NULL,
-                    volume_ratio REAL NOT NULL,
+                    volume_ratio REAL,
                     drawdown_pct REAL NOT NULL,
                     atr_pct REAL NOT NULL,
                     above_ema20 INTEGER NOT NULL,
@@ -2549,12 +3148,122 @@ class TradeHistoryStore:
                     failed_gate TEXT,
                     recorded_at TEXT NOT NULL,
                     PRIMARY KEY (symbol, session_date)
+                """
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS trade_metrics_history ({table_definition})"
+            )
+            columns = conn.execute(
+                "PRAGMA table_info(trade_metrics_history)"
+            ).fetchall()
+            volume_column = next((column for column in columns if column[1] == "volume_ratio"), None)
+            if volume_column is not None and volume_column[3]:
+                # Older databases required a volume ratio, which made the new
+                # explicit "unknown" value fail to persist. Rebuild the table
+                # once while preserving the existing measurements.
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "ALTER TABLE trade_metrics_history RENAME TO trade_metrics_history_legacy"
+                )
+                conn.execute(
+                    f"CREATE TABLE trade_metrics_history ({table_definition})"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO trade_metrics_history
+                    SELECT symbol, session_date, last_close, day_change_pct,
+                           week_momentum_pct, volume_ratio, drawdown_pct, atr_pct,
+                           above_ema20, qualified, failed_gate, recorded_at
+                    FROM trade_metrics_history_legacy
+                    """
+                )
+                conn.execute("DROP TABLE trade_metrics_history_legacy")
+            conn.commit()
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS published_picks (
+                    symbol TEXT NOT NULL,
+                    signal_session TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    horizon_sessions INTEGER NOT NULL,
+                    cost_bps_per_side REAL NOT NULL,
+                    benchmark_symbol TEXT,
+                    snapshot_json TEXT NOT NULL,
+                    outcome_json TEXT,
+                    PRIMARY KEY (symbol, signal_session)
                 )
                 """
             )
             conn.commit()
             self._conn = conn
         return self._conn
+
+    def publish(self, picks: List["TradeMetrics"], published_at: datetime) -> None:
+        """First successful publication wins; reruns cannot rewrite the signal."""
+        if published_at.tzinfo is None:
+            raise ValueError("publication timestamp must include a timezone")
+        if (
+            SETTINGS.trade_outcome_lookback_days < 1
+            or not math.isfinite(SETTINGS.trade_backtest_cost_bps)
+            or SETTINGS.trade_backtest_cost_bps < 0
+        ):
+            raise ValueError("publication requires a positive horizon and finite nonnegative costs")
+        with TRADE_HISTORY_LOCK:
+            conn = self._connection()
+            with conn:
+                for rank, metrics in enumerate(picks, 1):
+                    snapshot = {
+                        "rank": rank,
+                        "metrics": asdict(metrics),
+                        "gates": {
+                            key: getattr(SETTINGS, key)
+                            for key in (
+                                "trade_min_week_momentum_pct", "trade_min_day_change_pct",
+                                "trade_max_atr_pct", "trade_max_drawdown_pct",
+                                "trade_min_volume_ratio",
+                            )
+                        },
+                    }
+                    conn.execute(
+                        """
+                        INSERT INTO published_picks (
+                            symbol, signal_session, published_at, horizon_sessions,
+                            cost_bps_per_side, benchmark_symbol, snapshot_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol, signal_session) DO NOTHING
+                        """,
+                        (
+                            metrics.symbol, metrics.session,
+                            published_at.astimezone(timezone.utc).isoformat(),
+                            SETTINGS.trade_outcome_lookback_days,
+                            SETTINGS.trade_backtest_cost_bps,
+                            _backtest_benchmark_for(metrics.symbol),
+                            json.dumps(snapshot, allow_nan=False),
+                        ),
+                    )
+
+    def published_picks(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with TRADE_HISTORY_LOCK:
+            cursor = self._connection().execute(
+                """
+                SELECT * FROM published_picks
+                ORDER BY published_at DESC, symbol ASC LIMIT ?
+                """,
+                (limit,),
+            )
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def complete_pick(self, pick: Dict[str, Any], outcome: Dict[str, Any]) -> None:
+        with TRADE_HISTORY_LOCK:
+            conn = self._connection()
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE published_picks SET outcome_json = ?
+                    WHERE symbol = ? AND signal_session = ? AND outcome_json IS NULL
+                    """,
+                    (json.dumps(outcome, allow_nan=False), pick["symbol"], pick["signal_session"]),
+                )
 
     def record(self, metrics: "TradeMetrics", qualified: bool, failed_gate: Optional[str]) -> None:
         with TRADE_HISTORY_LOCK:
@@ -2676,10 +3385,9 @@ class TradeHistoryStore:
 
         This is what gives the screened universe continuity. Discovery hands
         back a fresh set of movers each session, so a symbol picked up on
-        Monday was simply never looked at again -- and both `/stocks` and
-        `/performance`, which read recorded history rather than live prices,
-        need a symbol measured on several sessions before they can say
-        anything about it at all.
+        Monday was simply never looked at again -- and `/stocks`, which reads
+        recorded history rather than live prices, needs a symbol measured on
+        several sessions before it can say anything about it at all.
 
         Ordering by qualifying count and then recency means a limited slot
         budget is spent re-measuring the names that have actually been
@@ -2709,70 +3417,6 @@ class TradeHistoryStore:
                 SYS_LOG.warning("trade_history_tracked_failed detail=%s", exc)
                 return []
 
-    def qualifying_outcomes(
-        self, lookback_days: int, today: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Pair each symbol's qualifying session from around `lookback_days`
-        ago with its most recently recorded session, and measure the price
-        move between the two.
-
-        This is deliberately a read over already-recorded history rather
-        than a fresh yfinance fetch: it answers "did the screener's own past
-        picks pay off", using only what the screener itself measured at the
-        time. It is necessarily best-effort -- a symbol only produces an
-        outcome here if it was screened both on its qualifying day and again
-        near `today`, which holds reliably for configured watchlist symbols
-        and only sometimes for ad hoc screener movers that come and go from
-        the universe day to day.
-        """
-        anchor_text = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        try:
-            anchor = datetime.strptime(anchor_text, "%Y-%m-%d")
-        except ValueError:
-            anchor = datetime.now(timezone.utc)
-        target_date = (anchor - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-
-        outcomes: List[Dict[str, Any]] = []
-        for symbol in self.symbols_with_history():
-            # Read a little past the anchor so the "latest qualifying row at or
-            # before target_date" search has room for weekends and holidays.
-            # It used to ask for lookback + 30 days, which `prune` then deleted
-            # out from under it at the 14-day retention default -- a silent
-            # truncation of exactly the window this report needs.
-            rows = self.history(symbol, days=lookback_days + 10, today=anchor_text)
-            if len(rows) < 2:
-                continue
-            # Rows are ascending by session_date; the qualifying anchor is the
-            # latest qualifying row at or before the lookback target -- the
-            # closest available match to "qualified lookback_days ago" once
-            # weekends/holidays are accounted for.
-            anchor_row = None
-            for row in rows:
-                if row["session_date"] > target_date:
-                    break
-                if row["qualified"]:
-                    anchor_row = row
-            if anchor_row is None:
-                continue
-            latest_row = rows[-1]
-            if latest_row["session_date"] <= anchor_row["session_date"]:
-                continue
-            entry_close = anchor_row["last_close"]
-            if not entry_close:
-                continue
-            forward_return_pct = ((latest_row["last_close"] - entry_close) / entry_close) * 100
-            outcomes.append(
-                {
-                    "symbol": symbol,
-                    "qualified_on": anchor_row["session_date"],
-                    "evaluated_on": latest_row["session_date"],
-                    "entry_close": entry_close,
-                    "latest_close": latest_row["last_close"],
-                    "forward_return_pct": forward_return_pct,
-                }
-            )
-        return outcomes
-
     def weekly_top_picks(
         self,
         lookback_days: int = 7,
@@ -2786,7 +3430,6 @@ class TradeHistoryStore:
         as distinct from `/recommendations`'s live single-day re-screen.
 
         Pure read over already-recorded history (no fresh yfinance calls),
-        the same best-effort characteristics as `qualifying_outcomes`: a
         symbol only shows up here if it was actually screened on the days
         being counted.
         """
@@ -2825,6 +3468,157 @@ class TradeHistoryStore:
 TRADE_HISTORY = TradeHistoryStore(SETTINGS.trade_history_db_file)
 
 
+def _record_published_picks(picks: List[TradeMetrics]) -> None:
+    if not picks:
+        return
+    try:
+        TRADE_HISTORY.publish(picks, datetime.now(timezone.utc))
+    except (sqlite3.Error, ValueError, OSError) as exc:
+        APP_LOG.error("published_picks_record_failed detail=%s", exc)
+
+
+def _published_pick_outcome(
+    pick: Dict[str, Any], history: Any, benchmark: Any,
+) -> Optional[Dict[str, Any]]:
+    """Daily-bar proxy: enter the first session strictly after publication's local date."""
+    if history is None or len(history) == 0 or getattr(history.index, "tz", None) is None:
+        raise ValueError("missing stock history or exchange timezone")
+    if pick["horizon_sessions"] < 1:
+        raise ValueError("invalid holding horizon")
+    dates = history.index.strftime("%Y-%m-%d").tolist()
+    if dates != sorted(set(dates)):
+        raise ValueError("unordered or duplicate stock sessions")
+    published_at = datetime.fromisoformat(pick["published_at"])
+    if published_at.tzinfo is None:
+        raise ValueError("missing publication timezone")
+    publication_date = published_at.astimezone(history.index.tz).strftime("%Y-%m-%d")
+    if dates[0] > publication_date:
+        raise ValueError("history does not cover publication")
+    eligible = [
+        index for index, date in enumerate(dates)
+        if date > publication_date and date > pick["signal_session"]
+    ]
+    if not eligible:
+        return None
+    entry = eligible[0]
+    exit_position = entry + pick["horizon_sessions"] - 1
+    if exit_position >= len(history):
+        return None
+    prices = history.iloc[entry:exit_position + 1][["Open", "Close"]]
+    if (
+        prices.isna().any().any()
+        or prices.isin([float("inf"), float("-inf")]).any().any()
+        or (prices <= 0).any().any()
+    ):
+        raise ValueError("invalid prices during holding period")
+    entry_price = float(history.iloc[entry]["Open"])
+    exit_price = float(history.iloc[exit_position]["Close"])
+    gross = (exit_price / entry_price - 1.0) * 100.0
+    benchmark_return = _matched_benchmark_return(
+        benchmark, dates[entry], dates[exit_position],
+    )
+    net = gross - 2.0 * pick["cost_bps_per_side"] / 100.0
+    return {
+        "entry_session": dates[entry],
+        "exit_session": dates[exit_position],
+        "gross_return_pct": gross,
+        "net_return_pct": net,
+        "benchmark_return_pct": benchmark_return,
+        "excess_return_pct": net - benchmark_return if benchmark_return is not None else None,
+    }
+
+
+def build_published_pick_report() -> str:
+    """Evaluate the latest 100 delivered signals, retaining completed outcomes."""
+    lines = ["<b>Published Pick Performance</b>", ""]
+    try:
+        picks = TRADE_HISTORY.published_picks()
+    except (sqlite3.Error, OSError) as exc:
+        SYS_LOG.error("published_picks_read_failed detail=%s", exc)
+        return "\n".join(lines + ["Pick ledger unavailable. Check bot logs."])
+    if not picks:
+        return "\n".join(lines + [
+            "No published picks recorded yet. Tracking starts with successful Telegram "
+            "delivery of /recommendations, /now, or scheduled briefings.",
+        ])
+    history_cache: Dict[str, Any] = {}
+
+    def history_for(symbol: Optional[str]) -> Any:
+        if not symbol:
+            return None
+        if symbol not in history_cache:
+            try:
+                history_cache[symbol] = _drop_in_progress_bar(
+                    _fetch_ticker_history(symbol, period="max")
+                )
+            except (requests.RequestException, yf.exceptions.YFException, ValueError, RuntimeError, OSError) as exc:
+                SYS_LOG.warning("published_pick_history_failed symbol=%s detail=%s", symbol, exc)
+                history_cache[symbol] = None
+        return history_cache[symbol]
+
+    completed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    pending = unavailable = 0
+    for pick in picks:
+        try:
+            if pick["outcome_json"]:
+                outcome = json.loads(pick["outcome_json"])
+            else:
+                outcome = _published_pick_outcome(
+                    pick, history_for(pick["symbol"]), history_for(pick["benchmark_symbol"]),
+                )
+                if outcome is None:
+                    pending += 1
+                    continue
+                TRADE_HISTORY.complete_pick(pick, outcome)
+            completed.append((pick, outcome))
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as exc:
+            SYS_LOG.warning("published_pick_evaluation_failed symbol=%s detail=%s", pick["symbol"], exc)
+            unavailable += 1
+    lines.append(
+        f"Latest {len(picks)} recorded signals (window capped at 100): "
+        f"{len(completed)} completed · "
+        f"{pending} pending · {unavailable} unavailable"
+    )
+    if completed:
+        returns = [outcome["net_return_pct"] for _, outcome in completed]
+        excess = [
+            outcome["excess_return_pct"] for _, outcome in completed
+            if outcome["excess_return_pct"] is not None
+        ]
+        lines.append(
+            f"Avg net {statistics.mean(returns):+.2f}% · median {statistics.median(returns):+.2f}% · "
+            f"hit rate {sum(value > 0 for value in returns) / len(returns) * 100:.0f}%"
+        )
+        lines.append(
+            f"Benchmark coverage: {len(excess)}/{len(completed)}"
+            + (f" · avg excess {statistics.mean(excess):+.2f}%" if excess else "")
+        )
+        for pick, outcome in completed[:10]:
+            comparison = (
+                f" · excess {outcome['excess_return_pct']:+.2f}% vs "
+                f"{escape(pick['benchmark_symbol'])}"
+                if outcome["excess_return_pct"] is not None else ""
+            )
+            lines.append(
+                f"    {escape(pick['symbol'])} {outcome['net_return_pct']:+.2f}% net · "
+                f"{outcome['gross_return_pct']:+.2f}% gross · "
+                f"{outcome['entry_session']} to {outcome['exit_session']} · "
+                f"{pick['horizon_sessions']} sessions, {pick['cost_bps_per_side']:g} bps/side"
+                + comparison
+            )
+        if len(completed) > 10:
+            lines.append("Showing the 10 most recently published completed signals.")
+    lines.extend([
+        "",
+        "<i>Daily-bar proxy, not actual fills: entry is the first session strictly after "
+        "the publication date in the stock exchange timezone. Same-day opens are never "
+        "used. Horizon, cost, and benchmark are frozen at first delivery; completed "
+        "outcomes are retained. Overlapping signals are not portfolio returns. "
+        "Unmatched benchmarks are not assumed to return zero.</i>",
+    ])
+    return "\n".join(lines)
+
+
 def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d") -> Any:
     """Fetch and cache yfinance OHLCV history to avoid repeated slow calls."""
     cache_key = f"{symbol}|{period}|{interval}"
@@ -2837,7 +3631,9 @@ def _fetch_ticker_history(symbol: str, period: str = "3mo", interval: str = "1d"
             if now_ts - cached_at <= ttl:
                 return history
     history = _with_retry(
-        lambda: yf.Ticker(symbol).history(period=period, interval=interval),
+        lambda: yf.Ticker(symbol).history(
+            period=period, interval=interval, auto_adjust=True
+        ),
         f"yf_history_{symbol}",
         retries=2,
     )
@@ -2879,14 +3675,24 @@ def _fetch_ticker_fundamentals(symbol: str) -> Dict[str, Any]:
     return info
 
 
-def _configured_watchlist() -> List[Tuple[str, str]]:
-    """(label, symbol) pairs for every symbol configured via environment."""
+def _configured_stock_watchlist() -> List[Tuple[str, str]]:
+    """Stable equity evaluation universe; fund lists are deliberately separate."""
     entries: List[Tuple[str, str]] = []
     for suffix, mapping in (
         ("USA Stock", USA_STOCK_UNIVERSE),
         ("India Stock", INDIA_STOCK_UNIVERSE),
         ("Norway Stock", NORWAY_STOCK_UNIVERSE),
         ("EU Stock", EU_STOCK_UNIVERSE),
+    ):
+        for name, symbol in mapping.items():
+            entries.append((f"{name} [{suffix}]", symbol))
+    return entries
+
+
+def _configured_watchlist() -> List[Tuple[str, str]]:
+    """(label, symbol) pairs for every symbol configured via environment."""
+    entries = _configured_stock_watchlist()
+    for suffix, mapping in (
         ("India Fund", INDIA_MUTUAL_FUNDS),
         ("Norway Fund", NORWAY_MUTUAL_FUNDS),
     ):
@@ -2907,10 +3713,9 @@ def _build_candidate_universe(max_symbols: int) -> List[Tuple[str, str]]:
     reads completed-session metrics.
 
     The sticky middle tier exists because discovery alone made the universe
-    churn almost completely from one session to the next. `/stocks` and
-    `/performance` read recorded history rather than live prices, so a symbol
-    seen exactly once can never satisfy either of them -- which is why both
-    reported "nothing yet" indefinitely on a discovery-only deployment.
+    churn almost completely from one session to the next. `/stocks` reads
+    recorded history rather than live prices, so a symbol seen exactly once
+    cannot meet its consistency requirement.
     """
     selected: List[Tuple[str, str]] = []
     seen: set = set()
@@ -2983,17 +3788,9 @@ class ScreenOutcome:
 
 
 def _effective_history_retention_days() -> int:
-    """How long history must actually be kept for the reports that read it.
-
-    `prune` used to delete at TRADE_HISTORY_RETENTION_DAYS (14) flat, while
-    the outcome, weekly-picks and sticky-universe reads all ask for windows
-    derived from their own settings. Raising one of those settings past the
-    retention default silently got a truncated window rather than an error,
-    so retention is now a floor computed from what the readers need.
-    """
+    """Keep enough recorded sessions for the SQLite streak and weekly-pick readers."""
     return max(
         SETTINGS.trade_history_retention_days,
-        SETTINGS.trade_outcome_lookback_days + 10,
         SETTINGS.trade_weekly_top_picks_lookback_days * 2 + 7,
         SETTINGS.trade_sticky_universe_days + 7,
     )
@@ -3035,34 +3832,50 @@ def _screen_universe(
             metrics, qualified=not failed, failed_gate=(failed[0] if failed else None)
         )
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    def _expire(future_to_symbol: Dict[Any, str]) -> None:
+        APP_LOG.warning(
+            "trade_candidates_deadline_reached analysed=%s of=%s",
+            outcome.analysed,
+            outcome.checked,
+        )
+        outcome.deadline_hit = True
+        # Drain everything else that already finished before cancelling.
+        # Throwing away a completed measurement loses that symbol's
+        # history row for the session, which silently breaks its
+        # qualifying streak and its eligibility for /stocks and
+        # /performance -- for no saving at all, since the work is done.
+        for other, other_symbol in list(future_to_symbol.items()):
+            if other.done():
+                _consume(other, other_symbol)
+        for pending in future_to_symbol:
+            pending.cancel()
+
+    # Not a `with` block: its exit is shutdown(wait=True), which waits for
+    # every fetch already running, so the deadline bounded nothing but the
+    # loop. Shutting down without waiting lets a hung fetch be abandoned.
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         future_to_symbol = {
             pool.submit(_compute_trade_metrics, symbol): symbol
             for _, symbol in candidate_items
         }
-        for future in as_completed(future_to_symbol):
-            _consume(future, future_to_symbol[future])
+        try:
+            # The timeout also covers the case where no future ever
+            # completes, which a post-result clock check cannot see.
+            for future in as_completed(
+                future_to_symbol, timeout=max(0.0, deadline - time.time())
+            ):
+                _consume(future, future_to_symbol[future])
 
-            # Checked after the result is consumed: testing first discarded work
-            # that had already finished.
-            if time.time() >= deadline:
-                APP_LOG.warning(
-                    "trade_candidates_deadline_reached analysed=%s of=%s",
-                    outcome.analysed,
-                    outcome.checked,
-                )
-                outcome.deadline_hit = True
-                # Drain everything else that already finished before cancelling.
-                # Throwing away a completed measurement loses that symbol's
-                # history row for the session, which silently breaks its
-                # qualifying streak and its eligibility for /stocks and
-                # /performance -- for no saving at all, since the work is done.
-                for other, other_symbol in list(future_to_symbol.items()):
-                    if other.done():
-                        _consume(other, other_symbol)
-                for pending in future_to_symbol:
-                    pending.cancel()
-                break
+                # Checked after the result is consumed: testing first
+                # discarded work that had already finished.
+                if time.time() >= deadline:
+                    _expire(future_to_symbol)
+                    break
+        except FuturesTimeoutError:
+            _expire(future_to_symbol)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     outcome.qualified.sort(key=_rank_key)
     TRADE_HISTORY.prune(_effective_history_retention_days())
@@ -3115,7 +3928,17 @@ def _render_candidate(index: int, metrics: TradeMetrics, name: str) -> List[str]
     wraps into fragments or makes the reader scroll sideways on a phone.
     Stacking the same numbers costs vertical space, which scrolls fine.
     """
-    confirmed = " ✓" if metrics.volume_ratio >= SETTINGS.trade_min_volume_ratio else ""
+    confirmed = (
+        " ✓"
+        if metrics.volume_ratio is not None
+        and metrics.volume_ratio >= SETTINGS.trade_min_volume_ratio
+        else ""
+    )
+    volume_text = (
+        f"{metrics.volume_ratio:.1f}× normal"
+        if metrics.volume_ratio is not None
+        else "n/a"
+    )
     # Today's own row was already recorded by `_screen_universe` before
     # ranking runs, so a streak of 1 just means "qualified today" -- only
     # worth a note once it says something about the days before today too.
@@ -3125,7 +3948,7 @@ def _render_candidate(index: int, metrics: TradeMetrics, name: str) -> List[str]
         f"<b>{index}. {escape(name)}</b> · {escape(metrics.symbol)}",
         f"    {metrics.last_close:,.2f}   {metrics.day_change_pct:+.2f}% today"
         f"   {metrics.week_momentum_pct:+.2f}% over 5 days{streak_note}",
-        f"    volume {metrics.volume_ratio:.1f}× normal{confirmed}"
+        f"    volume {volume_text}{confirmed}"
         f" · {metrics.drawdown_pct:.1f}% below 20-day high"
         f" · daily swing {metrics.atr_pct:.1f}%",
         f"    RSI {_rsi_label(metrics.rsi_14)} · volume {metrics.volume_trend}",
@@ -3529,65 +4352,408 @@ def send_candidate_charts(outcome: "ScreenOutcome", labels: Dict[str, str],
     return telegram_ok or slack_ok
 
 
-def _summarize_trade_outcomes(lookback_days: Optional[int] = None) -> Dict[str, Any]:
-    lookback_days = lookback_days if lookback_days is not None else SETTINGS.trade_outcome_lookback_days
-    outcomes = TRADE_HISTORY.qualifying_outcomes(lookback_days)
-    if not outcomes:
-        return {"lookback_days": lookback_days, "count": 0, "hit_rate_pct": None,
-                "avg_forward_return_pct": None, "outcomes": []}
-    wins = sum(1 for outcome in outcomes if outcome["forward_return_pct"] > 0)
-    avg_return = sum(outcome["forward_return_pct"] for outcome in outcomes) / len(outcomes)
-    return {
-        "lookback_days": lookback_days,
-        "count": len(outcomes),
-        "hit_rate_pct": (wins / len(outcomes)) * 100,
-        "avg_forward_return_pct": avg_return,
-        "outcomes": outcomes,
-    }
+def _run_walk_forward_backtest(
+    horizon_sessions: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Walk-forward test the current gates/ranking on the configured universe."""
+    horizon = (
+        horizon_sessions
+        if horizon_sessions is not None
+        else SETTINGS.trade_outcome_lookback_days
+    )
+    if horizon < 1:
+        APP_LOG.error("backtest_invalid_horizon value=%s", horizon)
+        return {"horizon_sessions": horizon, "trade_count": 0, "error": "invalid_horizon"}
+    if (
+        not math.isfinite(SETTINGS.trade_backtest_cost_bps)
+        or SETTINGS.trade_backtest_cost_bps < 0
+    ):
+        APP_LOG.error("backtest_invalid_cost value=%s", SETTINGS.trade_backtest_cost_bps)
+        return {
+            "horizon_sessions": horizon,
+            "trade_count": 0,
+            "error": "invalid_cost",
+        }
+    if (
+        not math.isfinite(SETTINGS.trade_backtest_min_avg_volume)
+        or SETTINGS.trade_backtest_min_avg_volume < 0
+    ):
+        APP_LOG.error("backtest_invalid_liquidity value=%s", SETTINGS.trade_backtest_min_avg_volume)
+        return {"horizon_sessions": horizon, "trade_count": 0, "error": "invalid_liquidity"}
+    holdout_start = SETTINGS.trade_backtest_holdout_start.strip()
+    if holdout_start:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", holdout_start):
+                raise ValueError("expected YYYY-MM-DD")
+            datetime.strptime(holdout_start, "%Y-%m-%d")
+        except ValueError as exc:
+            APP_LOG.error("backtest_invalid_holdout value=%s detail=%s", holdout_start, exc)
+            return {"horizon_sessions": horizon, "trade_count": 0, "error": "invalid_holdout"}
+    try:
+        universe_name, universe = _evaluation_stock_universe()
+    except (OSError, ValueError, csv.Error) as exc:
+        APP_LOG.error("backtest_universe_invalid detail=%s", exc)
+        return {"horizon_sessions": horizon, "trade_count": 0, "error": "invalid_universe"}
+    if SETTINGS.trade_backtest_universe_max < 1:
+        APP_LOG.error("backtest_universe_limit_invalid value=%s", SETTINGS.trade_backtest_universe_max)
+        return {"horizon_sessions": horizon, "trade_count": 0, "error": "invalid_universe"}
+    symbols = list(universe)
+    if not symbols:
+        APP_LOG.warning("backtest_empty_stock_universe")
+        return {"horizon_sessions": horizon, "trade_count": 0, "error": "empty_universe"}
+    configured_symbols = len(symbols)
+    if len(symbols) > SETTINGS.trade_backtest_universe_max:
+        APP_LOG.warning(
+            "backtest_universe_truncated configured=%s tested=%s",
+            len(symbols),
+            SETTINGS.trade_backtest_universe_max,
+        )
+        symbols = symbols[:SETTINGS.trade_backtest_universe_max]
+
+    benchmark_map = {symbol: _backtest_benchmark_for(symbol) for symbol in symbols}
+    requested = set(symbols)
+    requested.update(benchmark for benchmark in benchmark_map.values() if benchmark)
+    histories: Dict[str, Any] = {}
+    fetch_failures = 0
+
+    def fetch(symbol: str) -> Tuple[str, Any]:
+        try:
+            history = _fetch_ticker_history(
+                symbol, period=SETTINGS.trade_backtest_period, interval="1d"
+            )
+            return symbol, _drop_in_progress_bar(history)
+        except Exception as exc:
+            SYS_LOG.warning("backtest_history_failed symbol=%s detail=%s", symbol, exc)
+            return symbol, None
+
+    workers = max(1, min(SETTINGS.trade_fetch_workers, len(requested) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fetch, symbol) for symbol in sorted(requested)]
+        for future in as_completed(futures):
+            symbol, history = future.result()
+            if history is None or len(history) == 0:
+                fetch_failures += 1
+            else:
+                histories[symbol] = history
+
+    result = _walk_forward_backtest(
+        {symbol: histories[symbol] for symbol in symbols if symbol in histories},
+        {
+            benchmark: histories[benchmark]
+            for benchmark in set(benchmark_map.values())
+            if benchmark and benchmark in histories
+        },
+        horizon_sessions=horizon,
+        top_n=5,
+        cost_bps_per_side=SETTINGS.trade_backtest_cost_bps,
+        holdout_start=holdout_start or None,
+        min_avg_volume=SETTINGS.trade_backtest_min_avg_volume,
+    )
+    result.update(
+        {
+            "horizon_sessions": horizon,
+            "period": SETTINGS.trade_backtest_period,
+            "configured_symbols": configured_symbols,
+            "tested_symbols": len(symbols),
+            "omitted_symbols": configured_symbols - len(symbols),
+            "fetch_failures": fetch_failures,
+            "min_avg_volume": SETTINGS.trade_backtest_min_avg_volume,
+            "cost_bps_per_side": SETTINGS.trade_backtest_cost_bps,
+            "universe_name": universe_name,
+            "stock_fetch_failures": sorted(symbol for symbol in symbols if symbol not in histories),
+            "benchmark_fetch_failures": sorted(
+                benchmark for benchmark in set(benchmark_map.values())
+                if benchmark and benchmark not in histories
+            ),
+            "unusable_stocks": sorted(
+                set(symbols).intersection(histories).difference(result["usable_stock_symbols"])
+            ),
+            "coverage": {
+                dimension: {
+                    group: {
+                        "configured": sum(stock[dimension] == group for stock in universe.values()),
+                        "tested": sum(universe[symbol][dimension] == group for symbol in symbols),
+                        "usable": sum(
+                            universe[symbol][dimension] == group
+                            for symbol in result["usable_stock_symbols"]
+                        ),
+                    }
+                    for group in sorted({stock[dimension] for stock in universe.values()})
+                }
+                for dimension in ("market", "sector")
+            },
+        }
+    )
+    for cohort in ("development", "holdout"):
+        rows = [trade for trade in result["all_trades"] if trade["cohort"] == cohort]
+        for dimension in ("market", "sector"):
+            result["cohorts"][cohort]["by_universe_" + dimension] = {
+                group: {
+                    key: _summarize_backtest_trades([
+                        trade for trade in rows
+                        if universe[trade["symbol"]][dimension] == group
+                        and (key == "all" or trade["selected"])
+                    ])
+                    for key in ("all", "top")
+                }
+                for group in result["coverage"][dimension]
+            }
+    return result
 
 
-def build_trade_performance_report(lookback_days: Optional[int] = None) -> str:
-    """Whether the screener's own past picks actually paid off.
-
-    Computed on demand from `TRADE_HISTORY` -- a local SQLite read, no
-    yfinance calls -- rather than by a separate scheduled job, since there is
-    nothing to pre-materialize: the screener already records every session's
-    outcome as it runs, so this only ever reads what is already there.
-    """
-    summary = _summarize_trade_outcomes(lookback_days)
+def _render_evaluation_coverage(summary: Dict[str, Any]) -> List[str]:
     lines = [
-        "<b>📊 Trade Screener Performance</b>",
-        f"<i>Qualifying picks, evaluated ~{summary['lookback_days']} sessions later</i>",
+        f"Evaluation universe: {escape(summary.get('universe_name', 'configured'))}. "
+        "Live discovery/watchlists unchanged."
+    ]
+    for dimension, groups in summary.get("coverage", {}).items():
+        lines.append(f"<b>Universe {dimension} coverage (usable/tested/configured)</b>")
+        lines.extend(
+            f"    {escape(group)}: {counts['usable']}/{counts['tested']}/{counts['configured']}"
+            for group, counts in groups.items()
+        )
+    for key, label in (
+        ("stock_fetch_failures", "Missing stock histories"),
+        ("unusable_stocks", "Unusable stock histories"),
+        ("benchmark_fetch_failures", "Missing benchmarks"),
+    ):
+        if summary.get(key):
+            lines.append(label + ": " + escape(", ".join(summary[key])))
+    return lines
+
+
+def _render_backtest_comparison(comparison: Dict[str, Any], top_n: int) -> List[str]:
+    def percentage(value: Optional[float]) -> str:
+        return f"{value:+.2f}%" if value is not None else "n/a"
+
+    lines: List[str] = []
+    for key, label in (("all", "All qualifiers"), ("top", f"Top {top_n}")):
+        stats = comparison[key]
+        count = stats["trade_count"]
+        if not count:
+            lines.append(f"    {label}: no completed trades.")
+            continue
+        lines.extend([
+            f"    <b>{label}</b>: {count} trades / {stats['signal_days']} signal dates / "
+            f"{stats['symbol_count']} stocks",
+            f"    signals {stats['signal_start']} to {stats['signal_end']}",
+            f"    avg net {percentage(stats['avg_net_return_pct'])} · "
+            f"median {percentage(stats['median_net_return_pct'])} · "
+            f"hit rate {stats['hit_rate_pct']:.0f}%",
+            f"    avg win {percentage(stats['avg_win_pct'])} · "
+            f"avg loss {percentage(stats['avg_loss_pct'])} · "
+            f"worst return {percentage(stats['worst_return_pct'])}",
+            f"    avg adverse move {percentage(stats['avg_adverse_excursion_pct'])} · "
+            f"worst adverse move {percentage(stats['worst_adverse_excursion_pct'])}",
+            f"    benchmark coverage: {stats['benchmark_count']}/{count} · "
+            f"matched avg net {percentage(stats['avg_matched_net_return_pct'])} · "
+            f"benchmark {percentage(stats['avg_benchmark_return_pct'])} · "
+            f"excess {percentage(stats['avg_excess_return_pct'])}",
+        ])
+    return lines
+
+
+def build_trade_diagnostics_report() -> str:
+    summary = _run_walk_forward_backtest()
+    lines = ["<b>Signal diagnostics - historical rules, not delivered trades</b>"]
+    if summary.get("error"):
+        lines.append(
+            f"Diagnostics unavailable: {escape(summary['error'])}. "
+            "Check stock universe, backtest settings, and bot logs."
+        )
+        return "\n".join(lines)
+
+    def percentage(value: Optional[float], unit: str = "%") -> str:
+        return f"{value:+.2f}{unit}" if value is not None else "n/a"
+
+    lines.extend([
+        f"{summary['horizon_sessions']}-session hold, "
+        f"{summary['cost_bps_per_side']:g} bps/side; holdout starts {summary['holdout_start']}.",
+        f"Stocks usable/tested: {summary['usable_symbols']}/{summary['tested_symbols']}; "
+        f"fetch failures {summary['fetch_failures']}; omitted {summary['omitted_symbols']}.",
+        f"Pending {summary['pending_outcomes']}; purged {summary['purged_outcomes']}; "
+        f"liquidity rejected {summary['liquidity_rejected']}.",
+        f"Volume confirmed means ratio >= {SETTINGS.trade_min_volume_ratio:g}.",
+        "Slices cover ALL completed liquid qualifiers, not only selected picks.",
+        "Positive paired delta favors selected picks; dates have equal weight. "
+        "Benchmark pairs require coverage for every qualifier on that date.",
+    ])
+    lines.extend(_render_evaluation_coverage(summary))
+    for cohort, label in (("development", "Development"), ("holdout", "Holdout (exploratory if inspected)")):
+        diagnostics = summary["diagnostics"][cohort]
+        paired = diagnostics["paired_ranking"]
+        lines.extend([
+            "",
+            f"<b>{label}</b>",
+            f"Top {summary['top_n']} vs non-selected on {paired['paired_dates']} paired dates: "
+            f"mean net delta {percentage(paired['avg_net_delta_pct'], ' pp')}, "
+            f"median {percentage(paired['median_net_delta_pct'], ' pp')}; "
+            f"selected better {percentage(paired['selected_better_pct'])}.",
+            f"Benchmark paired dates {paired['benchmark_paired_dates']}: "
+            f"mean excess delta {percentage(paired['avg_excess_delta_pct'], ' pp')}; "
+            f"excluded observed dates: {paired['incomplete_dates']} incomplete, "
+            f"{paired['no_comparison_dates']} without both groups.",
+        ])
+        if not diagnostics["groups"]:
+            lines.append("No completed qualifiers.")
+        for dimension, buckets in diagnostics["groups"].items():
+            lines.append(f"<b>{escape(dimension)}</b>")
+            for bucket, stats in buckets.items():
+                lines.extend([
+                    f"  {escape(bucket)}: {stats['trade_count']} signals / "
+                    f"{stats['signal_days']} dates / {stats['symbol_count']} stocks; "
+                    f"net {percentage(stats['avg_net_return_pct'])}, "
+                    f"median {percentage(stats['median_net_return_pct'])}, "
+                    f"hit {percentage(stats['hit_rate_pct'])}.",
+                    f"  win/loss {percentage(stats['avg_win_pct'])}/"
+                    f"{percentage(stats['avg_loss_pct'])}; "
+                    f"adverse avg/worst {percentage(stats['avg_adverse_excursion_pct'])}/"
+                    f"{percentage(stats['worst_adverse_excursion_pct'])}; "
+                    f"excess {percentage(stats['avg_excess_return_pct'])} "
+                    f"(coverage {stats['benchmark_count']}/{stats['trade_count']}).",
+                ])
+    lines.extend([
+        "",
+        "<i>Fixed broad buckets, no threshold optimization. Slices overlap; "
+        "signals and neighboring dates are not independent. Differences are descriptive, "
+        "not proof an indicator causes profit. Current universe has selection/survivorship "
+        "bias; missing data affects coverage. An inspected holdout is not untouched "
+        "validation. Live rules are unchanged.</i>",
+    ])
+    return "\n".join(lines)
+
+
+def build_trade_performance_report(
+    horizon_sessions: Optional[int] = None,
+) -> str:
+    """Report fixed-horizon, next-open walk-forward results for current rules."""
+    summary = _run_walk_forward_backtest(horizon_sessions)
+    horizon = summary.get("horizon_sessions", SETTINGS.trade_outcome_lookback_days)
+    lines = [
+        "<b>📊 Walk-Forward Trade Screener Performance</b>",
+        f"<i>Current rules · next-session open entry · {horizon}-session hold</i>",
         "",
     ]
-    if summary["count"] == 0:
+    if summary.get("error") == "empty_universe":
         lines.append(
-            "No outcomes to evaluate yet. This needs a symbol that qualified at least "
-            f"{summary['lookback_days']} sessions ago and has been screened again since. "
-            "Configured watchlist symbols are screened every session; discovered movers "
-            f"are carried forward for {SETTINGS.trade_sticky_universe_days} days after "
-            "they are first seen, so give the screener a few daily runs to build up."
+            "No configured symbols are available to test. Add stocks to the "
+            "USA_STOCK_UNIVERSE, INDIA_STOCK_UNIVERSE, NORWAY_STOCK_UNIVERSE, "
+            "or EU_STOCK_UNIVERSE settings."
+        )
+        lines.append("")
+        return "\n".join(lines) + "\n\n"
+
+    if summary.get("error") in (
+        "invalid_horizon", "invalid_cost", "invalid_liquidity", "invalid_holdout", "invalid_universe",
+    ):
+        lines.append(
+            "Backtest configuration is invalid. The holding horizon must be at "
+            "least one session, cost and minimum volume must be finite and nonnegative, "
+            "holdout start must be blank or a valid YYYY-MM-DD date, and universe must "
+            "be configured or broad-v1 with a positive evaluation limit. Check bot logs."
         )
         lines.append("")
         return "\n".join(lines) + "\n\n"
 
     lines.append(
-        f"{summary['count']} outcome(s) · hit rate {summary['hit_rate_pct']:.0f}%"
-        f" · avg forward return {summary['avg_forward_return_pct']:+.2f}%"
+        f"Universe: {summary['usable_symbols']} usable of {summary['tested_symbols']} "
+        f"tested stocks; {summary['fetch_failures']} data fetch failure(s). Fund lists excluded."
     )
-    lines.append("")
-    ranked = sorted(summary["outcomes"], key=lambda outcome: -outcome["forward_return_pct"])
-    for outcome in ranked[:10]:
+    lines.extend(_render_evaluation_coverage(summary))
+    if summary.get("omitted_symbols", 0):
         lines.append(
-            f"    {outcome['symbol']:<8} {outcome['forward_return_pct']:+.2f}%"
-            f"  ({outcome['qualified_on']} → {outcome['evaluated_on']})"
+            f"Only {summary['tested_symbols']} of {summary['configured_symbols']} "
+            "configured symbols fit the backtest universe limit."
         )
-    if len(ranked) > 10:
-        lines.append(f"    <i>{len(ranked) - 10} more not shown.</i>")
+    lines.extend([
+        f"Holdout starts: {summary['holdout_start'] or 'unavailable'} "
+        f"({summary['split_mode']}) · history {escape(summary['period'])}",
+        f"Liquidity: prior 20-session average ≥ {summary['min_avg_volume']:,.0f} shares/day · "
+        f"cost {summary['cost_bps_per_side']:.1f} bps per side",
+        f"Excluded outcomes: {summary['purged_outcomes']} cross the split; "
+        f"{summary['pending_outcomes']} lack a complete hold. "
+        f"{summary['liquidity_rejected']} qualifying signals failed liquidity.",
+        "",
+    ])
+    for key, label in (("development", "Development"), ("holdout", "Reserved holdout")):
+        comparison = summary["cohorts"][key]
+        lines.append(f"<b>{label}</b>")
+        lines.extend(_render_backtest_comparison(comparison, summary["top_n"]))
+        lines.append("")
+
+    holdout = summary["cohorts"]["holdout"]
+    for dimension in ("market", "sector"):
+        groups = holdout.get("by_universe_" + dimension, {})
+        if summary.get("universe_name") == "broad-v1":
+            lines.append(f"<b>Holdout by universe {dimension}</b>")
+            for group, comparison in groups.items():
+                lines.append(escape(group))
+                lines.extend(_render_backtest_comparison(comparison, summary["top_n"]))
+    for key, heading in (("by_market", "Holdout by benchmark market"), ("by_quarter", "Holdout by quarter")):
+        lines.append(f"<b>{heading}</b>")
+        groups = holdout[key]
+        if not groups:
+            lines.append("    No completed holdout trades.")
+        for name, comparison in groups.items():
+            parts = []
+            for cohort_key, label in (("all", "all"), ("top", "top")):
+                stats = comparison[cohort_key]
+                excess = stats["avg_excess_return_pct"]
+                net = stats["avg_net_return_pct"]
+                net_text = f"{net:+.2f}%" if net is not None else "n/a"
+                excess_text = f"{excess:+.2f}%" if excess is not None else "n/a"
+                parts.append(
+                    f"{label} {stats['trade_count']} trades, net {net_text}, "
+                    f"excess {excess_text} ({stats['benchmark_count']} matched)"
+                )
+            lines.append(f"    {escape(name)}: " + " · ".join(parts))
+        lines.append("")
+    validation = summary["cost_validation"]
+    lines.extend([
+        "<b>Unchanged-rule validation: chronological blocks and cost stress</b>",
+        f"Excludes {validation['quarter_crossing_excluded']} additional holds crossing "
+        "calendar-quarter boundaries. Partial quarters remain labeled by date range.",
+        "Same picks in every scenario; costs do not alter selection. "
+        "These are descriptive blocks, not independent folds or fresh validation.",
+    ])
+    for scenario in validation["scenarios"]:
+        lines.append(f"<b>Cost {scenario['cost_bps_per_side']:g} bps per side</b>")
+        for cohort, label in (("development", "Development"), ("holdout", "Holdout (inspected = exploratory)")):
+            comparison = scenario["cohorts"][cohort]
+            lines.append(label)
+            for quarter, block in comparison["by_quarter"].items():
+                parts = []
+                for key in ("all", "top"):
+                    stats = block[key]
+                    net, excess = stats["avg_net_return_pct"], stats["avg_excess_return_pct"]
+                    net_text = f"{net:+.2f}%" if net is not None else "n/a"
+                    excess_text = f"{excess:+.2f} pp" if excess is not None else "n/a"
+                    parts.append(
+                        f"{key}: {stats['trade_count']} signals / {stats['signal_days']} dates / "
+                        f"{stats['symbol_count']} stocks, net {net_text}, excess {excess_text} "
+                        f"({stats['benchmark_count']} matched)"
+                    )
+                dates = block["all"]
+                lines.append(
+                    f"    {quarter} ({dates['signal_start']} to {dates['signal_end']}): "
+                    + " · ".join(parts)
+                )
+            if not comparison["by_quarter"]:
+                lines.append("    No completed within-quarter trades.")
+        lines.append("")
+    if summary["split_mode"] == "automatic":
+        lines.append(
+            "<i>Automatic split reserves the final 25% of signal dates. Set "
+            "TRADE_BACKTEST_HOLDOUT_START to the displayed date to freeze it before tuning.</i>"
+        )
     lines.append("")
     lines.append(
-        "<i>Informational only. Small sample sizes are not statistically meaningful, "
-        "and this reflects the current gate thresholds, not a guarantee they will keep working.</i>"
+        "<i>Do not tune on holdout results. A reserved date range is not evidence it was "
+        "never inspected. Small samples and overlapping trades do not support independent "
+        "confidence intervals; these averages are not portfolio returns. Today's stocks "
+        "introduce survivorship/universe bias. Share volume is only a liquidity proxy, "
+        "not a spread or execution guarantee. Costs are estimates; results do not predict "
+        "future performance.</i>"
     )
     return "\n".join(lines) + "\n\n"
 
@@ -3725,7 +4891,12 @@ def build_ticker_analysis(raw_symbol: str) -> str:
         )
         lines.append(
             f"RSI {_rsi_label(metrics.rsi_14)} · volume {metrics.volume_trend} "
-            f"({metrics.volume_ratio:.1f}× normal) · daily swing (ATR) {metrics.atr_pct:.1f}%"
+            f"({metrics.volume_ratio:.1f}× normal)"
+            if metrics.volume_ratio is not None
+            else f"RSI {_rsi_label(metrics.rsi_14)} · volume {metrics.volume_trend} (n/a)"
+        )
+        lines[-1] += (
+            f" · daily swing (ATR) {metrics.atr_pct:.1f}%"
             f" · {metrics.drawdown_pct:.1f}% below its 20-day high."
         )
         lines.append(_entry_exit_sketch(metrics).strip())
@@ -3883,6 +5054,7 @@ class Briefing:
     message: str
     pending: List[Tuple[str, str]] = field(default_factory=list)
     titles: List[str] = field(default_factory=list)
+    picks: List[TradeMetrics] = field(default_factory=list)
 
 
 def _pending_keys(section: str, selections: List[Selection]) -> List[Tuple[str, str]]:
@@ -3900,6 +5072,7 @@ def compose_briefing(now: Optional[datetime] = None) -> Briefing:
     norway_text, norway_selections = get_norwegian_morning_news()
     global_text, global_selections = get_global_news()
     business_text, business_selections = get_business_and_stocks()
+    trade_text, trade_outcome, _labels = build_trade_candidates_payload()
 
     message = (
         build_daily_intro(now)
@@ -3908,7 +5081,7 @@ def compose_briefing(now: Optional[datetime] = None) -> Briefing:
         + global_text
         + business_text
         + "\n\n"
-        + get_trade_candidates()
+        + trade_text
     )
     pending = (
         _pending_keys("norway_news", norway_selections)
@@ -3917,11 +5090,15 @@ def compose_briefing(now: Optional[datetime] = None) -> Briefing:
     )
     all_selections = norway_selections + global_selections + business_selections
     titles = [selection.candidate.title for selection in all_selections]
-    return Briefing(message=message, pending=pending, titles=titles)
+    return Briefing(
+        message=message, pending=pending, titles=titles,
+        picks=trade_outcome.qualified[:5],
+    )
 
 
 def _commit_briefing(briefing: Briefing) -> None:
     """Record what was shown. Call only after a confirmed successful send."""
+    _record_published_picks(briefing.picks)
     date_key = datetime.today().strftime("%Y-%m-%d")
     by_section: Dict[str, List[str]] = {}
     for section, key in briefing.pending:
@@ -3970,7 +5147,9 @@ def _command_help_text() -> str:
         "/stocks - Send this week's top picks, ranked by qualifying consistency\n"
         "/watchlist - Send every configured watchlist symbol and its verdict\n"
         "/analyze TICKER - Send a deep-dive report for one symbol (e.g. /analyze AAPL)\n"
-        "/performance - Send how the trade screener's past picks have done\n"
+        "/performance - Walk-forward test of trade rules vs. market benchmarks\n"
+        "/diagnostics - Historical signal slices and same-date ranking comparison\n"
+        "/pickperformance - Fixed-session outcomes of actually delivered picks\n"
         "/health - Send bot health report\n"
     )
 
@@ -3995,7 +5174,8 @@ def _handle_command(command: str, chat_id: str) -> None:
         _broadcast_message(payload, chat_id=chat_id)
     elif normalized == "/recommendations":
         text, outcome, labels = build_trade_candidates_payload()
-        _broadcast_message(text, chat_id=chat_id)
+        if _broadcast_message(text, chat_id=chat_id):
+            _record_published_picks(outcome.qualified[:5])
         # After the text, never instead of it: the charts decorate the
         # numbers, and Slack cannot receive them at all.
         send_candidate_charts(outcome, labels, chat_id=chat_id)
@@ -4010,10 +5190,62 @@ def _handle_command(command: str, chat_id: str) -> None:
             _broadcast_message(build_ticker_analysis(argument), chat_id=chat_id)
     elif normalized == "/performance":
         _broadcast_message(build_trade_performance_report(), chat_id=chat_id)
+    elif normalized == "/pickperformance":
+        _broadcast_message(build_published_pick_report(), chat_id=chat_id)
+    elif normalized == "/diagnostics":
+        _broadcast_message(build_trade_diagnostics_report(), chat_id=chat_id)
     elif normalized == "/health":
         _broadcast_message(build_health_report(), chat_id=chat_id)
     else:
         _broadcast_message(_command_help_text(), chat_id=chat_id)
+
+
+def _authorized_chat_ids() -> set:
+    """Chats allowed to issue commands: the configured chat and health chat.
+
+    Anyone can message a bot, and every command spends market-data quota and
+    mirrors its reply to Slack, so unknown senders are ignored.
+    """
+    allowed = {SETTINGS.telegram_chat_id, SETTINGS.health_ping_chat_id}
+    return {str(chat) for chat in allowed if chat}
+
+
+# Commands run off the poller thread so a multi-minute /performance cannot
+# starve /health and the rest. Two workers, and one in-flight run per command.
+_COMMAND_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="command")
+_COMMANDS_IN_FLIGHT: set = set()
+_COMMANDS_LOCK = threading.Lock()
+
+
+def _run_command_safely(command: str, chat_id: str, key: str, flight: Tuple[str, str]) -> None:
+    try:
+        _handle_command(command, chat_id)
+    except Exception as exc:
+        APP_LOG.error("command_failed cmd=%s detail=%s", key, exc)
+        try:
+            send_telegram_message(f"Sorry, {key} failed. Check the bot logs.", chat_id=chat_id)
+        except Exception:
+            pass
+    finally:
+        with _COMMANDS_LOCK:
+            _COMMANDS_IN_FLIGHT.discard(flight)
+
+
+def _dispatch_command(command: str, chat_id: str) -> None:
+    parts = command.strip().split(maxsplit=1)
+    key = parts[0].lower() if parts else ""
+    # /analyze differs by argument, so only identical invocations collide.
+    flight = (chat_id, command.strip().lower())
+    with _COMMANDS_LOCK:
+        if flight in _COMMANDS_IN_FLIGHT:
+            busy = True
+        else:
+            _COMMANDS_IN_FLIGHT.add(flight)
+            busy = False
+    if busy:
+        send_telegram_message(f"{key} is already running; wait for it to finish.", chat_id=chat_id)
+        return
+    _COMMAND_POOL.submit(_run_command_safely, command, chat_id, key, flight)
 
 
 def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
@@ -4040,18 +5272,31 @@ def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
         payload = response.json()
         updates = payload.get("result", [])
         for update in updates:
-            update_id = int(update.get("update_id", 0))
-            message = update.get("message") or update.get("edited_message") or {}
-            chat = message.get("chat", {})
-            chat_id = str(chat.get("id", SETTINGS.telegram_chat_id))
-            text = message.get("text", "")
-            if text.startswith("/"):
-                APP_LOG.info("command_received cmd=%s chat_id=%s", text.split()[0], chat_id)
-                _handle_command(text, chat_id)
+            # Per-update isolation: one bad update must not abort the batch
+            # before the offset moves, or Telegram redelivers it forever.
+            update_id = 0
+            try:
+                update_id = int(update.get("update_id", 0))
+                message = update.get("message") or update.get("edited_message") or {}
+                chat_id = str((message.get("chat") or {}).get("id", ""))
+                text = message.get("text") or ""
+                if text.startswith("/"):
+                    if chat_id not in _authorized_chat_ids():
+                        SYS_LOG.warning(
+                            "command_rejected reason=unauthorized_chat chat_id=%s cmd=%s",
+                            chat_id,
+                            text.split()[0],
+                        )
+                    else:
+                        APP_LOG.info(
+                            "command_received cmd=%s chat_id=%s", text.split()[0], chat_id
+                        )
+                        _dispatch_command(text, chat_id)
+            except Exception as exc:
+                SYS_LOG.error("command_update_failed detail=%s", exc)
             if update_id > STATE.telegram_update_offset:
                 STATE.telegram_update_offset = update_id
-        if updates:
-            STATE.save()
+                STATE.save()
         return True
     except Exception as exc:
         SYS_LOG.error("command_poll_failed detail=%s", exc)
@@ -4109,29 +5354,11 @@ def get_missing_required_config() -> Iterable[str]:
     return SETTINGS.missing_required()
 
 
-def _warn_deprecated_settings() -> None:
-    """Report settings that no longer do anything.
-
-    Reading the default off the model rather than hardcoding it keeps this
-    honest if the field's default ever changes. Ignoring a customised value
-    silently is the same failure that hid the truncated watchlist.
-    """
-    default_min_score = AppSettings.model_fields["trade_min_score"].default
-    if SETTINGS.trade_min_score != default_min_score:
-        SYS_LOG.warning(
-            "deprecated_setting name=TRADE_MIN_SCORE value=%s detail=ignored; "
-            "candidates now pass mandatory gates instead of a score threshold",
-            SETTINGS.trade_min_score,
-        )
-
-
 if __name__ == "__main__":
     missing_values = list(get_missing_required_config())
     if missing_values:
         print("Missing required environment variables: " + ", ".join(missing_values) + ".")
         raise SystemExit(1)
-
-    _warn_deprecated_settings()
 
     _prepare_telegram_long_polling()
 

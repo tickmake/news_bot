@@ -2,12 +2,14 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -425,6 +427,101 @@ class SlackIntegrationTests(unittest.TestCase):
         self.assertEqual(params["timeout"], 25)
         # Read timeout must outlast the server-side hold.
         self.assertGreater(mock_get.call_args.kwargs["timeout"], 25)
+
+
+class TelegramPollerHardeningTests(unittest.TestCase):
+    def _updates(self, *items):
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"result": list(items)}
+        return response
+
+    @staticmethod
+    def _update(update_id, chat_id, text):
+        return {"update_id": update_id, "message": {"chat": {"id": chat_id}, "text": text}}
+
+    def _poll(self, *items):
+        with patch("news_bot.requests.get", return_value=self._updates(*items)), patch.object(
+            news_bot.SETTINGS, "telegram_token", "token"
+        ), patch.object(news_bot.SETTINGS, "command_poll_enabled", True), patch.object(
+            news_bot.SETTINGS, "telegram_chat_id", "42"
+        ), patch.object(news_bot.SETTINGS, "health_ping_chat_id", None), patch.object(
+            news_bot.STATE, "save"
+        ):
+            news_bot.STATE.telegram_update_offset = 0
+            return news_bot.poll_telegram_commands()
+
+    @patch("news_bot._dispatch_command")
+    def test_unauthorized_chat_is_ignored_but_offset_advances(self, dispatch):
+        self.assertTrue(self._poll(self._update(7, 999, "/performance")))
+        dispatch.assert_not_called()
+        self.assertEqual(news_bot.STATE.telegram_update_offset, 7)
+
+    @patch("news_bot._dispatch_command")
+    def test_authorized_chat_is_dispatched(self, dispatch):
+        self._poll(self._update(8, 42, "/health"))
+        dispatch.assert_called_once_with("/health", "42")
+
+    @patch("news_bot._dispatch_command")
+    def test_failing_update_does_not_block_offset_or_batch(self, dispatch):
+        dispatch.side_effect = [RuntimeError("boom"), None]
+        self.assertTrue(
+            self._poll(self._update(1, 42, "/now"), self._update(2, 42, "/health"))
+        )
+        self.assertEqual(dispatch.call_count, 2)
+        self.assertEqual(news_bot.STATE.telegram_update_offset, 2)
+
+    def test_slow_command_does_not_block_the_poller(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow(command, chat_id):
+            started.set()
+            release.wait(5)
+
+        with patch("news_bot._handle_command", side_effect=slow), patch(
+            "news_bot.send_telegram_message"
+        ) as send:
+            news_bot._dispatch_command("/performance", "42")
+            self.assertTrue(started.wait(2))
+            # Identical command while running is refused, not queued.
+            news_bot._dispatch_command("/performance", "42")
+            self.assertIn("already running", send.call_args.args[0])
+            release.set()
+            for _ in range(100):
+                with news_bot._COMMANDS_LOCK:
+                    if not news_bot._COMMANDS_IN_FLIGHT:
+                        break
+                time.sleep(0.02)
+            self.assertFalse(news_bot._COMMANDS_IN_FLIGHT)
+
+    def test_command_failure_is_reported_and_releases_slot(self):
+        with patch("news_bot._handle_command", side_effect=RuntimeError("x")), patch(
+            "news_bot.send_telegram_message"
+        ) as send:
+            news_bot._run_command_safely("/now", "42", "/now", ("42", "/now"))
+        self.assertIn("failed", send.call_args.args[0])
+        self.assertFalse(news_bot._COMMANDS_IN_FLIGHT)
+
+    def test_screen_deadline_abandons_a_hung_fetch(self):
+        release = threading.Event()
+
+        def hang(symbol):
+            release.wait(10)
+            return None
+
+        began = time.time()
+        try:
+            with patch("news_bot._compute_trade_metrics", side_effect=hang), patch.object(
+                news_bot.SETTINGS, "trade_total_deadline_seconds", 1
+            ), patch.object(news_bot.SETTINGS, "trade_fetch_workers", 2), patch.object(
+                news_bot.TRADE_HISTORY, "prune"
+            ):
+                outcome, _ = news_bot._screen_universe([("A", "A"), ("B", "B")])
+        finally:
+            release.set()
+        self.assertTrue(outcome.deadline_hit)
+        self.assertLess(time.time() - began, 8)  # deadline floor is 5s; the hang lasts 10s
 
 
 class FeedDateParsingTests(unittest.TestCase):
@@ -1342,7 +1439,8 @@ class MarkOnSendTests(unittest.TestCase):
         ), patch.object(news_bot, "get_global_news", return_value=("g", [])), patch.object(
             news_bot, "get_business_and_stocks", return_value=("b", [selection])
         ), patch.object(
-            news_bot, "get_trade_candidates", return_value="t"
+            news_bot, "build_trade_candidates_payload",
+            return_value=("t", news_bot.ScreenOutcome(), {}),
         ), patch.object(
             news_bot, "build_daily_intro", return_value="i"
         ):
@@ -1502,7 +1600,7 @@ class TradeMetricsTests(unittest.TestCase):
         self.assertTrue(metrics.above_ema20)
         self.assertAlmostEqual(metrics.drawdown_pct, 0.0, places=6)
         # Volume is uniform across the fixture (default 1_000_000/bar), so the
-        # last bar's volume equals its own 20-bar average.
+        # last bar equals the average of its previous 20 sessions.
         self.assertAlmostEqual(metrics.volume_ratio, 1.0, places=6)
         # True range is constant at 1% of close (High/Low = close * 1.005/0.995)
         # for every bar except the flat->rising transition, which is why ATR%
@@ -1523,6 +1621,925 @@ class TradeMetricsTests(unittest.TestCase):
         self.assertIsNotNone(metrics.rsi_14)
         self.assertGreaterEqual(metrics.resistance_level, metrics.support_level)
         self.assertIn(metrics.volume_trend, ("rising", "falling", "flat"))
+
+    def test_volume_ratio_uses_prior_twenty_sessions(self):
+        volumes = [1_000_000.0] * 39 + [2_000_000.0]
+        self._cache("VOL", _history([100.0] * 40, volumes=volumes))
+        metrics = news_bot._compute_trade_metrics("VOL")
+        self.assertAlmostEqual(metrics.volume_ratio, 2.0)
+
+    def test_volume_ratio_is_unknown_when_baseline_is_unavailable(self):
+        self._cache("NOVOL", _history([100.0] * 40, volumes=[0.0] * 40))
+        metrics = news_bot._compute_trade_metrics("NOVOL")
+        self.assertIsNone(metrics.volume_ratio)
+
+    def test_missing_volume_session_does_not_shrink_the_baseline_window(self):
+        volumes = [1_000_000.0] * 40
+        volumes[-2] = float("nan")
+        self._cache("GAPVOL", _history([100.0] * 40, volumes=volumes))
+        metrics = news_bot._compute_trade_metrics("GAPVOL")
+        self.assertIsNone(metrics.volume_ratio)
+        self.assertEqual(metrics.volume_trend, "unknown")
+
+
+class PublishedPickTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = os.path.join(self.directory.name, "picks.db")
+        self.store = news_bot.TradeHistoryStore(self.path)
+        self.addCleanup(self.store.close)
+        replacement = patch.object(news_bot, "TRADE_HISTORY", self.store)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+
+    def _publish(self, symbol="AAA"):
+        at = datetime(2026, 8, 7, 19, 0, tzinfo=timezone.utc)
+        with patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 2), \
+             patch.object(news_bot.SETTINGS, "trade_backtest_cost_bps", 10.0), \
+             patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"):
+            self.store.publish([_metrics(symbol=symbol, session="2026-08-06")], at)
+        return self.store.published_picks()[0]
+
+    @staticmethod
+    def _history():
+        dates = pd.DatetimeIndex(
+            ["2026-08-06", "2026-08-07", "2026-08-10", "2026-08-11", "2026-08-12"],
+            tz="America/New_York",
+        )
+        return pd.DataFrame(
+            {"Open": [99.0, 100.0, 110.0, 115.0, 120.0],
+             "Close": [100.0, 105.0, 112.0, 121.0, 124.0]},
+            index=dates,
+        )
+
+    def test_first_publication_is_immutable_and_survives_reopen_and_pruning(self):
+        first = self._publish()
+        with patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 20):
+            self.store.publish(
+                [_metrics(symbol="AAA", session="2026-08-06", last_close=999.0)],
+                datetime(2026, 8, 10, tzinfo=timezone.utc),
+            )
+        self.store.prune(retention_days=1, today="2026-09-01")
+        self.store.close()
+        self.assertEqual(self.store.published_picks(), [first])
+        snapshot = json.loads(first["snapshot_json"])
+        self.assertEqual(snapshot["metrics"]["last_close"], 100.0)
+        self.assertEqual(first["horizon_sessions"], 2)
+        self.assertEqual(first["benchmark_symbol"], "BENCH")
+
+    def test_outcome_starts_after_actual_publication_not_old_signal(self):
+        pick = self._publish()
+        history = self._history()
+        outcome = news_bot._published_pick_outcome(pick, history, history)
+        self.assertEqual(outcome["entry_session"], "2026-08-10")
+        self.assertEqual(outcome["exit_session"], "2026-08-11")
+        self.assertAlmostEqual(outcome["gross_return_pct"], 10.0)
+        self.assertAlmostEqual(outcome["net_return_pct"], 9.8)
+        self.assertAlmostEqual(outcome["excess_return_pct"], -0.2)
+
+    def test_publication_utc_date_is_converted_to_exchange_date(self):
+        pick = self._publish()
+        # Saturday in UTC is still Friday in New York.
+        pick["published_at"] = "2026-08-08T01:00:00+00:00"
+        outcome = news_bot._published_pick_outcome(pick, self._history(), None)
+        self.assertEqual(outcome["entry_session"], "2026-08-10")
+        self.assertIsNone(outcome["benchmark_return_pct"])
+
+    def test_pending_and_missing_history_are_distinct(self):
+        pick = self._publish()
+        self.assertIsNone(
+            news_bot._published_pick_outcome(pick, self._history().iloc[:3], None)
+        )
+        with self.assertRaises(ValueError):
+            news_bot._published_pick_outcome(pick, None, None)
+        with self.assertRaises(ValueError):
+            news_bot._published_pick_outcome(pick, self._history().iloc[2:], None)
+
+    def test_unknown_timezone_and_duplicate_sessions_are_unavailable(self):
+        pick = self._publish()
+        history = self._history()
+        naive = history.copy()
+        naive.index = naive.index.tz_localize(None)
+        for invalid in (naive, pd.concat([history, history.iloc[-1:]]), history.iloc[::-1]):
+            with self.subTest(index=invalid.index), self.assertRaises(ValueError):
+                news_bot._published_pick_outcome(pick, invalid, None)
+
+    def test_missing_holding_period_prices_do_not_shorten_horizon(self):
+        pick = self._publish()
+        for value in (float("nan"), float("inf"), 0.0, -10.0):
+            history = self._history()
+            history.loc[history.index[2], "Open"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                news_bot._published_pick_outcome(pick, history, None)
+
+    def test_missing_or_invalid_benchmark_keeps_stock_outcome(self):
+        pick = self._publish()
+        history = self._history()
+        invalid = history.copy()
+        invalid.loc[invalid.index[2], "Open"] = float("nan")
+        for benchmark in (history.iloc[:3], invalid, history.drop(columns=["Open"])):
+            with self.subTest(benchmark=benchmark):
+                outcome = news_bot._published_pick_outcome(pick, history, benchmark)
+                self.assertAlmostEqual(outcome["net_return_pct"], 9.8)
+                self.assertIsNone(outcome["excess_return_pct"])
+
+    def test_pending_report_does_not_persist_an_outcome(self):
+        self._publish()
+        with patch.object(news_bot, "_fetch_ticker_history", return_value=self._history().iloc[:3]):
+            report = news_bot.build_published_pick_report()
+        self.assertIn("1 pending", report)
+        self.assertIsNone(self.store.published_picks()[0]["outcome_json"])
+
+    def test_completed_outcome_is_persisted_and_not_refetched(self):
+        self._publish()
+        with patch.object(news_bot, "_fetch_ticker_history", return_value=self._history()) as fetch:
+            report = news_bot.build_published_pick_report()
+        self.assertEqual(fetch.call_count, 2)
+        self.assertIn("1 completed", report)
+        self.assertIn("+9.80%", report)
+        self.assertIn("Benchmark coverage: 1/1", report)
+        with patch.object(news_bot, "_fetch_ticker_history") as fetch:
+            self.assertEqual(news_bot.build_published_pick_report(), report)
+        fetch.assert_not_called()
+        self.assertIsNotNone(self.store.published_picks()[0]["outcome_json"])
+
+    def test_completed_outcomes_cannot_be_overwritten_after_reopen(self):
+        pick = self._publish()
+        outcome = news_bot._published_pick_outcome(pick, self._history(), None)
+        self.store.complete_pick(pick, outcome)
+        self.store.close()
+        self.store.complete_pick(pick, dict(outcome, net_return_pct=-100.0))
+        self.assertEqual(json.loads(self.store.published_picks()[0]["outcome_json"]), outcome)
+
+    def test_new_signal_session_is_separate_and_snapshots_include_rank(self):
+        self._publish()
+        self.store.publish(
+            [_metrics(symbol="AAA", session="2026-08-07"),
+             _metrics(symbol="BBB", session="2026-08-07")],
+            datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+        rows = self.store.published_picks()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(self.store.published_picks(limit=1)), 1)
+        self.assertEqual(json.loads(rows[1]["snapshot_json"])["rank"], 2)
+
+    def test_publication_rejects_invalid_horizon_cost_and_unknown_timezone(self):
+        with patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 0):
+            with self.assertRaises(ValueError):
+                self._publish_without_settings()
+        for cost in (-1.0, float("inf"), float("nan")):
+            with patch.object(news_bot.SETTINGS, "trade_backtest_cost_bps", cost):
+                with self.subTest(cost=cost), self.assertRaises(ValueError):
+                    self._publish_without_settings()
+        with self.assertRaises(ValueError):
+            self.store.publish([_metrics()], datetime(2026, 8, 10))
+        self.assertEqual(self.store.published_picks(), [])
+
+    def _publish_without_settings(self):
+        self.store.publish([_metrics()], datetime(2026, 8, 10, tzinfo=timezone.utc))
+
+    def test_no_completed_claim_when_outcome_persistence_fails(self):
+        self._publish()
+        with patch.object(news_bot, "_fetch_ticker_history", return_value=self._history()), \
+             patch.object(self.store, "complete_pick", side_effect=sqlite3.OperationalError("disk")), \
+             self.assertLogs("news_bot", level="WARNING"):
+            report = news_bot.build_published_pick_report()
+        self.assertIn("0 completed", report)
+        self.assertIn("1 unavailable", report)
+        self.assertIsNone(self.store.published_picks()[0]["outcome_json"])
+
+    def test_provider_failure_keeps_report_available(self):
+        self._publish()
+        with patch.object(news_bot, "_fetch_ticker_history", side_effect=news_bot.yf.exceptions.YFException("missing")), \
+             self.assertLogs("news_bot", level="WARNING"):
+            report = news_bot.build_published_pick_report()
+        self.assertIn("1 unavailable", report)
+
+    def test_report_counts_unavailable_data_without_turning_it_into_losses(self):
+        self._publish()
+        with patch.object(news_bot, "_fetch_ticker_history", return_value=None), \
+             self.assertLogs("news_bot", level="WARNING"):
+            report = news_bot.build_published_pick_report()
+        self.assertIn("0 completed", report)
+        self.assertIn("1 unavailable", report)
+        self.assertNotIn("hit rate", report)
+
+    def test_empty_ledger_does_not_fetch(self):
+        with patch.object(news_bot, "_fetch_ticker_history") as fetch:
+            report = news_bot.build_published_pick_report()
+        self.assertIn("No published picks", report)
+        fetch.assert_not_called()
+
+    def test_report_window_is_100_with_at_most_ten_details(self):
+        with patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 2):
+            self.store.publish(
+                [_metrics(symbol=f"S{index:03d}", session="2026-08-06") for index in range(105)],
+                datetime(2026, 8, 7, 19, 0, tzinfo=timezone.utc),
+            )
+        picks = self.store.published_picks()
+        self.assertEqual(len(picks), 100)
+        for pick in picks:
+            self.store.complete_pick(
+                pick, news_bot._published_pick_outcome(pick, self._history(), None),
+            )
+        with patch.object(news_bot, "_fetch_ticker_history") as fetch:
+            report = news_bot.build_published_pick_report()
+        fetch.assert_not_called()
+        self.assertIn("Latest 100 recorded signals", report)
+        self.assertIn("100 completed", report)
+        self.assertIn("Benchmark coverage: 0/100", report)
+        self.assertEqual(report.count("bps/side"), 10)
+        self.assertIn("Showing the 10", report)
+        self.assertEqual(len(self.store.published_picks(limit=200)), 105)
+
+    def test_read_failure_is_explicit(self):
+        with patch.object(self.store, "published_picks", side_effect=sqlite3.OperationalError("disk")), \
+             self.assertLogs("news_bot", level="ERROR"):
+            report = news_bot.build_published_pick_report()
+        self.assertIn("ledger unavailable", report)
+
+    def test_recommendations_record_only_shown_picks_on_success(self):
+        metrics = [_metrics(symbol=f"S{i}", session="2026-08-06") for i in range(7)]
+        outcome = news_bot.ScreenOutcome(qualified=metrics)
+        with patch.object(news_bot, "build_trade_candidates_payload", return_value=("text", outcome, {})), \
+             patch.object(news_bot, "_broadcast_message", return_value=False), \
+             patch.object(news_bot, "send_candidate_charts"):
+            news_bot._handle_command("/recommendations", "chat")
+        self.assertEqual(self.store.published_picks(), [])
+        with patch.object(news_bot, "build_trade_candidates_payload", return_value=("text", outcome, {})), \
+             patch.object(news_bot, "_broadcast_message", return_value=True), \
+             patch.object(news_bot, "send_candidate_charts"):
+            news_bot._handle_command("/recommendations", "chat")
+        self.assertEqual({row["symbol"] for row in self.store.published_picks()}, {f"S{i}" for i in range(5)})
+
+    def test_scheduled_and_now_briefings_record_only_after_delivery(self):
+        briefing = news_bot.Briefing(message="text", picks=[_metrics(session="2026-08-06")])
+        with patch.object(news_bot, "compose_briefing", return_value=briefing), \
+             patch.object(news_bot, "_broadcast_message", return_value=False), \
+             patch.object(news_bot.STATE, "save"):
+            self.assertFalse(news_bot.job_daily_briefing())
+            news_bot._send_briefing(datetime.now(), "chat")
+        self.assertEqual(self.store.published_picks(), [])
+        with patch.object(news_bot, "compose_briefing", return_value=briefing), \
+             patch.object(news_bot, "_broadcast_message", return_value=True), \
+             patch.object(news_bot.STATE, "save"):
+            self.assertTrue(news_bot.job_daily_briefing())
+            news_bot._send_briefing(datetime.now(), "chat")
+        self.assertEqual(len(self.store.published_picks()), 1)
+
+    def test_composition_retains_only_rendered_metrics_without_rescreening(self):
+        metrics = [_metrics(symbol=f"S{i}") for i in range(7)]
+        outcome = news_bot.ScreenOutcome(qualified=metrics)
+        with patch.object(news_bot, "get_norwegian_morning_news", return_value=("n", [])), \
+             patch.object(news_bot, "get_global_news", return_value=("g", [])), \
+             patch.object(news_bot, "get_business_and_stocks", return_value=("b", [])), \
+             patch.object(news_bot, "build_trade_candidates_payload", return_value=("candidates", outcome, {})) as payload:
+            briefing = news_bot.compose_briefing(datetime(2026, 8, 10, 7, 0))
+        self.assertIn("candidates", briefing.message)
+        self.assertEqual(briefing.picks, metrics[:5])
+        payload.assert_called_once_with()
+
+    def test_publish_failure_is_logged_without_claiming_ledger_success(self):
+        with patch.object(self.store, "publish", side_effect=sqlite3.OperationalError("disk")), \
+             self.assertLogs("news_bot", level="ERROR") as logs:
+            news_bot._record_published_picks([_metrics()])
+        self.assertIn("published_picks_record_failed", "\n".join(logs.output))
+
+    def test_pickperformance_command_is_separate_from_backtest(self):
+        with patch.object(news_bot, "build_published_pick_report", return_value="picks") as report, \
+             patch.object(news_bot, "build_trade_performance_report") as backtest, \
+             patch.object(news_bot, "_broadcast_message") as send:
+            news_bot._handle_command("/pickperformance", "chat")
+        report.assert_called_once()
+        backtest.assert_not_called()
+        send.assert_called_once_with("picks", chat_id="chat")
+        self.assertIn("/pickperformance", news_bot._command_help_text())
+
+
+class SignalDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def _trade(symbol="AAA", date="2026-01-05", rank=1, net=1.0, excess=0.5, count=2, **features):
+        return {
+            "symbol": symbol, "signal_session": date, "rank": rank,
+            "selected": rank == 1, "qualifier_count": count,
+            "qualifying_streak": 1, "quarter": "2026-Q1",
+            "net_return_pct": net, "benchmark_return_pct": net - excess if excess is not None else None,
+            "excess_return_pct": excess, "adverse_excursion_pct": -2.0,
+            "signal_metrics": {
+                "week_momentum_pct": 2.0, "volume_ratio": 1.0,
+                "rsi_14": 60.0, "atr_pct": 1.5,
+                **features,
+            },
+        }
+
+    def test_paired_ranking_uses_equal_date_weights_and_complete_benchmark_dates(self):
+        rows = [
+            self._trade(net=4.0, excess=3.0),
+            self._trade(symbol="BBB", rank=2, net=0.0, excess=0.0),
+            self._trade(date="2026-01-06", net=-1.0, count=3),
+            self._trade(symbol="BBB", date="2026-01-06", rank=2, net=1.0, count=3, excess=None),
+            self._trade(symbol="CCC", date="2026-01-06", rank=3, net=1.0, count=3),
+        ]
+        paired = news_bot._backtest_diagnostics(rows)["paired_ranking"]
+        self.assertEqual(paired["paired_dates"], 2)
+        self.assertEqual(paired["avg_net_delta_pct"], 1.0)
+        self.assertEqual(paired["median_net_delta_pct"], 1.0)
+        self.assertEqual(paired["selected_better_pct"], 50.0)
+        self.assertEqual(paired["benchmark_paired_dates"], 1)
+        self.assertEqual(paired["avg_excess_delta_pct"], 3.0)
+
+    def test_report_formats_paired_differences_as_percentage_points(self):
+        result = {
+            "horizon_sessions": 5, "cost_bps_per_side": 10.0, "holdout_start": "2026-04-15",
+            "usable_symbols": 2, "tested_symbols": 2, "fetch_failures": 0,
+            "omitted_symbols": 0, "pending_outcomes": 0, "purged_outcomes": 0,
+            "liquidity_rejected": 0, "top_n": 1,
+            "diagnostics": {
+                "development": news_bot._backtest_diagnostics([
+                    self._trade(net=2.0), self._trade(symbol="BBB", rank=2, net=-1.0),
+                ]),
+                "holdout": news_bot._backtest_diagnostics([]),
+            },
+        }
+        with patch.object(news_bot, "_run_walk_forward_backtest", return_value=result):
+            report = news_bot.build_trade_diagnostics_report()
+        self.assertIn("mean net delta +3.00 pp", report)
+        self.assertIn("No completed qualifiers.", report)
+
+    def test_incomplete_dates_are_not_backfilled_or_compared(self):
+        rows = [
+            self._trade(count=3), self._trade(symbol="BBB", rank=2, count=3),
+            self._trade(date="2026-01-06", count=1),
+        ]
+        paired = news_bot._backtest_diagnostics(rows)["paired_ranking"]
+        self.assertEqual(paired["incomplete_dates"], 1)
+        self.assertEqual(paired["no_comparison_dates"], 1)
+        self.assertEqual(paired["paired_dates"], 0)
+        self.assertIsNone(paired["avg_net_delta_pct"])
+
+    def test_fixed_bucket_boundaries_unknowns_and_numeric_rank_order(self):
+        rows = [
+            self._trade(rank=10, week_momentum_pct=6.0, volume_ratio=1.2, rsi_14=70.0, atr_pct=2.0),
+            self._trade(rank=2, week_momentum_pct=3.0, volume_ratio=None, rsi_14=None),
+            self._trade(rank=1),
+        ]
+        rows[0]["qualifying_streak"] = 4
+        rows[1]["qualifying_streak"] = 3
+        with patch.object(news_bot.SETTINGS, "trade_min_volume_ratio", 1.2):
+            groups = news_bot._backtest_diagnostics(rows)["groups"]
+        self.assertEqual(list(groups["rank"]), ["1", "2", "10"])
+        for dimension, buckets in (
+            ("momentum", ["<3%", "3-6%", ">=6%"]),
+            ("volume", ["unconfirmed", "unknown", "confirmed"]),
+            ("RSI", ["<70", "unknown", ">=70"]),
+            ("ATR", ["<2%", ">=2%"]),
+            ("streak", ["1", "2-3", ">=4"]),
+        ):
+            self.assertEqual(set(groups[dimension]), set(buckets))
+            self.assertEqual(sum(stats["trade_count"] for stats in groups[dimension].values()), 3)
+        self.assertEqual(groups["stock"]["AAA"]["signal_days"], 1)
+        self.assertEqual(groups["stock"]["AAA"]["symbol_count"], 1)
+        self.assertEqual(groups["quarter"]["2026-Q1"]["benchmark_count"], 3)
+
+    def test_empty_diagnostics_are_explicit(self):
+        result = news_bot._backtest_diagnostics([])
+        self.assertEqual(result["groups"], {})
+        self.assertEqual(result["paired_ranking"]["paired_dates"], 0)
+        self.assertIsNone(result["paired_ranking"]["selected_better_pct"])
+
+    def test_diagnostics_command_dispatch_and_configuration_error(self):
+        with patch.object(news_bot, "build_trade_diagnostics_report", return_value="diagnostics") as build, \
+             patch.object(news_bot, "_broadcast_message") as send:
+            news_bot._handle_command("/diagnostics", "chat")
+        build.assert_called_once_with()
+        send.assert_called_once_with("diagnostics", chat_id="chat")
+        self.assertIn("/diagnostics", news_bot._command_help_text())
+        with patch.object(news_bot, "_run_walk_forward_backtest", return_value={"error": "invalid_cost"}):
+            report = news_bot.build_trade_diagnostics_report()
+        self.assertIn("Diagnostics unavailable: invalid_cost", report)
+
+
+class EvaluationUniverseTests(unittest.TestCase):
+    def test_broad_preset_is_fixed_unique_and_covers_four_markets_and_eleven_sectors(self):
+        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "broad-v1"), \
+             patch.object(news_bot, "_configured_stock_watchlist", side_effect=AssertionError("live list")):
+            name, stocks = news_bot._evaluation_stock_universe()
+        self.assertEqual(name, "broad-v1")
+        self.assertEqual(len(stocks), 44)
+        self.assertEqual(
+            {market: sum(row["market"] == market for row in stocks.values())
+             for market in ("US", "Europe", "India", "Norway")},
+            {"US": 11, "Europe": 14, "India": 11, "Norway": 8},
+        )
+        self.assertEqual(len({row["sector"] for row in stocks.values()}), 11)
+        self.assertEqual(list(stocks)[:2], ["MSFT", "JPM"])
+
+    def test_configured_default_preserves_stock_only_lists_and_deduplicates(self):
+        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "configured"), \
+             patch.object(news_bot, "_configured_stock_watchlist", return_value=[
+                 ("Alpha", "AAA"), ("Alpha duplicate", "AAA"), ("Beta", "BBB"),
+             ]):
+            name, stocks = news_bot._evaluation_stock_universe()
+        self.assertEqual(name, "configured")
+        self.assertEqual(list(stocks), ["AAA", "BBB"])
+
+    def test_invalid_manifest_and_unknown_preset_are_rejected(self):
+        manifests = (
+            "ticker,name,market,sector\nAAA,Alpha,US,Technology\n",
+            "symbol,name,market,sector\n",
+            "symbol,name,market,sector\nAAA,Alpha,US,\n",
+            "symbol,name,market,sector\nAAA,Alpha,US\n",
+            "symbol,name,market,sector\nAAA,Alpha,US,Technology,extra\n",
+            "symbol,name,market,sector\nAAA,Alpha,US,Technology\nAAA,Duplicate,US,Technology\n",
+        )
+        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "broad-v1"):
+            for manifest in manifests:
+                with self.subTest(manifest=manifest), patch("builtins.open", mock_open(read_data=manifest)):
+                    with self.assertRaises(ValueError):
+                        news_bot._evaluation_stock_universe()
+        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "typo"), \
+             self.assertLogs("news_bot", level="ERROR"):
+            self.assertEqual(news_bot._run_walk_forward_backtest()["error"], "invalid_universe")
+
+    def test_manifest_missing_is_logged_and_reported(self):
+        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "broad-v1"), \
+             patch("builtins.open", side_effect=FileNotFoundError("manifest")), \
+             self.assertLogs("news_bot", level="ERROR"):
+            report = news_bot.build_trade_performance_report()
+        self.assertIn("universe must be configured or broad-v1", report)
+
+    def test_live_watchlist_is_unchanged_by_evaluation_preset(self):
+        original = news_bot._configured_watchlist()
+        with patch.object(news_bot.SETTINGS, "trade_backtest_universe", "broad-v1"):
+            news_bot._evaluation_stock_universe()
+            self.assertEqual(news_bot._configured_watchlist(), original)
+
+    def test_loader_uses_separate_limit_and_reports_market_sector_and_missing_data(self):
+        stocks = {
+            "AAA": {"name": "Alpha", "market": "US", "sector": "Technology"},
+            "BBB": {"name": "Beta", "market": "US", "sector": "Financials"},
+            "CCC.NS": {"name": "Gamma", "market": "India", "sector": "Technology"},
+            "DDD.NS": {"name": "Delta", "market": "India", "sector": "Financials"},
+        }
+        history = WalkForwardBacktestTests()._rising_history()
+        invalid = history.copy()
+        invalid.iloc[40, invalid.columns.get_loc("Open")] = float("nan")
+        data = {"AAA": history, "CCC.NS": invalid, "SPY": history}
+        with patch.object(news_bot, "_evaluation_stock_universe", return_value=("broad-v1", stocks)), \
+             patch.object(news_bot.SETTINGS, "trade_universe_max", 1), \
+             patch.object(news_bot.SETTINGS, "trade_backtest_universe_max", 3), \
+             patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:SPY,.NS:NIFTY"), \
+             patch.object(news_bot, "_fetch_ticker_history", side_effect=lambda symbol, **kw: data.get(symbol)), \
+             self.assertLogs("news_bot", level="WARNING"):
+            result = news_bot._run_walk_forward_backtest()
+        self.assertEqual(result["tested_symbols"], 3)
+        self.assertEqual(result["configured_symbols"], 4)
+        self.assertEqual(result["omitted_symbols"], 1)
+        self.assertEqual(result["stock_fetch_failures"], ["BBB"])
+        self.assertEqual(result["benchmark_fetch_failures"], ["NIFTY"])
+        self.assertEqual(result["unusable_stocks"], ["CCC.NS"])
+        self.assertEqual(result["coverage"]["market"]["US"], {"configured": 2, "tested": 2, "usable": 1})
+        self.assertEqual(result["coverage"]["market"]["India"], {"configured": 2, "tested": 1, "usable": 0})
+        for cohort in ("development", "holdout"):
+            for dimension in ("market", "sector"):
+                groups = result["cohorts"][cohort]["by_universe_" + dimension]
+                for key in ("all", "top"):
+                    self.assertEqual(
+                        sum(group[key]["trade_count"] for group in groups.values()),
+                        result["cohorts"][cohort][key]["trade_count"],
+                    )
+        with patch.object(news_bot, "_run_walk_forward_backtest", return_value=result):
+            report = news_bot.build_trade_performance_report()
+            diagnostics = news_bot.build_trade_diagnostics_report()
+        for text in ("broad-v1", "Missing stock histories: BBB",
+                     "Missing benchmarks: NIFTY", "Unusable stock histories: CCC.NS"):
+            self.assertIn(text, report)
+            self.assertIn(text, diagnostics)
+        self.assertIn("Holdout by universe sector", report)
+
+    def test_invalid_evaluation_limit_is_not_silently_clamped(self):
+        with patch.object(news_bot.SETTINGS, "trade_backtest_universe_max", 0), \
+             self.assertLogs("news_bot", level="ERROR"):
+            self.assertEqual(news_bot._run_walk_forward_backtest()["error"], "invalid_universe")
+
+    def test_broad_loader_keeps_historical_liquidity_filter(self):
+        stocks = {"AAA": {"name": "Alpha", "market": "US", "sector": "Technology"}}
+        history = WalkForwardBacktestTests()._rising_history()
+        history["Volume"] = 100.0
+        with patch.object(news_bot, "_evaluation_stock_universe", return_value=("broad-v1", stocks)), \
+             patch.object(news_bot.SETTINGS, "trade_backtest_min_avg_volume", 100000.0), \
+             patch.object(news_bot, "_fetch_ticker_history", return_value=history):
+            result = news_bot._run_walk_forward_backtest()
+        self.assertEqual(result["coverage"]["market"]["US"]["usable"], 1)
+        self.assertEqual(result["trade_count"], 0)
+        self.assertGreater(result["liquidity_rejected"], 0)
+
+
+class CostValidationTests(unittest.TestCase):
+    @staticmethod
+    def _trade(date="2026-01-05", exit_date="2026-01-12", selected=True, benchmark=0.5):
+        return {
+            "symbol": "AAA", "signal_session": date, "exit_session": exit_date,
+            "quarter": "2026-Q1", "cohort": "development", "market": "BENCH",
+            "selected": selected, "gross_return_pct": 1.0, "net_return_pct": 0.8,
+            "benchmark_return_pct": benchmark,
+            "excess_return_pct": 0.8 - benchmark if benchmark is not None else None,
+            "adverse_excursion_pct": -2.0,
+        }
+
+    def test_cost_stress_uses_identical_picks_and_preserves_original_rows(self):
+        rows = [self._trade(), self._trade(selected=False, benchmark=None)]
+        original = json.dumps(rows, sort_keys=True)
+        result = news_bot._backtest_cost_validation(rows, 10.0)
+        self.assertEqual([row["cost_bps_per_side"] for row in result["scenarios"]], [10, 25, 50])
+        for scenario, expected_net in zip(result["scenarios"], [0.8, 0.5, 0.0]):
+            comparison = scenario["cohorts"]["development"]
+            self.assertEqual(comparison["all"]["trade_count"], 2)
+            self.assertEqual(comparison["top"]["trade_count"], 1)
+            self.assertAlmostEqual(comparison["all"]["avg_net_return_pct"], expected_net)
+            self.assertAlmostEqual(comparison["top"]["avg_excess_return_pct"], expected_net - 0.5)
+            self.assertEqual(comparison["all"]["benchmark_count"], 1)
+            self.assertEqual(comparison["all"]["avg_adverse_excursion_pct"], -2.0)
+        self.assertEqual(json.dumps(rows, sort_keys=True), original)
+
+    def test_quarter_crossing_holds_are_excluded_including_year_boundary(self):
+        crossing = self._trade(date="2026-03-30", exit_date="2026-04-02")
+        year_crossing = dict(
+            self._trade(date="2025-12-30", exit_date="2026-01-05"), quarter="2025-Q4",
+        )
+        result = news_bot._backtest_cost_validation(
+            [self._trade(), crossing, year_crossing], 10.0,
+        )
+        self.assertEqual(result["quarter_crossing_excluded"], 2)
+        self.assertEqual(result["scenarios"][0]["cohorts"]["development"]["all"]["trade_count"], 1)
+
+    def test_empty_cohorts_and_high_baseline_cost_are_explicit(self):
+        result = news_bot._backtest_cost_validation([], 75.0)
+        self.assertEqual([row["cost_bps_per_side"] for row in result["scenarios"]], [75, 90, 115])
+        for scenario in result["scenarios"]:
+            for comparison in scenario["cohorts"].values():
+                self.assertEqual(comparison["by_quarter"], {})
+                self.assertIsNone(comparison["all"]["avg_net_return_pct"])
+
+
+class WalkForwardBacktestTests(unittest.TestCase):
+    def _rising_history(self, count=90, step=0.5):
+        dates = pd.bdate_range("2025-01-02", periods=count)
+        closes = [100.0 + step * index for index in range(count)]
+        close = pd.Series(closes, index=dates)
+        return pd.DataFrame(
+            {
+                "Open": close - step * 0.25,
+                "High": close * 1.01,
+                "Low": close * 0.99,
+                "Close": close,
+                "Volume": 1_000_000.0,
+            },
+            index=dates,
+        )
+
+    def test_walk_forward_uses_next_open_and_fixed_session_horizon(self):
+        stock = self._rising_history()
+        benchmark = self._rising_history(step=0.1)
+        with patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"):
+            result = news_bot._walk_forward_backtest(
+                {"AAA": stock},
+                {"BENCH": benchmark},
+                horizon_sessions=5,
+                top_n=1,
+                cost_bps_per_side=10.0,
+            )
+        self.assertGreater(result["trade_count"], 0)
+        trade = result["trades"][0]
+        signal_position = stock.index.strftime("%Y-%m-%d").tolist().index(
+            trade["signal_session"]
+        )
+        self.assertEqual(
+            trade["entry_session"],
+            stock.index[signal_position + 1].strftime("%Y-%m-%d"),
+        )
+        self.assertEqual(
+            trade["exit_session"],
+            stock.index[signal_position + 5].strftime("%Y-%m-%d"),
+        )
+        self.assertAlmostEqual(
+            trade["net_return_pct"],
+            trade["gross_return_pct"] - 0.2,
+        )
+        self.assertIsNotNone(trade["excess_return_pct"])
+
+    def test_backtest_signal_metrics_do_not_read_future_bars(self):
+        original = self._rising_history()
+        changed = original.copy()
+        changed.loc[changed.index[45]:, ["Open", "High", "Low", "Close"]] *= 0.5
+        original_metrics = news_bot._backtest_metrics_by_session("AAA", original)[1]
+        changed_metrics = news_bot._backtest_metrics_by_session("AAA", changed)[1]
+        session = original.index[35].strftime("%Y-%m-%d")
+        self.assertAlmostEqual(
+            original_metrics[session].week_momentum_pct,
+            changed_metrics[session].week_momentum_pct,
+        )
+        self.assertEqual(
+            original_metrics[session].above_ema20,
+            changed_metrics[session].above_ema20,
+        )
+
+    def test_diagnostic_snapshots_and_streaks_use_only_signal_time_data(self):
+        original = self._rising_history()
+        changed = original.copy()
+        changed.loc[changed.index[45]:, ["Open", "High", "Low", "Close"]] *= 0.5
+        with patch.object(news_bot.TRADE_HISTORY, "recent_qualifying_streak", side_effect=AssertionError("live history")):
+            results = [
+                news_bot._walk_forward_backtest(
+                    {"AAA": history}, {}, horizon_sessions=1, holdout_start="2026-02-01",
+                )
+                for history in (original, changed)
+            ]
+        before = [
+            next(trade for trade in result["all_trades"] if trade["signal_session"] == original.index[35].strftime("%Y-%m-%d"))
+            for result in results
+        ]
+        self.assertEqual(before[0]["signal_metrics"], before[1]["signal_metrics"])
+        self.assertEqual(before[0]["qualifying_streak"], before[1]["qualifying_streak"])
+        metrics = news_bot._backtest_metrics_by_session("AAA", original)[1][before[0]["signal_session"]]
+        self.assertEqual(before[0]["signal_metrics"]["week_momentum_pct"], metrics.week_momentum_pct)
+        self.assertEqual(before[0]["qualifier_count"], 1)
+        for result in results:
+            for cohort in ("development", "holdout"):
+                count = result["cohorts"][cohort]["all"]["trade_count"]
+                groups = result["diagnostics"][cohort]["groups"]
+                self.assertEqual(sum(stats["trade_count"] for stats in groups.get("rank", {}).values()), count)
+
+    def test_diagnostic_report_discloses_cohorts_coverage_and_no_optimization(self):
+        result = news_bot._walk_forward_backtest(
+            {"AAA": self._rising_history()}, {}, horizon_sessions=5,
+        )
+        result.update(
+            horizon_sessions=5, cost_bps_per_side=10.0, tested_symbols=1,
+            omitted_symbols=0, fetch_failures=0,
+        )
+        with patch.object(news_bot, "_run_walk_forward_backtest", return_value=result):
+            report = news_bot.build_trade_diagnostics_report()
+        for text in ("Development", "Holdout", "ALL completed", "without both groups",
+                     "coverage", "no threshold optimization", "Live rules are unchanged"):
+            self.assertIn(text, report)
+
+    def test_benchmark_map_uses_suffix_then_default(self):
+        with patch.object(
+            news_bot.SETTINGS,
+            "trade_backtest_benchmarks",
+            "DEFAULT:SPY,.NS:^NSEI",
+        ):
+            self.assertEqual(news_bot._backtest_benchmark_for("ABC.NS"), "^NSEI")
+            self.assertEqual(news_bot._backtest_benchmark_for("AAPL"), "SPY")
+            self.assertIsNone(news_bot._backtest_benchmark_for("ABC.T"))
+
+    def test_performance_loader_fetches_configured_symbols_and_benchmarks(self):
+        data = {"AAA": self._rising_history(), "BENCH": self._rising_history(step=0.1)}
+
+        def fetch(symbol, period, interval):
+            self.assertEqual(period, "2y")
+            self.assertEqual(interval, "1d")
+            return data[symbol]
+
+        with patch.object(news_bot, "_configured_stock_watchlist", return_value=[("Alpha", "AAA")]), \
+             patch.object(news_bot, "_fetch_ticker_history", side_effect=fetch), \
+             patch.object(news_bot.SETTINGS, "trade_backtest_benchmarks", "DEFAULT:BENCH"), \
+             patch.object(news_bot.SETTINGS, "trade_backtest_period", "2y"):
+            summary = news_bot._run_walk_forward_backtest(horizon_sessions=5)
+        self.assertEqual(summary["configured_symbols"], 1)
+        self.assertEqual(summary["tested_symbols"], 1)
+        self.assertEqual(summary["usable_symbols"], 1)
+        self.assertGreater(summary["trade_count"], 0)
+        self.assertEqual(summary["benchmark_count"], summary["trade_count"])
+
+    def test_walk_forward_report_discloses_overlap_and_universe_bias(self):
+        result = news_bot._walk_forward_backtest(
+            {"AAA": self._rising_history()},
+            {"SPY": self._rising_history(step=0.1)},
+            horizon_sessions=5,
+        )
+        result.update({
+            "horizon_sessions": 5, "period": "2y", "configured_symbols": 1,
+            "tested_symbols": 1, "omitted_symbols": 0, "fetch_failures": 0,
+            "min_avg_volume": 100000.0, "cost_bps_per_side": 10.0,
+        })
+        with patch("news_bot._run_walk_forward_backtest", return_value=result):
+            report = news_bot.build_trade_performance_report()
+        self.assertIn("Development", report)
+        self.assertIn("Reserved holdout", report)
+        self.assertIn("All qualifiers", report)
+        self.assertIn("Top 5", report)
+        self.assertIn("benchmark coverage:", report)
+        self.assertIn("Holdout by quarter", report)
+        self.assertIn("worst adverse move", report)
+        self.assertIn("overlap", report)
+        self.assertIn("survivorship/universe bias", report)
+        self.assertIn("Unchanged-rule validation", report)
+        self.assertIn("Cost 25 bps per side", report)
+        self.assertIn("Cost 50 bps per side", report)
+        self.assertIn("not independent folds or fresh validation", report)
+
+    def test_split_purges_development_trades_that_touch_holdout(self):
+        stock = self._rising_history()
+        split = stock.index[60].strftime("%Y-%m-%d")
+        result = news_bot._walk_forward_backtest(
+            {"AAA": stock}, {}, horizon_sessions=5, holdout_start=split,
+        )
+        self.assertGreater(result["purged_outcomes"], 0)
+        self.assertGreater(result["pending_outcomes"], 0)
+        for trade in result["all_trades"]:
+            if trade["cohort"] == "development":
+                self.assertLess(trade["exit_session"], split)
+            else:
+                self.assertGreaterEqual(trade["signal_session"], split)
+        self.assertGreater(result["cohorts"]["development"]["all"]["trade_count"], 0)
+        self.assertGreater(result["cohorts"]["holdout"]["all"]["trade_count"], 0)
+
+    def test_holdout_prices_cannot_change_development_returns(self):
+        original = self._rising_history()
+        changed = original.copy()
+        split = original.index[60].strftime("%Y-%m-%d")
+        changed.loc[changed.index[60]:, ["Open", "High", "Low", "Close"]] *= 0.5
+        before = news_bot._walk_forward_backtest(
+            {"AAA": original}, {}, horizon_sessions=5, holdout_start=split,
+        )
+        after = news_bot._walk_forward_backtest(
+            {"AAA": changed}, {}, horizon_sessions=5, holdout_start=split,
+        )
+        self.assertEqual(
+            before["cohorts"]["development"], after["cohorts"]["development"],
+        )
+
+    def test_auto_split_is_chronological_and_does_not_consult_returns(self):
+        stock = self._rising_history()
+        dates = sorted(news_bot._backtest_metrics_by_session("AAA", stock)[1])
+        expected = dates[int(len(dates) * 0.75)]
+        result = news_bot._walk_forward_backtest(
+            {"AAA": stock}, {}, horizon_sessions=5,
+        )
+        self.assertEqual(result["holdout_start"], expected)
+        self.assertEqual(result["split_mode"], "automatic")
+
+    def test_all_qualifiers_and_top_picks_use_the_same_ranked_population(self):
+        stocks = {f"S{i}": self._rising_history(step=0.5 + i * 0.1) for i in range(7)}
+        result = news_bot._walk_forward_backtest(
+            stocks, {}, horizon_sessions=5, top_n=5,
+        )
+        self.assertGreater(len(result["all_trades"]), len(result["trades"]))
+        for trade in result["all_trades"]:
+            self.assertEqual(trade["selected"], trade["rank"] <= 5)
+        for comparison in result["cohorts"].values():
+            self.assertGreater(comparison["all"]["trade_count"], comparison["top"]["trade_count"])
+            self.assertEqual(comparison["all"]["signal_days"], comparison["top"]["signal_days"])
+
+    def test_liquidity_uses_prior_volume_not_the_signal_spike(self):
+        stock = self._rising_history()
+        stock["Volume"] = 50000.0
+        stock.loc[stock.index[40]:, "Volume"] = 2000000.0
+        result = news_bot._walk_forward_backtest(
+            {"AAA": stock}, {}, horizon_sessions=5, min_avg_volume=100000.0,
+        )
+        dates = {trade["signal_session"] for trade in result["all_trades"]}
+        self.assertNotIn(stock.index[40].strftime("%Y-%m-%d"), dates)
+        self.assertIn(stock.index[41].strftime("%Y-%m-%d"), dates)
+        self.assertGreater(result["liquidity_rejected"], 0)
+
+    def test_unknown_volume_fails_liquidity_but_can_be_explicitly_disabled(self):
+        stock = self._rising_history().drop(columns=["Volume"])
+        filtered = news_bot._walk_forward_backtest(
+            {"AAA": stock}, {}, horizon_sessions=5, min_avg_volume=100000.0,
+        )
+        unfiltered = news_bot._walk_forward_backtest(
+            {"AAA": stock}, {}, horizon_sessions=5, min_avg_volume=0.0,
+        )
+        self.assertEqual(filtered["trade_count"], 0)
+        self.assertGreater(unfiltered["trade_count"], 0)
+
+    def test_adverse_excursion_includes_entry_and_exit_session_lows(self):
+        stock = self._rising_history()
+        stock.loc[stock.index[30], "Low"] = 90.0
+        result = news_bot._walk_forward_backtest(
+            {"AAA": stock}, {}, horizon_sessions=5,
+        )
+        trade = next(
+            trade for trade in result["all_trades"]
+            if trade["signal_session"] == stock.index[29].strftime("%Y-%m-%d")
+        )
+        entry = float(stock.iloc[30]["Open"])
+        self.assertAlmostEqual(trade["adverse_excursion_pct"], (90.0 / entry - 1) * 100.0)
+
+    def test_trade_statistics_use_matched_subset_and_preserve_losses(self):
+        trades = [
+            {
+                "symbol": "A", "signal_session": "2025-01-01",
+                "net_return_pct": 2.0, "benchmark_return_pct": 1.0,
+                "excess_return_pct": 1.0, "adverse_excursion_pct": -3.0,
+            },
+            {
+                "symbol": "B", "signal_session": "2025-01-01",
+                "net_return_pct": -4.0, "benchmark_return_pct": None,
+                "excess_return_pct": None, "adverse_excursion_pct": -5.0,
+            },
+        ]
+        stats = news_bot._summarize_backtest_trades(trades)
+        self.assertEqual(stats["avg_net_return_pct"], -1.0)
+        self.assertEqual(stats["median_net_return_pct"], -1.0)
+        self.assertEqual(stats["avg_win_pct"], 2.0)
+        self.assertEqual(stats["avg_loss_pct"], -4.0)
+        self.assertEqual(stats["worst_return_pct"], -4.0)
+        self.assertEqual(stats["worst_adverse_excursion_pct"], -5.0)
+        self.assertEqual(stats["avg_matched_net_return_pct"], 2.0)
+        self.assertEqual(stats["avg_excess_return_pct"], 1.0)
+        self.assertEqual(stats["benchmark_count"], 1)
+        self.assertEqual(stats["signal_days"], 1)
+
+    def test_invalid_split_and_liquidity_are_rejected(self):
+        for split in ("2025-2-01", "2025-02-30"):
+            with self.assertRaises(ValueError):
+                news_bot._walk_forward_backtest({}, {}, horizon_sessions=5, holdout_start=split)
+        with self.assertRaises(ValueError):
+            news_bot._walk_forward_backtest({}, {}, horizon_sessions=5, min_avg_volume=-1)
+
+    def test_invalid_price_rows_are_not_dropped_to_shorten_horizon(self):
+        stock = self._rising_history()
+        stock.loc[stock.index[40], "Open"] = float("nan")
+        with self.assertLogs("news_bot", level="WARNING"):
+            result = news_bot._walk_forward_backtest({"AAA": stock}, {}, horizon_sessions=5)
+        self.assertEqual(result["usable_symbols"], 0)
+        self.assertEqual(result["trade_count"], 0)
+
+    def test_stock_evaluation_universe_excludes_fund_lists(self):
+        with patch.object(news_bot, "USA_STOCK_UNIVERSE", {"Alpha": "AAA"}), \
+             patch.object(news_bot, "INDIA_STOCK_UNIVERSE", {}), \
+             patch.object(news_bot, "NORWAY_STOCK_UNIVERSE", {}), \
+             patch.object(news_bot, "EU_STOCK_UNIVERSE", {}), \
+             patch.object(news_bot, "INDIA_MUTUAL_FUNDS", {"Fund": "FUND"}), \
+             patch.object(news_bot, "NORWAY_MUTUAL_FUNDS", {}):
+            self.assertEqual(news_bot._configured_stock_watchlist(), [("Alpha [USA Stock]", "AAA")])
+            self.assertIn(("Fund [India Fund]", "FUND"), news_bot._configured_watchlist())
+
+    def test_market_and_quarter_breakdowns_reconcile_with_holdout(self):
+        stocks = {"AAA.NS": self._rising_history(), "BBB.DE": self._rising_history()}
+        with patch.object(
+            news_bot.SETTINGS, "trade_backtest_benchmarks", ".NS:INDIA,.DE:GERMANY",
+        ):
+            result = news_bot._walk_forward_backtest(
+                stocks, {"INDIA": self._rising_history(step=0.1)}, horizon_sessions=5,
+                holdout_start="2025-03-10",
+            )
+        holdout = result["cohorts"]["holdout"]
+        self.assertEqual(set(holdout["by_market"]), {"INDIA", "GERMANY"})
+        self.assertEqual(holdout["by_market"]["GERMANY"]["all"]["benchmark_count"], 0)
+        for group in ("by_market", "by_quarter"):
+            for cohort in ("all", "top"):
+                self.assertEqual(
+                    sum(stats[cohort]["trade_count"] for stats in holdout[group].values()),
+                    holdout[cohort]["trade_count"],
+                )
+                self.assertEqual(
+                    sum(stats[cohort]["benchmark_count"] for stats in holdout[group].values()),
+                    holdout[cohort]["benchmark_count"],
+                )
+
+    def test_empty_holdout_is_explicit_not_a_success_result(self):
+        result = news_bot._walk_forward_backtest(
+            {"AAA": self._rising_history()}, {}, horizon_sessions=5,
+            holdout_start="2030-01-01",
+        )
+        self.assertIsNone(result["cohorts"]["holdout"]["top"]["avg_net_return_pct"])
+        result.update({
+            "horizon_sessions": 5, "period": "2y", "tested_symbols": 1,
+            "configured_symbols": 1, "fetch_failures": 0, "min_avg_volume": 100000,
+            "cost_bps_per_side": 10.0,
+        })
+        with patch.object(news_bot, "_run_walk_forward_backtest", return_value=result):
+            report = news_bot.build_trade_performance_report()
+        self.assertIn("Top 5: no completed trades.", report)
+        self.assertIn("No completed holdout trades.", report)
+
+    def test_backtest_features_match_live_metrics_on_same_history(self):
+        frame = self._rising_history()
+        expected = news_bot._backtest_metrics_by_session("AAA", frame)[1]
+        with patch.object(news_bot, "_fetch_ticker_history", return_value=frame):
+            live = news_bot._compute_trade_metrics("AAA")
+        self.assertIsNotNone(live)
+        replay = expected[live.session]
+        for field in (
+            "last_close", "day_change_pct", "week_momentum_pct", "volume_ratio",
+            "drawdown_pct", "atr_pct", "ema20", "rsi_14",
+        ):
+            self.assertAlmostEqual(getattr(live, field), getattr(replay, field))
+        self.assertEqual(news_bot._failed_gates(live), news_bot._failed_gates(replay))
+
+    def test_invalid_config_reports_error_without_fetching(self):
+        with patch.object(news_bot.SETTINGS, "trade_backtest_holdout_start", "bad-date"), \
+             patch.object(news_bot, "_fetch_ticker_history") as fetch, \
+             self.assertLogs("news_bot", level="ERROR"):
+            report = news_bot.build_trade_performance_report()
+        fetch.assert_not_called()
+        self.assertIn("Backtest configuration is invalid", report)
 
 
 def _metrics(**overrides):
@@ -1689,8 +2706,8 @@ class SignalEnrichmentTests(unittest.TestCase):
         volumes = pd.Series([1_000_000.0] * 20)
         self.assertEqual(news_bot._compute_volume_trend(volumes), "flat")
 
-    def test_volume_trend_flat_below_minimum_bars(self):
-        self.assertEqual(news_bot._compute_volume_trend(pd.Series([1_000_000.0] * 10)), "flat")
+    def test_volume_trend_unknown_below_minimum_bars(self):
+        self.assertEqual(news_bot._compute_volume_trend(pd.Series([1_000_000.0] * 10)), "unknown")
 
     def test_rsi_label_flags_overbought_and_oversold(self):
         self.assertIn("overbought", news_bot._rsi_label(75.0))
@@ -1726,6 +2743,52 @@ class TradeHistoryStoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["session_date"], "2026-08-10")
         self.assertEqual(rows[0]["qualified"], 1)
         self.assertIsNone(rows[0]["failed_gate"])
+
+    def test_migrates_old_non_nullable_volume_ratio_column(self):
+        path = os.path.join(tempfile.mkdtemp(), "legacy.db")
+        connection = sqlite3.connect(path)
+        connection.execute(
+            """
+            CREATE TABLE trade_metrics_history (
+                symbol TEXT NOT NULL,
+                session_date TEXT NOT NULL,
+                last_close REAL NOT NULL,
+                day_change_pct REAL NOT NULL,
+                week_momentum_pct REAL NOT NULL,
+                volume_ratio REAL NOT NULL,
+                drawdown_pct REAL NOT NULL,
+                atr_pct REAL NOT NULL,
+                above_ema20 INTEGER NOT NULL,
+                qualified INTEGER NOT NULL,
+                failed_gate TEXT,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, session_date)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO trade_metrics_history VALUES (
+                'OLD', '2026-08-09', 100.0, 1.0, 2.0, 1.5, 3.0, 2.0,
+                1, 1, NULL, '2026-08-09T00:00:00+00:00'
+            )
+            """
+        )
+        connection.commit()
+        connection.close()
+        store = news_bot.TradeHistoryStore(path)
+        self.addCleanup(store.close)
+        store.record(
+            _metrics(symbol="NOVOL", session="2026-08-10", volume_ratio=None),
+            qualified=True,
+            failed_gate=None,
+        )
+        rows = store.history("NOVOL", days=30, today="2026-08-13")
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["volume_ratio"])
+        old_rows = store.history("OLD", days=30, today="2026-08-13")
+        self.assertEqual(len(old_rows), 1)
+        self.assertEqual(old_rows[0]["volume_ratio"], 1.5)
 
     def test_rerun_on_same_session_overwrites_not_duplicates(self):
         store = self._store()
@@ -1771,43 +2834,6 @@ class TradeHistoryStoreTests(unittest.TestCase):
         self.assertEqual(len(store.history("BBB", days=30, today="2026-08-13")), 1)
         self.assertEqual(len(store.history("CCC", days=30, today="2026-08-13")), 0)
 
-    def test_qualifying_outcomes_computes_forward_return(self):
-        store = self._store()
-        store.record(
-            _metrics(symbol="OUT1", session="2026-01-01", last_close=100.0),
-            qualified=True, failed_gate=None,
-        )
-        store.record(
-            _metrics(symbol="OUT1", session="2026-01-10", last_close=110.0),
-            qualified=False, failed_gate="drawdown",
-        )
-        outcomes = store.qualifying_outcomes(lookback_days=5, today="2026-01-10")
-        self.assertEqual(len(outcomes), 1)
-        self.assertEqual(outcomes[0]["symbol"], "OUT1")
-        self.assertEqual(outcomes[0]["qualified_on"], "2026-01-01")
-        self.assertEqual(outcomes[0]["evaluated_on"], "2026-01-10")
-        self.assertAlmostEqual(outcomes[0]["forward_return_pct"], 10.0)
-
-    def test_qualifying_outcomes_skips_symbol_with_no_prior_qualifying_row(self):
-        store = self._store()
-        store.record(
-            _metrics(symbol="OUT2", session="2026-01-01", last_close=100.0),
-            qualified=False, failed_gate="trend",
-        )
-        store.record(
-            _metrics(symbol="OUT2", session="2026-01-10", last_close=110.0),
-            qualified=False, failed_gate="drawdown",
-        )
-        self.assertEqual(store.qualifying_outcomes(lookback_days=5, today="2026-01-10"), [])
-
-    def test_qualifying_outcomes_skips_symbol_with_no_later_session(self):
-        store = self._store()
-        store.record(
-            _metrics(symbol="OUT3", session="2026-01-01", last_close=100.0),
-            qualified=True, failed_gate=None,
-        )
-        self.assertEqual(store.qualifying_outcomes(lookback_days=5, today="2026-01-10"), [])
-
     def test_weekly_top_picks_ranks_by_qualifying_days_then_momentum(self):
         store = self._store()
         # STRONG: qualifies every session, highest momentum.
@@ -1849,42 +2875,6 @@ class TradeHistoryStoreTests(unittest.TestCase):
         store.record(_metrics(symbol="AAA", session="2026-01-07"), qualified=True, failed_gate=None)
         picks = store.weekly_top_picks(lookback_days=7, top_n=5, min_qualifying_days=2, today="2026-01-07")
         self.assertEqual(picks, [])
-
-
-class TradeOutcomeSummaryTests(unittest.TestCase):
-    def test_summarize_aggregates_hit_rate_and_average(self):
-        fake_outcomes = [
-            {"symbol": "A", "forward_return_pct": 10.0, "qualified_on": "x", "evaluated_on": "y"},
-            {"symbol": "B", "forward_return_pct": -2.0, "qualified_on": "x", "evaluated_on": "y"},
-        ]
-        with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=fake_outcomes):
-            summary = news_bot._summarize_trade_outcomes(lookback_days=5)
-        self.assertEqual(summary["count"], 2)
-        self.assertEqual(summary["hit_rate_pct"], 50.0)
-        self.assertAlmostEqual(summary["avg_forward_return_pct"], 4.0)
-
-    def test_summarize_handles_no_outcomes(self):
-        with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=[]):
-            summary = news_bot._summarize_trade_outcomes(lookback_days=5)
-        self.assertEqual(summary["count"], 0)
-        self.assertIsNone(summary["hit_rate_pct"])
-        self.assertIsNone(summary["avg_forward_return_pct"])
-
-    def test_report_renders_outcomes_and_footer(self):
-        fake_outcomes = [
-            {"symbol": "A", "forward_return_pct": 10.0, "qualified_on": "2026-01-01", "evaluated_on": "2026-01-10"},
-        ]
-        with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=fake_outcomes):
-            report = news_bot.build_trade_performance_report(lookback_days=5)
-        self.assertIn("1 outcome(s)", report)
-        self.assertIn("hit rate 100%", report)
-        self.assertIn("A", report)
-        self.assertIn("Informational only", report)
-
-    def test_report_handles_empty_history_gracefully(self):
-        with patch.object(news_bot.TRADE_HISTORY, "qualifying_outcomes", return_value=[]):
-            report = news_bot.build_trade_performance_report(lookback_days=5)
-        self.assertIn("No outcomes to evaluate yet", report)
 
 
 class WeeklyTopPicksReportTests(unittest.TestCase):
@@ -2296,25 +3286,6 @@ class TradeRenderingTests(unittest.TestCase):
         self.assertIn("reward:risk 1.0:1", result)
 
 
-class DeprecatedSettingTests(unittest.TestCase):
-    def test_warns_when_trade_min_score_is_customised(self):
-        with patch.object(news_bot.SETTINGS, "trade_min_score", 5):
-            with self.assertLogs(news_bot.LOGGER, level="WARNING") as logs:
-                news_bot._warn_deprecated_settings()
-        self.assertTrue(any("TRADE_MIN_SCORE" in line for line in logs.output))
-
-    def test_silent_at_default_value(self):
-        default = news_bot.AppSettings.model_fields["trade_min_score"].default
-        with patch.object(news_bot.SETTINGS, "trade_min_score", default):
-            with patch.object(news_bot.LOGGER, "warning") as mock_warn:
-                news_bot._warn_deprecated_settings()
-        mock_warn.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TradeChecksHeadingTests(unittest.TestCase):
     """The checks heading must not claim candidates passed when none did."""
 
@@ -2669,12 +3640,12 @@ class LogRoutingTests(unittest.TestCase):
 
 
 class StickyUniverseTests(unittest.TestCase):
-    """The continuity tier that lets /stocks and /performance have data.
+    """The continuity tier that lets /stocks build weekly pick history.
 
     Discovery returns a near-different set of movers every session, so a
-    symbol screened once was never looked at again -- and both of those
-    commands read recorded history rather than live prices, so neither could
-    ever say anything about a symbol seen exactly once.
+    symbol screened once was never looked at again -- and /stocks reads
+    recorded history rather than live prices, so it could not say anything
+    about a symbol seen exactly once.
     """
 
     def setUp(self):
@@ -2735,14 +3706,12 @@ class StickyUniverseTests(unittest.TestCase):
             universe = news_bot._build_candidate_universe(10)
         self.assertEqual([symbol for _, symbol in universe].count("AAPL"), 1)
 
-    def test_retention_floor_outlasts_every_reader_window(self):
-        """prune used to delete at the 14-day retention default regardless of
-        how far back the reports actually read, silently truncating them."""
+    def test_retention_floor_outlasts_history_readers(self):
         with patch.object(news_bot.SETTINGS, "trade_history_retention_days", 14), \
              patch.object(news_bot.SETTINGS, "trade_outcome_lookback_days", 30), \
              patch.object(news_bot.SETTINGS, "trade_sticky_universe_days", 10), \
              patch.object(news_bot.SETTINGS, "trade_weekly_top_picks_lookback_days", 7):
-            self.assertEqual(news_bot._effective_history_retention_days(), 40)
+            self.assertEqual(news_bot._effective_history_retention_days(), 21)
 
 
 class RankingQualityTests(unittest.TestCase):

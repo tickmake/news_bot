@@ -26,7 +26,7 @@ The bot is built in Python and scheduled with APScheduler.
 - **Relevance-ranked headlines** by importance, topic weight, and recency — not raw feed order.
 - **Cross-outlet and cross-day deduplication**, so one story appears once.
 - **Local LLM ranking** via Ollama — no API key, no data leaves your network — with a deterministic heuristic fallback.
-- **Telegram command support** (`/now`, `/news`, `/recommendations`, `/stocks`, `/watchlist`, `/analyze`, `/performance`, `/health`).
+- **Telegram command support** (`/now`, `/news`, `/recommendations`, `/stocks`, `/watchlist`, `/analyze`, `/performance`, `/diagnostics`, `/pickperformance`, `/health`).
 - **Optional Slack mirror** of every outbound message via an incoming webhook, alongside Telegram.
 - **Health ping** support for runtime monitoring.
 - **CI test workflow** via GitHub Actions.
@@ -318,9 +318,6 @@ universe variables above).
 
 ### Trade Risk Controls
 
-- `TRADE_MIN_SCORE` - **deprecated and ignored.** Candidates now pass mandatory
-  gates rather than reaching a score threshold. Setting it logs a warning at
-  startup.
 - `TRADE_MIN_WEEK_MOMENTUM_PCT`
 - `TRADE_MIN_DAY_CHANGE_PCT`
 - `TRADE_MIN_VOLUME_RATIO` - threshold for the `✓` volume-confirmation marker,
@@ -373,11 +370,11 @@ Each run fills `TRADE_UNIVERSE_MAX` slots in three tiers, in order:
    whatever is left, with at least `TRADE_DISCOVERY_MIN_SLOTS` (default `10`)
    slots reserved so a long-lived tracked set can never freeze the universe.
 
-Tier 2 exists because `/stocks` and `/performance` read *recorded history*
-rather than live prices, so they can only speak about symbols re-screened
-across several sessions. Discovery alone returns a near-different set of
-movers every day, so before this tier a discovered mover was measured once
-and never looked at again — meaning neither command could ever evaluate one.
+Tier 2 exists because `/stocks` reads *recorded screening history* rather than
+live prices, so it can only speak about symbols re-screened across several
+sessions. Discovery alone returns a near-different set of movers every day, so
+before this tier a discovered mover was measured once and never looked at
+again.
 
 - `TRADE_STICKY_UNIVERSE_DAYS` - how long a seen symbol is carried forward (default `10`)
 - `TRADE_DISCOVERY_MIN_SLOTS` - slots always reserved for fresh discovery (default `10`)
@@ -391,8 +388,10 @@ Every screening run records what it measured for every symbol it looked at —
 qualified or not — in a local SQLite file (stdlib `sqlite3`, no extra
 dependency). This is separate from the yfinance history cache above: it's a
 rolling memory of the screener's own daily output, used to see streaks (e.g.
-a symbol qualifying several sessions running) and, later, whether qualifying
-days actually paid off.
+a symbol qualifying several sessions running) and weekly picks. `/performance`
+uses historical daily bars for a separate walk-forward test.
+Successfully delivered candidate lists are also recorded in a separate,
+non-pruned table in the same DB for `/pickperformance`; keep this volume backed up.
 
 - `TRADE_HISTORY_DB_FILE` - SQLite file path (default `.news_bot_trade_history.db`; under docker compose it points into the `news_bot_data` volume at `/app/data`)
 - `TRADE_HISTORY_RETENTION_DAYS` - rolling window kept before older rows are pruned (default `14`)
@@ -415,7 +414,7 @@ Each qualifying candidate's block also shows:
 
 - **RSI(14)**, flagged `(overbought)` at 70+ or `(oversold)` at 30 or below.
 - **Volume trend** — the last 5 sessions' average volume vs. the 15 before
-  that, as `rising`, `falling`, or `flat`.
+  that, as `rising`, `falling`, `flat`, or `unknown` when data is insufficient.
 - **Session streak** — how many recent sessions running (today included)
   the symbol has qualified, once that's 2 or more; backed by the trade
   signal history above.
@@ -424,6 +423,11 @@ Each qualifying candidate's block also shows:
   pullback zone between the recent low and the 20-day EMA, the level a
   close below which invalidates the setup, and the resulting reward-to-risk
   ratio. Technical-only, not a recommendation — see the disclaimer below.
+
+Relative volume compares the last completed session with the prior 20
+sessions, excluding that session from its own baseline. If usable volume is
+unavailable, the candidate displays `n/a` and `unknown`, and sorts as
+unconfirmed rather than assuming a neutral `1.0×` ratio.
 
 ## Scheduling
 
@@ -453,7 +457,9 @@ After sending `/start` to the bot, you can use:
 - `/stocks` - send this week's top picks, ranked by how consistently they've qualified — see below
 - `/watchlist` - send every configured watchlist symbol with today's read and its verdict — see below
 - `/analyze TICKER` - send a deep-dive report for one symbol, e.g. `/analyze AAPL`
-- `/performance` - send how the trade screener's past qualifying picks have done
+- `/performance` - run a walk-forward test of current trade rules against market benchmarks
+- `/diagnostics` - break down historical signal outcomes and compare ranking on matching dates
+- `/pickperformance` - evaluate fixed-session outcomes of successfully delivered stock picks
 - `/health` - send runtime health report
 
 `/morning` and `/evening` (forcing the greeting/tone of the scheduled
@@ -542,10 +548,10 @@ symbols by:
 
 A symbol only appears if it qualified at least
 `TRADE_WEEKLY_TOP_PICKS_MIN_QUALIFYING_DAYS` times (default `2`) in the
-window — a one-off qualifying day is filtered out as noise. Like
-`/performance`, this is a pure SQLite read (no fresh yfinance calls), so it
-needs a few days of the screener actually running before it has anything to
-rank; check `/recommendations` or `/watchlist` in the meantime.
+window — a one-off qualifying day is filtered out as noise. This is a pure
+SQLite read (no fresh yfinance calls), so it needs a few days of the screener
+actually running before it has anything to rank; check `/recommendations` or
+`/watchlist` in the meantime.
 
 The window is counted in **recorded sessions**, not calendar days — a symbol
 is ranked over its last `TRADE_WEEKLY_TOP_PICKS_LOOKBACK_DAYS` rows. It used
@@ -577,23 +583,208 @@ scheduled 07:00/19:00 briefing, so it adds no load there.
 
 ### `/performance`
 
-Whether the trade screener's own past qualifying picks actually paid off:
-for each symbol with a qualifying session roughly `TRADE_OUTCOME_LOOKBACK_DAYS`
-sessions ago (default `5`) that has been screened again since, it reports the
-forward price move, plus an aggregate hit rate and average return. Computed
-on demand from the trade signal history (SQLite) above — no yfinance calls
-— since the screener already records every session's outcome as it runs;
-there is nothing to pre-materialize with a separate scheduled job.
+Runs an on-demand walk-forward backtest of the current gates and ranking rules
+over split- and dividend-adjusted historical daily bars for the **evaluation
+stock universe** (fund lists are excluded). By default this uses the currently
+configured stock lists; the opt-in fixed basket below broadens coverage without
+changing live picks. A signal is measured at a
+completed close, entered at the next session's open, and exited at the close after
+`TRADE_OUTCOME_LOOKBACK_DAYS` market sessions. All liquid qualifiers are
+evaluated alongside the top five ranked on each signal date, so you can assess
+whether ranking adds value. The live recommendation rules remain unchanged.
 
-This is best-effort: it only sees a symbol's outcome if that symbol was
-screened both on its qualifying day and again near today. Configured
-watchlist symbols are screened every session, and discovered movers are
-carried forward for `TRADE_STICKY_UNIVERSE_DAYS` after they are first seen
-(see [Which symbols get screened](#which-symbols-get-screened)) — without
-that carry-forward a discovered mover was measured exactly once and could
-never produce an outcome at all.
+**Development versus holdout:** `TRADE_BACKTEST_HOLDOUT_START` sets a fixed
+`YYYY-MM-DD` boundary. When blank, the last 25% of available signal dates are
+reserved automatically, without consulting returns. Freeze the displayed
+boundary before tuning; the automatic date moves as new data arrives. Only
+development trades whose exits are strictly before the boundary count, so a
+development return never uses holdout prices. Holdout indicators can still use
+earlier bars for warm-up. Trades without enough future sessions are counted as
+pending, not treated as wins or losses. No parameter optimization happens
+automatically, and a date split cannot guarantee you have never inspected it.
 
-- `TRADE_OUTCOME_LOOKBACK_DAYS` - sessions after qualifying to evaluate the outcome (default `5`)
+**Historical liquidity:** the evaluation requires at least
+`TRADE_BACKTEST_MIN_AVG_VOLUME` shares/day averaged over the 20 sessions *before*
+each signal (default `100000`). Missing baseline data fails that check; `0`
+disables it. This is a currency-independent volume proxy, not a guarantee of
+low spreads, adequate turnover, or executable fills. Use a stable, representative
+stock list chosen before tuning; today's discovery movers are not reconstructed
+as a historical universe. Misclassified funds placed in a stock list are still
+the user's responsibility.
+
+Returns are adjusted by an estimated round-trip transaction cost, calculated
+as twice `TRADE_BACKTEST_COST_BPS`. Benchmark returns and average excess return
+are reported only when matching benchmark bars exist for the stock's entry and
+exit dates. The default benchmark map uses broad exchange indices, with `SPY`
+for symbols without an exchange suffix. Customize `TRADE_BACKTEST_BENCHMARKS`
+to match the markets in your watchlist; unknown suffixes, invalid benchmark
+symbols, or unavailable bars reduce benchmark coverage rather than silently
+substituting an unrelated series. Index proxies can differ in dividend
+treatment; use a suitable total-return or adjusted ETF benchmark where possible.
+
+The report separates development/holdout results for all qualifiers and the top
+five. It includes mean and median net return, average win/loss, worst net
+return, and average/worst adverse price excursion from entry to the lowest
+intraday low during the hold. Excursions are price-only and do not simulate
+stops. Holdout results are also broken down by benchmark market and signal
+quarter, including benchmark coverage. Excess return is calculated only on the
+matched subset; unmatched trades are not counted as benchmark wins.
+
+**Validate before tuning:** the same report also evaluates unchanged picks in
+calendar-quarter blocks at the configured cost, plus 15 and 40 bps per side
+(defaults: 10, 25, and 50 bps per side). Costs are recalculated from gross returns;
+signals, ranking, liquidity, and holding horizon are identical across scenarios.
+This section excludes holds whose exits reach a later quarter, in addition to
+the existing development/holdout purge, so block outcomes do not use a later
+quarter's prices. The original overall results remain unchanged. Each block
+shows dates, stock/signal counts, net return and matched benchmark excess for
+all qualifiers and the top five. Partial quarters and unavailable benchmark
+matches must not be interpreted as full-period or whole-universe performance.
+
+These are descriptive chronological blocks, not independent cross-validation
+folds, a parameter search, or a profitability pass/fail test. Inspect consistency
+across periods and cost assumptions before proposing a rule change. The
+April-September 2026 holdout used during development has already been inspected;
+it is exploratory evidence for subsequent changes, not fresh validation.
+Nothing in this evaluation changes live recommendation thresholds.
+
+This is a validation aid, not a portfolio simulation: trades overlap and the
+per-trade averages do not represent an investable equity curve. Testing the
+current watchlist also has survivorship and universe-selection bias, and the
+cost assumption may not match actual spreads, fees, taxes, or slippage. Do not
+tune thresholds and judge them on the same sample; reserve a later period for
+out-of-sample validation. Trade counts are not independent sample sizes; the
+report also shows distinct signal dates and stocks, and avoids misleading
+independent-trade confidence intervals. The assumed next-open fills are not a
+simulation of the bot's actual briefing delivery time.
+
+- `TRADE_OUTCOME_LOOKBACK_DAYS` - backward-compatible setting name for the
+  holding horizon in trading sessions (default `5`)
+- `TRADE_BACKTEST_PERIOD` - historical bars fetched for the backtest (default `2y`)
+- `TRADE_BACKTEST_UNIVERSE` - `configured` (default) or the fixed `broad-v1` basket
+- `TRADE_BACKTEST_UNIVERSE_MAX` - evaluation-only symbol limit (default `100`);
+  replaces use of the live `TRADE_UNIVERSE_MAX` cap in historical evaluation
+- `TRADE_BACKTEST_COST_BPS` - estimated cost per side in basis points (default `10`)
+- `TRADE_BACKTEST_HOLDOUT_START` - fixed holdout boundary, `YYYY-MM-DD`; blank
+  reserves the final 25% of available signal dates
+- `TRADE_BACKTEST_MIN_AVG_VOLUME` - minimum prior 20-session average share
+  volume for evaluation (default `100000`; `0` disables)
+- `TRADE_BACKTEST_BENCHMARKS` - comma-separated `suffix:ticker` mappings and
+  `DEFAULT:ticker` fallback (default uses SPY and common exchange indices)
+
+### Broader evaluation universe
+
+Set `TRADE_BACKTEST_UNIVERSE=broad-v1` and restart to evaluate the fixed basket in
+[evaluation_universe.csv](./evaluation_universe.csv) with `/performance` and
+`/diagnostics`. The basket was frozen on **2026-10-02** with 44 single-listed
+stocks: 11 US, 14 continental European, 11 Indian, and 8 Norwegian names.
+It spans 11 broad sector labels. The US and India portions each include one
+name per sector; Europe retains the original 14 names, and Norway adds
+energy, banking, telecom, food, materials, and industrial exposure. Sector
+labels are descriptive manual classifications, not a maintained index feed.
+
+Names were chosen as a small, recognizable cross-market basket, not selected by
+backtest returns. This is neither an exhaustive nor statistically representative
+universe, and not every market has every sector. It does **not** reconstruct
+historical index membership, include delisted stocks, or eliminate survivorship
+and discretionary-selection bias. Keep this manifest fixed during experiments;
+version a changed basket rather than removing stocks because they lost money.
+Funds and duplicate listings are not intentionally included. Missing or invalid
+price histories are disclosed, never replaced by retrospectively chosen winners.
+
+Both reports show usable/tested/configured coverage by market and sector,
+missing stock histories, unusable stock histories, and missing benchmark
+symbols. `/performance` additionally breaks holdout returns down by the basket's
+markets and sectors. All markets compete in one top-five ranking; these are
+per-signal local-price returns, **not** a currency-converted global portfolio.
+Exchange holidays can differ. The historical liquidity filter still applies
+per signal and is a shares/day proxy, not a cross-market turnover measure.
+Global ranks compare exchange-local calendar dates, not synchronized UTC closes;
+they are not an executable cross-market allocation simulation.
+
+The basket does not alter `/recommendations`, `/stocks`, `/watchlist`, discovery,
+or the delivered-pick ledger. No new dependencies are needed; the Docker image
+includes the manifest. The independent evaluation cap defaults to 100 so the
+44-stock basket is not cut down by the live screener's default cap of 30.
+If you lower it, selection follows manifest order and omitted counts/coverage
+are shown; do not treat a truncated basket as the full four-market test.
+Benchmark mappings remain configurable. An unavailable Italian benchmark is
+reported rather than silently substituted; choose a verified suitable proxy
+before interpreting benchmark-relative results.
+
+### `/diagnostics`
+
+Uses the same historical evaluation, liquidity filter, costs, universe, and
+development/holdout purge as `/performance`, without changing live gates or
+ranking. This is **not** a report of delivered recommendations.
+
+For each cohort, it reports all completed qualifiers grouped by exact rank,
+five-session momentum (`<3%`, `3-6%`, `>=6%`), volume confirmation (the configured
+`TRADE_MIN_VOLUME_RATIO`, with unknown separate), RSI (`<70`, `>=70`, unknown),
+ATR (`<2%`, `>=2%`), qualifying streak (`1`, `2-3`, `>=4`), stock, and quarter.
+Metrics and streaks are captured at signal time using only earlier/current bars.
+These broad diagnostic buckets are fixed descriptions, not new selection
+thresholds or an automatic parameter search. Each slice shows signal/date/stock
+counts, mean/median net return, hit rate, average win/loss, average/worst adverse
+excursion, and matched benchmark excess/coverage.
+
+The paired ranking comparison first computes the average return of the top five
+minus that of the non-selected qualifiers **on each common signal date**, then
+averages those differences with equal weight per date. Positive values favor
+selected picks. It excludes observed dates without both groups or without outcomes
+for every liquid qualifier (including pending or purged outcomes); it never
+backfills a missing selected pick with a lower-ranked stock. Benchmark-relative
+pairs additionally require matching benchmark returns for every qualifier on the
+date. Dates with no completed outcomes do not appear in this comparison; global
+pending/purge counts are shown separately.
+
+Groups overlap and indicators are correlated. A good-looking slice, particularly
+one containing few stocks or dates, is not proof of a profitable rule. Use stock
+and quarter slices to spot concentration, and development data to formulate a
+small number of hypotheses. An already inspected holdout is exploratory evidence,
+not untouched validation for changes motivated by these results. The command does
+not tune rules or claim statistical significance. Large universes can produce
+multiple Telegram message parts.
+
+### `/pickperformance`
+
+Tracks the picks actually shown in successful **Telegram text deliveries** from
+`/recommendations`, `/now`, and scheduled briefings. Failed sends, chart uploads,
+Slack-only delivery, and other screening commands do not create ledger entries.
+Only the displayed top five are recorded, using the same screening result as
+the message. No past deliveries are inferred or backfilled from screening history.
+Repeated delivery of the same stock and signal session counts once; the first
+successful delivery fixes its UTC publication time, rank, metric/rule snapshot,
+holding horizon, cost, and benchmark. Different signal sessions remain separate.
+Persistence failures are logged explicitly; they cannot undo a delivered message.
+
+Returns are **hypothetical post-publication outcomes, not executed trades**.
+Adjusted daily bars are used to enter at the first session's open strictly after
+the publication's exchange-local calendar date (and after the signal session).
+The exit is the close of the frozen `TRADE_OUTCOME_LOOKBACK_DAYS`-th held session.
+This conservative convention never reuses an open from before delivery, even if
+the message arrived before that day's market open. The current day's bar is
+excluded, so outcomes may appear one session late. Missing exchange timezones or
+unusable prices are reported as unavailable; insufficient future bars are pending,
+not losses. Provider data can still omit sessions or contain later adjustments.
+
+The report covers the **latest 100 unique published signals**, with aggregate
+mean/median net return, hit rate, matched benchmark coverage and excess return,
+and details for up to ten completed signals. Costs subtract twice the frozen
+`TRADE_BACKTEST_COST_BPS`. Benchmark returns use the same entry/exit dates; no
+missing benchmark is treated as zero. Completed outcomes, including missing
+benchmark matches, are stored once and not rewritten after setting changes or
+data revisions. Pending/unavailable outcomes are retried on later reports.
+Full available history is requested only for unevaluated symbols and reused
+within a report and by the existing history cache.
+
+The ledger shares `TRADE_HISTORY_DB_FILE` and the existing Docker data volume;
+no new deployment settings or dependencies are needed. It is not removed by
+`TRADE_HISTORY_RETENTION_DAYS`. Only the report window is capped, not ledger
+retention. An unevaluated signal older than that window will no longer be
+evaluated by this command. Overlapping picks are not independent observations
+or a portfolio equity curve. `/performance` remains the historical current-rule
+backtest; live recommendation thresholds are unchanged.
 
 ## Slack Integration
 
