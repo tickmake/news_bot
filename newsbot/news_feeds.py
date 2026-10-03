@@ -263,7 +263,7 @@ def _fetch_newsapi_items(
     api_key = (SETTINGS.news_api_key or "").strip()
     if not api_key:
         return []
-    params: Dict[str, Any] = {"pageSize": max_items, "apiKey": api_key}
+    params: Dict[str, Any] = {"pageSize": max_items}
     if scope == "norway":
         params["country"] = "no"
     else:
@@ -276,6 +276,8 @@ def _fetch_newsapi_items(
             lambda: requests.get(
                 "https://newsapi.org/v2/top-headlines",
                 params=params,
+                # Header rather than `?apiKey=` so the key stays out of exception text.
+                headers={"X-Api-Key": api_key},
                 timeout=SETTINGS.request_timeout_seconds,
             ),
             f"newsapi_{scope}",

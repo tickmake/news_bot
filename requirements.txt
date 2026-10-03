@@ -1,10 +1,10 @@
 # Pinned for reproducible builds. yfinance is version-sensitive (see the
 # DNSError shim in news_bot.py); upgrade deliberately.
-requests==2.31.0
+requests==2.33.0
 yfinance==0.2.66
 # yfinance now imports curl_cffi unconditionally, so it must be installed
 # (the old YF_NO_CURL_CFFI / uninstall workaround no longer applies).
-curl_cffi==0.13.0
+curl_cffi==0.15.0
 apscheduler==3.10.4
 # Feed bodies are untrusted third-party input; stdlib ElementTree is
 # vulnerable to XML entity-expansion denial of service.
