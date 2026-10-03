@@ -99,7 +99,58 @@ def _commit_briefing(briefing: Briefing) -> None:
         STATE.record_recent_title(title, date_key)
 
 
-def job_daily_briefing(force_hour: Optional[int] = None) -> bool:
+BRIEFING_HOURS = (7, 19)
+# How long after a slot a restarted bot will still send the briefing it missed.
+CATCHUP_WINDOW_HOURS = 3
+
+
+def _latest_slot(now: datetime) -> Optional[Tuple[str, datetime]]:
+    """The most recent scheduled slot at or before `now` today, as (key, time)."""
+    due = [hour for hour in BRIEFING_HOURS if hour <= now.hour]
+    if not due:
+        return None
+    slot_time = now.replace(hour=max(due), minute=0, second=0, microsecond=0)
+    return f"{slot_time:%Y-%m-%d}@{slot_time.hour:02d}", slot_time
+
+
+def missed_briefing_slot(now: Optional[datetime] = None) -> Optional[str]:
+    """Slot key of a scheduled briefing that never went out, if one is recent.
+
+    The in-memory APScheduler job store computes the first fire time from the
+    moment of startup, so a restart or redeploy at 07:00:30 skips the 07:00
+    briefing without any misfire being recorded. Compare against the slot that
+    last *succeeded* instead. A state file with no record at all (first start
+    after this feature, or a fresh volume) is not treated as a miss, otherwise
+    every first boot would send a duplicate.
+    """
+    now = now or datetime.now()
+    latest = _latest_slot(now)
+    if latest is None:
+        return None
+    key, slot_time = latest
+    if (now - slot_time).total_seconds() > CATCHUP_WINDOW_HOURS * 3600:
+        return None
+    recorded = STATE.data.get("last_scheduled_slot")
+    if not recorded or recorded == key:
+        return None
+    return key
+
+
+def job_scheduled_briefing() -> bool:
+    """The cron entry point: a briefing that also records which slot it served."""
+    latest = _latest_slot(datetime.now())
+    return job_daily_briefing(slot=latest[0] if latest else None)
+
+
+def job_catchup_briefing() -> bool:
+    slot = missed_briefing_slot()
+    if slot is None:
+        return True
+    APP_LOG.warning("briefing_catchup slot=%s", slot)
+    return job_daily_briefing(slot=slot)
+
+
+def job_daily_briefing(force_hour: Optional[int] = None, slot: Optional[str] = None) -> bool:
     run_time = datetime.now()
     if force_hour is not None:
         run_time = run_time.replace(hour=force_hour, minute=0, second=0, microsecond=0)
@@ -108,6 +159,8 @@ def job_daily_briefing(force_hour: Optional[int] = None) -> bool:
     success = messaging._broadcast_message(briefing.message)
     if success:
         _commit_briefing(briefing)
+        if slot:
+            STATE.data["last_scheduled_slot"] = slot
     else:
         APP_LOG.warning("briefing_send_failed headlines_not_marked=%d", len(briefing.pending))
     STATE.data["last_run_status"] = "success" if success else "failed"

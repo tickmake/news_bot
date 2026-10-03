@@ -61,7 +61,10 @@ def _fetch_finnhub_quote(symbol: str) -> Optional[Dict[str, float]]:
         response = _with_retry(
             lambda: requests.get(
                 f"{SETTINGS.finnhub_api_url.rstrip('/')}/quote",
-                params={"symbol": symbol, "token": api_key},
+                params={"symbol": symbol},
+                # A header, not `?token=`: query strings end up in exception
+                # text and therefore in the logs.
+                headers={"X-Finnhub-Token": api_key},
                 timeout=timeout_seconds,
             ),
             f"finnhub_quote_{symbol}",

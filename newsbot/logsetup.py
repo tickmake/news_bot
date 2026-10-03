@@ -1,6 +1,7 @@
 """Banded INFRA/SYSTEM/APP logging."""
 
 import logging
+import re
 import sys
 from datetime import datetime
 from typing import Dict, Optional, Tuple
@@ -53,6 +54,28 @@ def _band_for(logger_name: str) -> str:
     return BAND_INFRA
 
 
+# Credentials reach log lines through exception text: requests' HTTPError and
+# ConnectionError messages embed the full request URL, and Telegram puts the bot
+# token in the URL path while news/market APIs put theirs in the query string.
+# Scrubbing at the formatter covers every call site, including ones added later.
+_REDACTED = "***"
+_SECRET_PATTERNS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"/bot\d+:[A-Za-z0-9_-]+"), "/bot" + _REDACTED),
+    (re.compile(r"\bbot\d{6,}:[A-Za-z0-9_-]{20,}"), "bot" + _REDACTED),
+    (re.compile(r"(?i)\b((?:api[_-]?key|apikey|token|access_token|key)=)[^&\s'\"<>)]+"), r"\1" + _REDACTED),
+    (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1" + _REDACTED),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]+"), _REDACTED),
+    (re.compile(r"(https://hooks\.slack\.com/services/)[A-Za-z0-9/_-]+"), r"\1" + _REDACTED),
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Mask tokens, API keys and webhook URLs in a log message."""
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 _ANSI: Dict[str, str] = {
     "reset": "\033[0m",
     "dim": "\033[2m",
@@ -83,12 +106,12 @@ class BandedFormatter(logging.Formatter):
         # measured at that resolution; durations are logged as latency_ms=.
         stamp = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
 
-        message = record.getMessage()
+        message = redact_secrets(record.getMessage())
         if band == BAND_INFRA:
             # "Scheduler started" says nothing about who said it.
             message = f"{record.name} | {message}"
         if record.exc_info:
-            message = f"{message}\n{self.formatException(record.exc_info)}"
+            message = f"{message}\n{redact_secrets(self.formatException(record.exc_info))}"
 
         band_text = f"{band:<5}"
         level_text = f"{level:<5}"

@@ -3,7 +3,7 @@
 import json
 import re
 from html import unescape
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests.exceptions
 
@@ -12,54 +12,119 @@ from newsbot.logsetup import APP_LOG, SYS_LOG
 from newsbot.util import _truncate, _with_retry
 
 
+# Tags this bot emits that Telegram requires to be balanced within one message.
+_TAG_RE = re.compile(r"<(/?)(b|i|u|s|code|pre|a)\b([^>]*)>", re.IGNORECASE)
+# Headroom for the closers/reopeners added at a split plus the "Part i/n" prefix.
+_SPLIT_RESERVE = 96
+
+
+def _hard_split(line: str, limit: int) -> List[str]:
+    """Break one over-long line, preferring a space, never inside a tag or entity."""
+    pieces: List[str] = []
+    while len(line) > limit:
+        cut = line.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        # Do not cut inside "<...>" or "&...;".
+        for opener, closer in (("<", ">"), ("&", ";")):
+            last_open = line.rfind(opener, 0, cut)
+            if last_open != -1 and line.find(closer, last_open, cut) == -1:
+                cut = last_open if last_open > 0 else cut
+        pieces.append(line[:cut])
+        line = line[cut:].lstrip(" ")
+    if line:
+        pieces.append(line)
+    return pieces
+
+
+def _rebalance_tags(chunks: List[str]) -> List[str]:
+    """Close tags left open at the end of a chunk and reopen them in the next.
+
+    Splitting at blank lines or newlines can land inside a <pre> table or a
+    <b> span. Telegram rejects an unbalanced message outright, which loses the
+    whole chunk, so each chunk is made self-contained.
+    """
+    balanced: List[str] = []
+    carried: List[Tuple[str, str]] = []  # (name, full opening tag)
+    for chunk in chunks:
+        chunk = "".join(opening for _, opening in carried) + chunk
+        stack: List[Tuple[str, str]] = []
+        for match in _TAG_RE.finditer(chunk):
+            name = match.group(2).lower()
+            if match.group(1):
+                for index in range(len(stack) - 1, -1, -1):
+                    if stack[index][0] == name:
+                        del stack[index:]
+                        break
+            else:
+                stack.append((name, match.group(0)))
+        balanced.append(chunk + "".join(f"</{name}>" for name, _ in reversed(stack)))
+        carried = stack
+    return balanced
+
+
 def _split_message_html(message: str, max_chars: int) -> List[str]:
     if len(message) <= max_chars:
         return [message]
+    limit = max(1, max_chars - _SPLIT_RESERVE)
     sections = message.split("\n\n")
     chunks: List[str] = []
     current = ""
     for section in sections:
         candidate = section if not current else f"{current}\n\n{section}"
-        if len(candidate) <= max_chars:
+        if len(candidate) <= limit:
             current = candidate
             continue
         if current:
             chunks.append(current)
-        if len(section) <= max_chars:
+        if len(section) <= limit:
             current = section
             continue
-        lines = section.splitlines()
         current = ""
-        for line in lines:
-            candidate_line = line if not current else f"{current}\n{line}"
-            if len(candidate_line) <= max_chars:
-                current = candidate_line
-            else:
-                if current:
-                    chunks.append(current)
-                current = line
+        for line in section.splitlines():
+            for piece in _hard_split(line, limit):
+                candidate_line = piece if not current else f"{current}\n{piece}"
+                if len(candidate_line) <= limit:
+                    current = candidate_line
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = piece
         if current:
             chunks.append(current)
             current = ""
     if current:
         chunks.append(current)
-    return chunks
+    return _rebalance_tags(chunks)
 
 
-def _telegram_post(chat_id: str, message: str) -> None:
+def _plain_text(message: str) -> str:
+    """Telegram HTML reduced to readable plain text, for the parse-error fallback."""
+    return unescape(re.sub(r"<[^>]+>", "", message))
+
+
+def _telegram_post(chat_id: str, message: str, html: bool = True) -> None:
     def _send() -> requests.Response:
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": message,
+            "disable_web_page_preview": True,
+        }
+        if html:
+            payload["parse_mode"] = "HTML"
         return requests.post(
             f"https://api.telegram.org/bot{SETTINGS.telegram_token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
+            json=payload,
             timeout=SETTINGS.request_timeout_seconds,
         )
 
     response = _with_retry(_send, "telegram_send")
+    if html and response.status_code == 400 and "parse entities" in (response.text or "").lower():
+        # Malformed markup must not cost the reader the message: resend it as
+        # plain text rather than dropping it.
+        APP_LOG.warning("telegram_html_rejected resending_plain")
+        _telegram_post(chat_id, _plain_text(message), html=False)
+        return
     response.raise_for_status()
 
 
