@@ -26,7 +26,7 @@ The bot is built in Python and scheduled with APScheduler.
 - **Relevance-ranked headlines** by importance, topic weight, and recency — not raw feed order.
 - **Cross-outlet and cross-day deduplication**, so one story appears once.
 - **Local LLM ranking** via Ollama — no API key, no data leaves your network — with a deterministic heuristic fallback.
-- **Telegram command support** (`/now`, `/news`, `/recommendations`, `/stocks`, `/watchlist`, `/analyze`, `/performance`, `/diagnostics`, `/pickperformance`, `/health`).
+- **Telegram command support** (`/now`, `/news`, `/recommendations`, `/stocks`, `/watchlist`, `/analyze`, `/performance`, `/diagnostics`, `/pickperformance`, `/forwardtest`, `/health`).
 - **Optional Slack mirror** of every outbound message via an incoming webhook, alongside Telegram.
 - **Health ping** support for runtime monitoring.
 - **CI test workflow** via GitHub Actions.
@@ -400,6 +400,9 @@ a symbol qualifying several sessions running) and weekly picks. `/performance`
 uses historical daily bars for a separate walk-forward test.
 Successfully delivered candidate lists are also recorded in a separate,
 non-pruned table in the same DB for `/pickperformance`; keep this volume backed up.
+Every screened symbol is also archived, permanently and once per session (first
+observation wins, qualified or not, with its delivered rank and the gate
+thresholds it was produced under), for `/forwardtest`.
 
 - `TRADE_HISTORY_DB_FILE` - SQLite file path (default `.news_bot_trade_history.db`; under docker compose it points into the `news_bot_data` volume at `/app/data`)
 - `TRADE_HISTORY_RETENTION_DAYS` - rolling window kept before older rows are pruned (default `14`)
@@ -769,6 +772,24 @@ small number of hypotheses. An already inspected holdout is exploratory evidence
 not untouched validation for changes motivated by these results. The command does
 not tune rules or claim statistical significance. Large universes can produce
 multiple Telegram message parts.
+
+### `/forwardtest`
+
+The out-of-sample read. `/performance` replays history, so every rule it judges
+was chosen with that data in view; `/forwardtest` judges only signals the bot
+recorded live before their outcome existed (`signal_archive`, never pruned).
+It settles any outcome that has become computable (next-session open entry,
+close after `TRADE_OUTCOME_LOOKBACK_DAYS` sessions, costs and benchmark frozen
+at recording), then compares **qualified** and **top 5 as delivered** with
+**every symbol screened that day**, paired by signal date with dates weighted
+equally, reporting the standard error and a rough t value.
+
+Signals made under different gate thresholds are never mixed: each row carries
+a rule id, and only the current one is reported. Below 60 paired dates the report
+says it cannot conclude anything. The baseline is the bot's own screened set (watchlist
+plus mover discovery, not liquidity-filtered), not the whole market; holds overlap
+and averages are not portfolio returns. Archiving starts at deploy; nothing is
+backfilled.
 
 ### `/pickperformance`
 
