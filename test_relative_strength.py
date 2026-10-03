@@ -25,7 +25,7 @@ def _grow(total_pct, n=70, start=100.0):
 
 
 def _fetch_from(table):
-    return lambda symbol: table.get(symbol)
+    return table.get
 
 
 def _m(symbol="AAA", atr=2.0):
