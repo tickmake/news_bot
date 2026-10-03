@@ -103,8 +103,119 @@ class TradeHistoryStore:
                 """
             )
             conn.commit()
+            # Permanent, unlike trade_metrics_history (pruned after a couple of
+            # weeks). One row per screened symbol per session, qualified or not,
+            # so a forward test has both the signals and the same-date baseline.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_archive (
+                    symbol TEXT NOT NULL,
+                    signal_session TEXT NOT NULL,
+                    qualified INTEGER NOT NULL,
+                    rank INTEGER,
+                    failed_gate TEXT,
+                    last_close REAL NOT NULL,
+                    day_change_pct REAL NOT NULL,
+                    week_momentum_pct REAL NOT NULL,
+                    volume_ratio REAL,
+                    atr_pct REAL NOT NULL,
+                    drawdown_pct REAL NOT NULL,
+                    rsi_14 REAL,
+                    rule_id TEXT NOT NULL,
+                    horizon_sessions INTEGER NOT NULL,
+                    cost_bps_per_side REAL NOT NULL,
+                    benchmark_symbol TEXT,
+                    recorded_at TEXT NOT NULL,
+                    outcome_json TEXT,
+                    PRIMARY KEY (symbol, signal_session)
+                )
+                """
+            )
+            conn.commit()
             self._conn = conn
         return self._conn
+
+    @staticmethod
+    def current_rule_id() -> str:
+        """Identifies the gate thresholds a signal was produced under, so a later
+        change to them is never averaged together with earlier signals."""
+        return (
+            f"mom{SETTINGS.trade_min_week_momentum_pct:g}"
+            f"-day{SETTINGS.trade_min_day_change_pct:g}"
+            f"-atr{SETTINGS.trade_max_atr_pct:g}"
+            f"-dd{SETTINGS.trade_max_drawdown_pct:g}"
+            f"-vol{SETTINGS.trade_min_volume_ratio:g}"
+        )
+
+    def archive_signal(
+        self, metrics: "TradeMetrics", qualified: bool, failed_gate: Optional[str]
+    ) -> None:
+        """First observation of a (symbol, session) wins, like published picks:
+        a rerun or a later settings change cannot rewrite what was signalled."""
+        with TRADE_HISTORY_LOCK:
+            try:
+                conn = self._connection()
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO signal_archive (
+                            symbol, signal_session, qualified, failed_gate, last_close,
+                            day_change_pct, week_momentum_pct, volume_ratio, atr_pct,
+                            drawdown_pct, rsi_14, rule_id, horizon_sessions,
+                            cost_bps_per_side, benchmark_symbol, recorded_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol, signal_session) DO NOTHING
+                        """,
+                        (
+                            metrics.symbol, metrics.session, int(qualified), failed_gate,
+                            metrics.last_close, metrics.day_change_pct,
+                            metrics.week_momentum_pct, metrics.volume_ratio, metrics.atr_pct,
+                            metrics.drawdown_pct, metrics.rsi_14, self.current_rule_id(),
+                            SETTINGS.trade_outcome_lookback_days,
+                            SETTINGS.trade_backtest_cost_bps,
+                            _backtest_benchmark_for(metrics.symbol),
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+            except Exception as exc:
+                SYS_LOG.warning("signal_archive_failed symbol=%s detail=%s", metrics.symbol, exc)
+
+    def archive_ranks(self, ranked: List["TradeMetrics"]) -> None:
+        """Record the delivered ordering of qualifiers (1 = top). Set once."""
+        with TRADE_HISTORY_LOCK:
+            try:
+                conn = self._connection()
+                with conn:
+                    for rank, metrics in enumerate(ranked, 1):
+                        conn.execute(
+                            """
+                            UPDATE signal_archive SET rank = ?
+                            WHERE symbol = ? AND signal_session = ? AND rank IS NULL
+                            """,
+                            (rank, metrics.symbol, metrics.session),
+                        )
+            except Exception as exc:
+                SYS_LOG.warning("signal_archive_rank_failed detail=%s", exc)
+
+    def archive_rows(self) -> List[Dict[str, Any]]:
+        with TRADE_HISTORY_LOCK:
+            cursor = self._connection().execute(
+                "SELECT * FROM signal_archive ORDER BY signal_session, symbol"
+            )
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def complete_archive_row(self, symbol: str, signal_session: str, outcome: Dict[str, Any]) -> None:
+        with TRADE_HISTORY_LOCK:
+            conn = self._connection()
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE signal_archive SET outcome_json = ?
+                    WHERE symbol = ? AND signal_session = ? AND outcome_json IS NULL
+                    """,
+                    (json.dumps(outcome, allow_nan=False), symbol, signal_session),
+                )
 
     def publish(self, picks: List["TradeMetrics"], published_at: datetime) -> None:
         """First successful publication wins; reruns cannot rewrite the signal."""
