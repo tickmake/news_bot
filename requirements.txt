@@ -23,5 +23,5 @@ pydantic-settings==2.11.0
 # Python 3.14 -- every savefig hits a RecursionError in Path.__deepcopy__ --
 # which is what a dev machine on current Homebrew python runs. Each marker
 # picks the newest release with a real wheel for that platform.
-matplotlib==3.10.3; platform_machine == "aarch64"
+matplotlib==3.11.2; platform_machine == "aarch64"
 matplotlib==3.11.2; platform_machine != "aarch64"
