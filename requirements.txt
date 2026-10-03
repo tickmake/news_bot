@@ -1,17 +1,17 @@
 # Pinned for reproducible builds. yfinance is version-sensitive (see the
 # DNSError shim in news_bot.py); upgrade deliberately.
 requests==2.33.0
-yfinance==0.2.66
+yfinance==1.7.0
 # yfinance now imports curl_cffi unconditionally, so it must be installed
 # (the old YF_NO_CURL_CFFI / uninstall workaround no longer applies).
 curl_cffi==0.15.0
-apscheduler==3.10.4
+apscheduler==3.11.3
 # Feed bodies are untrusted third-party input; stdlib ElementTree is
 # vulnerable to XML entity-expansion denial of service.
 defusedxml==0.7.1
 # The news ranker talks to a local Ollama endpoint over plain HTTP via
 # `requests`, so no LLM SDK is needed.
-pydantic==2.13.4
+pydantic==2.13.5
 pydantic-settings==2.11.0
 # Technical-analysis charts for /recommendations, rendered locally and
 # uploaded via Telegram's sendPhoto. Imported lazily in render_candidate_charts
@@ -23,5 +23,5 @@ pydantic-settings==2.11.0
 # Python 3.14 -- every savefig hits a RecursionError in Path.__deepcopy__ --
 # which is what a dev machine on current Homebrew python runs. Each marker
 # picks the newest release with a real wheel for that platform.
-matplotlib==3.10.3; platform_machine == "aarch64"
+matplotlib==3.11.2; platform_machine == "aarch64"
 matplotlib==3.11.2; platform_machine != "aarch64"

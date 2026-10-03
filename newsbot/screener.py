@@ -170,6 +170,9 @@ def _screen_universe(
         history_store.TRADE_HISTORY.record(
             metrics, qualified=not failed, failed_gate=(failed[0] if failed else None)
         )
+        history_store.TRADE_HISTORY.archive_signal(
+            metrics, qualified=not failed, failed_gate=(failed[0] if failed else None)
+        )
 
     def _expire(future_to_symbol: Dict[Any, str]) -> None:
         APP_LOG.warning(
@@ -379,6 +382,10 @@ def build_trade_candidates_payload(
         candidate_items = list(universe.items())[:universe_max]
 
     outcome, labels = _screen_universe(candidate_items)
+    # The ordering delivered to the reader is part of what a forward test must
+    # judge. /watchlist screens a different, smaller universe, so only this
+    # path records ranks.
+    history_store.TRADE_HISTORY.archive_ranks(outcome.qualified)
     qualified_count = len(outcome.qualified)
     shown = outcome.qualified[:top_n]
 

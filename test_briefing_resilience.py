@@ -10,7 +10,6 @@ from unittest.mock import patch
 from newsbot import (
     briefing as nb_briefing,
     commands as nb_commands,
-    config as nb_config,
     market_data as nb_market_data,
     messaging as nb_messaging,
     news_feeds as nb_news_feeds,

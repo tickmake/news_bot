@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests.exceptions
 
-from newsbot import backtest_reports, charts, history_store, market_data, messaging, news_feeds, reports, screener
+from newsbot import backtest_reports, charts, forward_test, history_store, market_data, messaging, news_feeds, reports, screener
 from newsbot.briefing import _send_briefing
 from newsbot.config import SETTINGS
 from newsbot.history_store import _record_published_picks
@@ -32,6 +32,7 @@ def _command_help_text() -> str:
         "/performance - Walk-forward test of trade rules vs. market benchmarks\n"
         "/diagnostics - Historical signal slices and same-date ranking comparison\n"
         "/pickperformance - Fixed-session outcomes of actually delivered picks\n"
+        "/forwardtest - Out-of-sample results of every signal the bot recorded live\n"
         "/health - Send bot health report\n"
     )
 
@@ -68,6 +69,8 @@ def _handle_command(command: str, chat_id: str) -> None:
         messaging._broadcast_message(backtest_reports.build_trade_performance_report(), chat_id=chat_id)
     elif normalized == "/pickperformance":
         messaging._broadcast_message(history_store.build_published_pick_report(), chat_id=chat_id)
+    elif normalized == "/forwardtest":
+        messaging._broadcast_message(forward_test.build_forward_test_report(), chat_id=chat_id)
     elif normalized == "/diagnostics":
         messaging._broadcast_message(backtest_reports.build_trade_diagnostics_report(), chat_id=chat_id)
     elif normalized == "/health":
