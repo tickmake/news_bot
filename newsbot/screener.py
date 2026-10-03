@@ -402,7 +402,7 @@ def build_trade_candidates_payload(
         ]
         # Looked up once for the shown picks, within a deadline; a failure only
         # means the risk lines are missing, never that the screen is.
-        risk = risk_analytics.build_context(shown)
+        risk = risk_analytics.build_context(shown, labels)
         for index, metrics in enumerate(shown, 1):
             lines.extend(
                 _render_candidate(index, metrics, labels.get(metrics.symbol, metrics.symbol), risk)

@@ -172,6 +172,13 @@ class AppSettings(BaseSettings):
     relative_strength_enabled: bool = True
     relative_strength_windows: str = "20,60"
     relative_strength_beta_min_obs: int = 30
+    # Headlines that mention a pick, from the news feeds the bot already reads,
+    # shown as "why is it moving" context. Matching is by company name or an
+    # explicit ($TICKER) / (TICKER) mention, so it errs on the side of silence.
+    catalysts_enabled: bool = True
+    catalysts_max_per_pick: int = 2
+    catalysts_max_age_hours: int = 36
+    catalysts_pool_ttl_seconds: int = 1200
     # Market-data health. The container healthcheck only proves threads are
     # alive; if Yahoo returns nothing the bot stays "healthy" while every
     # screen is empty. A screen is "bad" when too many symbols come back with

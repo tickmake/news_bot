@@ -813,6 +813,16 @@ the holding period, so each candidate and `/analyze` now carry:
   market, or just go along?), not a ranking: it does not change what qualifies.
   Set `RELATIVE_STRENGTH_ENABLED=false` to switch it off.
 
+- **Headlines that mention the pick.** Up to `CATALYSTS_MAX_PER_PICK` (2) headlines from the
+  last `CATALYSTS_MAX_AGE_HOURS` (36) hours, taken from the business and global feeds
+  the briefing already reads (no new source or credential; the feed pool is cached
+  20 minutes). A headline counts only if it names the company as a whole word (legal
+  suffixes stripped, so `Apple Inc.` matches "Apple"; a multi-word name's first
+  word is also tried when it is safe, so "Meta Platforms" matches "Meta") or writes the
+  ticker the way news does, `$NVDA` or `(NVDA)`. Bare tickers are never matched, and
+  names that are ordinary words ("Target", "Block", "Visa") are skipped, so it errs on the
+  side of silence. It is there to answer "why is it moving?", not to score sentiment.
+
 The extra lookups (sector, earnings date, six months of history for relative strength) run in parallel within
 `RISK_CONTEXT_DEADLINE_SECONDS` and are cached for 12 hours; if they fail, the risk
 lines for that pick are simply missing and the screen is unaffected. Switch it all

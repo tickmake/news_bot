@@ -161,7 +161,7 @@ def build_ticker_analysis(raw_symbol: str) -> str:
     # 2b. Risk and event risk, from the same helpers /recommendations uses.
     if metrics:
         lines.append("<b>Risk &amp; Events</b>")
-        context = risk_analytics.build_context([metrics]) if SETTINGS.risk_analytics_enabled else None
+        context = risk_analytics.build_context([metrics], {symbol: name}) if SETTINGS.risk_analytics_enabled else None
         sized_lines = risk_analytics.candidate_lines(symbol, context)
         lines.extend(sized_lines or ["Position sizing unavailable (no usable volatility reading)."])
         profile = (context.profiles.get(symbol) if context else None) or {}

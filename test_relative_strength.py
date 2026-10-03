@@ -203,6 +203,7 @@ class ContextWiringTests(unittest.TestCase):
             patch.object(nb_config.SETTINGS, "risk_analytics_enabled", True),
             patch.object(nb_config.SETTINGS, "relative_strength_enabled", True),
             patch.object(nb_config.SETTINGS, "relative_strength_windows", "20,60"),
+            patch.object(nb_config.SETTINGS, "catalysts_enabled", False),
         ):
             p.start()
             self.addCleanup(p.stop)
