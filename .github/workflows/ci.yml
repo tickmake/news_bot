@@ -41,8 +41,8 @@ jobs:
         # ResourceWarning as an error catches leaked SQLite connections and files.
         run: |
           pip install coverage
-          coverage run -W error::ResourceWarning -m unittest -v
-          coverage report
+          python -W error::ResourceWarning -m coverage run -m unittest -v
+          python -m coverage report
 
   docker:
     runs-on: ubuntu-latest
@@ -56,8 +56,11 @@ jobs:
       - name: Entrypoint drops privileges and fixes a root-owned volume
         run: |
           vol="$(mktemp -d)"
-          # Simulate a volume left behind by an older, root-running image.
+          # Simulate a volume left behind by an older, root-running image:
+          # the directory and its files are owned by root.
           sudo sh -c "echo old > '$vol/.news_bot_state.json'"
+          sudo chown root:root "$vol"
+          sudo chmod 755 "$vol"
           docker run --rm --read-only --tmpfs /tmp \
             --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
             --security-opt no-new-privileges:true \
