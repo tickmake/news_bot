@@ -17,12 +17,12 @@ from newsbot import (
 
 
 def _metrics(symbol="AAA", session="2026-09-01", **overrides):
-    base = dict(
-        symbol=symbol, session=session, last_close=100.0, day_change_pct=1.0,
-        week_momentum_pct=3.0, volume_ratio=1.5, drawdown_pct=2.0, atr_pct=2.0,
-        above_ema20=True, ema20=98.0, rsi_14=60.0, support_level=95.0,
-        resistance_level=102.0, volume_trend="flat",
-    )
+    base = {
+        "symbol": symbol, "session": session, "last_close": 100.0, "day_change_pct": 1.0,
+        "week_momentum_pct": 3.0, "volume_ratio": 1.5, "drawdown_pct": 2.0, "atr_pct": 2.0,
+        "above_ema20": True, "ema20": 98.0, "rsi_14": 60.0, "support_level": 95.0,
+        "resistance_level": 102.0, "volume_trend": "flat",
+    }
     base.update(overrides)
     return nb_indicators.TradeMetrics(**base)
 

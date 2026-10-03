@@ -138,8 +138,8 @@ def _run_command_safely(command: str, chat_id: str, key: str, flight: Tuple[str,
         APP_LOG.error("command_failed cmd=%s detail=%s", key, exc)
         try:
             messaging.send_telegram_message(f"Sorry, {key} failed. Check the bot logs.", chat_id=chat_id)
-        except Exception:
-            pass
+        except Exception as notify_exc:
+            SYS_LOG.warning("command_failure_notice_failed cmd=%s detail=%s", key, notify_exc)
     finally:
         with _COMMANDS_LOCK:
             _COMMANDS_IN_FLIGHT.discard(flight)

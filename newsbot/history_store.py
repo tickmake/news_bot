@@ -203,7 +203,7 @@ class TradeHistoryStore:
                 "SELECT * FROM signal_archive ORDER BY signal_session, symbol"
             )
             columns = [column[0] for column in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
     def complete_archive_row(self, symbol: str, signal_session: str, outcome: Dict[str, Any]) -> None:
         with TRADE_HISTORY_LOCK:
@@ -271,7 +271,7 @@ class TradeHistoryStore:
                 (limit,),
             )
             columns = [column[0] for column in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
     def complete_pick(self, pick: Dict[str, Any], outcome: Dict[str, Any]) -> None:
         with TRADE_HISTORY_LOCK:
