@@ -2857,6 +2857,17 @@ class SignalEnrichmentTests(unittest.TestCase):
         self.assertNotIn("bought", nb_screener._rsi_label(50.0))
         self.assertEqual(nb_screener._rsi_label(None), "n/a")
 
+    def test_entry_exit_sketch_at_the_high_has_no_measured_room(self):
+        at_high = _metrics(last_close=104.0, support_level=95.0, resistance_level=104.0, ema20=100.0)
+        self.assertIn("reward:risk no room to the 20-day high", nb_screener._entry_exit_sketch(at_high))
+        self.assertNotIn("0.0:1", nb_screener._entry_exit_sketch(at_high))
+        above = _metrics(last_close=105.0, support_level=95.0, resistance_level=104.0, ema20=100.0)
+        self.assertIn("no room to the 20-day high", nb_screener._entry_exit_sketch(above))
+
+    def test_entry_exit_sketch_without_downside_is_na(self):
+        no_risk = _metrics(last_close=95.0, support_level=95.0, resistance_level=104.0, ema20=95.0)
+        self.assertIn("reward:risk n/a", nb_screener._entry_exit_sketch(no_risk))
+
     def test_entry_exit_sketch_computes_reward_risk(self):
         metrics = _metrics(last_close=100.0, support_level=90.0, resistance_level=120.0, ema20=95.0)
         sketch = nb_screener._entry_exit_sketch(metrics)
