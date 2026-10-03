@@ -1,0 +1,20 @@
+# Keep the build context to what the image actually needs; the Dockerfile
+# copies requirements.txt, news_bot.py, newsbot/, evaluation_universe.csv and
+# the entrypoint explicitly, so this mainly stops secrets and clutter from
+# being sent to the daemon at all.
+.git
+.github
+.env
+.env.*
+!.env.example
+*.db
+*.json
+.news_bot_*
+__pycache__/
+*.pyc
+.venv/
+.venv_test/
+.ruff_cache/
+docs/
+test_*.py
+*.md

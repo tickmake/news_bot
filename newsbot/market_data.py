@@ -138,7 +138,7 @@ def _fetch_predefined_screener_quotes(scr_id: str, count: int) -> List[Dict[str,
         for endpoint in YAHOO_SCREENER_ENDPOINTS:
             try:
                 response = _with_retry(
-                    lambda: requests.get(
+                    lambda endpoint=endpoint: requests.get(
                         endpoint,
                         params={"scrIds": scr_id, "count": count, "start": 0},
                         headers={"User-Agent": MARKET_DATA_USER_AGENT},

@@ -54,6 +54,20 @@ services:
     build: . # 👈 This tells Portainer to look for the Dockerfile in your Git repo
     container_name: daily_news_bot
     restart: unless-stopped
+    # Hardening. The entrypoint starts as root only to chown the data volume
+    # (older volumes are root-owned), then drops to the unprivileged `app` user
+    # with no capabilities left. Nothing but the volume and /tmp is writable.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN   # entrypoint: hand the data volume to `app`
+      - SETUID  # entrypoint: drop to `app`
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
     networks:
       - default
       # Lets the bot resolve an Ollama running in another compose project.
@@ -65,8 +79,8 @@ services:
       # qualifying streaks, /analyze outcomes and /stocks weekly picks to
       # empty until enough sessions re-accumulate.
       - news_bot_data:/app/data
-    # The image carries no .env of its own (the Dockerfile copies only
-    # requirements.txt, news_bot.py, newsbot/ and evaluation_universe.csv), and the explicit `environment` list
+    # The image carries no .env of its own (the Dockerfile copies only the code,
+    # evaluation_universe.csv and the entrypoint), and the explicit `environment` list
     # below is an allowlist -- so every setting missing from it was simply
     # unset in the container. That is how the configured stock universes
     # (USA_/INDIA_/NORWAY_/EU_STOCK_UNIVERSE and the mutual-fund lists) never
@@ -90,8 +104,7 @@ services:
       - TRADE_HISTORY_DB_FILE=/app/data/.news_bot_trade_history.db
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      # Slack mirror. The image has no .env of its own (the Dockerfile copies
-      # only requirements.txt, news_bot.py, newsbot/ and evaluation_universe.csv), so anything absent from this
+      # Slack mirror. The image has no .env of its own, so anything absent from this
       # list is simply unset in the container -- and an unset webhook makes
       # send_slack_message() return early without logging, so the mirror goes
       # silently dead rather than erroring.
@@ -155,8 +168,8 @@ services:
       # names still surface.
       - TRADE_STICKY_UNIVERSE_DAYS=${TRADE_STICKY_UNIVERSE_DAYS:-10}
       - TRADE_DISCOVERY_MIN_SLOTS=${TRADE_DISCOVERY_MIN_SLOTS:-10}
-      # Charts on /recommendations. Telegram-only by construction: an incoming
-      # webhook cannot upload a file, so Slack keeps getting the text.
+      # Charts on /recommendations, sent to Telegram and, when SLACK_BOT_TOKEN and
+      # SLACK_CHANNEL_ID are set, uploaded to Slack too.
       - TRADE_CHART_ENABLED=${TRADE_CHART_ENABLED:-true}
       - TRADE_CHART_COUNT=${TRADE_CHART_COUNT:-3}
       - TRADE_CHART_LOOKBACK_DAYS=${TRADE_CHART_LOOKBACK_DAYS:-90}

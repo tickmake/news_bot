@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .news_bot_state.json
 .news_bot_trade_history.db
+.coverage
+.ruff_cache/

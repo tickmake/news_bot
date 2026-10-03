@@ -1,0 +1,8 @@
+[run]
+source = newsbot
+
+[report]
+# Floor, not a target: overall coverage is about 85%. Raise it as the weakest
+# modules (market_data, bot) gain tests.
+fail_under = 80
+skip_empty = true

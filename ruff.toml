@@ -1,0 +1,20 @@
+target-version = "py311"
+
+[lint]
+# F: pyflakes. E4/E7/E9: import, statement and syntax errors. B: bugbear
+# (late-binding closures, blind assertRaises, zip without strict). S: bandit
+# security checks. C4/PIE: needless constructs. PLE/PLW: pylint errors and
+# warnings. RUF100: stale noqa comments. Style-only families (UP, SIM, RET,
+# formatting) are deliberately left out so the rules catch bugs, not taste.
+select = ["F", "E4", "E7", "E9", "B", "S", "C4", "PIE", "PLE", "PLW", "RUF100"]
+ignore = [
+    # Module-level backoff timestamps and one-time logging setup are deliberate
+    # process-wide state, guarded by CACHE_LOCK where it matters.
+    "PLW0603",
+    # Re-binding a loop variable to a normalised value reads fine here.
+    "PLW2901",
+]
+
+[lint.per-file-ignores]
+# Tests assert, build throwaway credentials, and use fixed paths.
+"test_*.py" = ["S101", "S105", "S106", "S108"]
