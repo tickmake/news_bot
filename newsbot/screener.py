@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 
-from newsbot import config, history_store, indicators, market_data
+from newsbot import config, data_health, history_store, indicators, market_data
 from newsbot.config import SETTINGS
 from newsbot.indicators import TRADE_GATES, TradeMetrics, _failed_gates
 from newsbot.logsetup import APP_LOG, SYS_LOG
@@ -221,6 +221,7 @@ def _screen_universe(
 
     outcome.qualified.sort(key=_rank_key)
     history_store.TRADE_HISTORY.prune(_effective_history_retention_days())
+    data_health.record_screen(outcome)
     return outcome, labels
 
 

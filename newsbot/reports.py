@@ -4,7 +4,7 @@ from datetime import datetime
 from html import escape
 from typing import Any, List, Optional
 
-from newsbot import history_store, indicators, market_data
+from newsbot import data_health, history_store, indicators, market_data
 from newsbot.config import SETTINGS
 from newsbot.market_data import _as_float
 from newsbot.screener import _entry_exit_sketch, _rsi_label
@@ -289,6 +289,7 @@ def build_health_report() -> str:
         f"Ranker model: {SETTINGS.news_ranker_model}",
         f"Ranker latency: {latency if latency is not None else 'n/a'} ms",
         f"Slack mirror: {'configured' if SETTINGS.slack_webhook_url else 'not configured'}",
+        data_health.describe(),
     ]
     if RANKER_STATUS.get("error"):
         lines.append(
