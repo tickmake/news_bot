@@ -802,7 +802,18 @@ the holding period, so each candidate and `/analyze` now carry:
   the total at work and at risk if every stop is hit, with a warning above
   `RISK_MAX_TOTAL_PCT` (60%).
 
-The extra lookups (sector, earnings date) run in parallel within
+- **Relative strength and beta.** The stock's return over the last 20 and 60 completed
+  sessions (`RELATIVE_STRENGTH_WINDOWS`) minus its market's, and for US listings
+  minus its SPDR sector ETF's (Yahoo sector names map to XLK, XLE, XLF and so on),
+  plus 60-session beta to the market. Markets are the same proxies `/performance`
+  uses (SPY, OSEBX.OL, ^GDAXI, ^NSEI, ...). Non-US stocks get the market comparison
+  only, since a US sector ETF would mostly measure the US. Returns are taken between
+  the same dates, using the last close on or before each, so markets with different
+  holidays still line up. This is context for reading a move (did it outrun its
+  market, or just go along?), not a ranking: it does not change what qualifies.
+  Set `RELATIVE_STRENGTH_ENABLED=false` to switch it off.
+
+The extra lookups (sector, earnings date, six months of history for relative strength) run in parallel within
 `RISK_CONTEXT_DEADLINE_SECONDS` and are cached for 12 hours; if they fail, the risk
 lines for that pick are simply missing and the screen is unaffected. Switch it all
 off with `RISK_ANALYTICS_ENABLED=false`.

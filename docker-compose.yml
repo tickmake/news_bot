@@ -182,6 +182,8 @@ services:
       - RISK_ACCOUNT_SIZE=${RISK_ACCOUNT_SIZE:-0}
       - RISK_CORR_THRESHOLD=${RISK_CORR_THRESHOLD:-0.7}
       - RISK_EARNINGS_WARN_DAYS=${RISK_EARNINGS_WARN_DAYS:-7}
+      - RELATIVE_STRENGTH_ENABLED=${RELATIVE_STRENGTH_ENABLED:-true}
+      - RELATIVE_STRENGTH_WINDOWS=${RELATIVE_STRENGTH_WINDOWS:-20,60}
       # Market-data alerting: a Telegram message when too many symbols return no
       # data, or prices go stale. See newsbot/data_health.py.
       - MARKET_DATA_ALERTS_ENABLED=${MARKET_DATA_ALERTS_ENABLED:-true}
