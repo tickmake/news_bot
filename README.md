@@ -931,7 +931,13 @@ source .venv/bin/activate
 python -m unittest -v
 ```
 
-CI runs this same test suite on push/PR via `.github/workflows/ci.yml`.
+CI (`.github/workflows/ci.yml`) runs on Python 3.11 (the Docker image) and 3.14:
+ruff with the rules in `ruff.toml` (pyflakes plus bugbear, bandit security
+checks and a few others; style-only families are left out), `pip-audit` on the
+pinned requirements, and the suite under coverage with `ResourceWarning` treated as
+an error. Coverage has a floor of 80% (`.coveragerc`); it is about 85% today, with
+`market_data.py` and `bot.py` the weakest. A separate job builds the Docker image and
+checks the hardened runtime below.
 
 ## Docker
 
@@ -942,6 +948,17 @@ docker compose up -d --build
 ```
 
 Ensure environment values are provided in your shell or an env file before launch.
+
+**Hardening.** The base image is pinned by digest (Dependabot proposes updates)
+and `.dockerignore` keeps `.env`, databases and tests out of the build context.
+The bot runs as an unprivileged `app` user (uid 10001): `docker-entrypoint.sh`
+starts as root only to `chown` the data volume, then drops privileges with
+`setpriv`. That step is what lets a volume created by an older, root-running
+image keep working. Compose also sets a read-only root filesystem (writable:
+the `news_bot_data` volume and a `/tmp` tmpfs), drops every capability except
+the three the entrypoint needs (which are gone once it has dropped to `app`), and
+sets `no-new-privileges`. If you add a feature that writes elsewhere, give it a
+path under `/app/data` rather than loosening `read_only`.
 
 ## Message Sections
 

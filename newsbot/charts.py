@@ -159,8 +159,8 @@ def render_candidate_charts(candidates: List[Tuple[TradeMetrics, str]]) -> Optio
         APP_LOG.warning("chart_render_failed detail=%s", exc)
         try:
             plt.close("all")
-        except Exception:
-            pass
+        except Exception as close_exc:
+            SYS_LOG.debug("chart_close_failed detail=%s", close_exc)
         return None
 
 

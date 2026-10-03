@@ -12,10 +12,11 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, mock_open, patch
 from zoneinfo import ZoneInfo
 
+import defusedxml.common
 import pandas as pd
 
 import requests
-import yfinance  # noqa: F401  (patched by dotted path)
+import yfinance  # patched by dotted path
 
 from newsbot import (
     backtest as nb_backtest,
@@ -706,7 +707,7 @@ class XmlHardeningTests(unittest.TestCase):
             '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">]>'
             "<rss><channel><item><title>&lol3;</title></item></channel></rss>"
         )
-        with self.assertRaises(Exception):
+        with self.assertRaises(defusedxml.common.DefusedXmlException):
             nb_news_feeds._parse_rss_items(bomb)
 
     def test_ordinary_feeds_still_parse(self):
@@ -2242,7 +2243,7 @@ class CostValidationTests(unittest.TestCase):
         original = json.dumps(rows, sort_keys=True)
         result = nb_backtest._backtest_cost_validation(rows, 10.0)
         self.assertEqual([row["cost_bps_per_side"] for row in result["scenarios"]], [10, 25, 50])
-        for scenario, expected_net in zip(result["scenarios"], [0.8, 0.5, 0.0]):
+        for scenario, expected_net in zip(result["scenarios"], [0.8, 0.5, 0.0], strict=True):
             comparison = scenario["cohorts"]["development"]
             self.assertEqual(comparison["all"]["trade_count"], 2)
             self.assertEqual(comparison["top"]["trade_count"], 1)
@@ -2679,17 +2680,17 @@ class WalkForwardBacktestTests(unittest.TestCase):
 
 def _metrics(**overrides):
     """A qualifying TradeMetrics, with fields overridden per test."""
-    base = dict(
-        symbol="AAA",
-        session="2026-08-13",
-        last_close=100.0,
-        day_change_pct=1.0,
-        week_momentum_pct=3.0,
-        volume_ratio=1.5,
-        drawdown_pct=2.0,
-        atr_pct=2.0,
-        above_ema20=True,
-    )
+    base = {
+        "symbol": "AAA",
+        "session": "2026-08-13",
+        "last_close": 100.0,
+        "day_change_pct": 1.0,
+        "week_momentum_pct": 3.0,
+        "volume_ratio": 1.5,
+        "drawdown_pct": 2.0,
+        "atr_pct": 2.0,
+        "above_ema20": True,
+    }
     base.update(overrides)
     return nb_indicators.TradeMetrics(**base)
 
@@ -3289,7 +3290,7 @@ class CandidateUniverseTests(unittest.TestCase):
     def test_labels_carry_market_suffix(self):
         with patch.object(nb_market_data, "_build_live_universe", return_value={}):
             universe = nb_screener._build_candidate_universe(10)
-        labels = dict((symbol, label) for label, symbol in universe)
+        labels = {symbol: label for label, symbol in universe}
         self.assertEqual(labels["AAPL"], "Apple [USA Stock]")
         self.assertEqual(labels["EQNR.OL"], "Equinor [Norway Stock]")
 
@@ -3363,8 +3364,8 @@ class TradeRenderingTests(unittest.TestCase):
     def test_blockers_are_ordered_by_count(self):
         """Most common reason first, so the tunable knob leads."""
         def side_effect(symbol):
-            base = dict(session="2026-08-13", last_close=100.0, volume_ratio=1.0,
-                        drawdown_pct=1.0, above_ema20=True)
+            base = {"session": "2026-08-13", "last_close": 100.0, "volume_ratio": 1.0,
+                    "drawdown_pct": 1.0, "above_ema20": True}
             if symbol in ("A1", "A2", "A3"):   # volatility
                 return nb_indicators.TradeMetrics(symbol=symbol, day_change_pct=1.0,
                     week_momentum_pct=5.0, atr_pct=99.0, **base)
@@ -4108,8 +4109,10 @@ class SlackPhotoUploadTests(unittest.TestCase):
     def setUp(self):
         self._token = patch.object(nb_config.SETTINGS, "slack_bot_token", "xoxb-test")
         self._channel = patch.object(nb_config.SETTINGS, "slack_channel_id", "C123")
-        self._token.start(); self._channel.start()
-        self.addCleanup(self._token.stop); self.addCleanup(self._channel.stop)
+        self._token.start()
+        self._channel.start()
+        self.addCleanup(self._token.stop)
+        self.addCleanup(self._channel.stop)
 
     def _response(self, payload, status=200):
         response = MagicMock()

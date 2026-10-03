@@ -183,9 +183,9 @@ class AppSettings(BaseSettings):
     # retains reserved slots so it can never crowd out fresh names entirely.
     trade_sticky_universe_days: int = 10
     trade_discovery_min_slots: int = 10
-    # Technical-analysis charts attached to /recommendations. Telegram
-    # only: an incoming webhook cannot upload a file, so Slack keeps
-    # receiving the text rendering (see send_candidate_charts).
+    # Technical-analysis charts attached to /recommendations. Sent to Telegram,
+    # and to Slack too when a bot token and channel id are set; a webhook alone
+    # cannot upload a file (see send_candidate_charts).
     trade_chart_enabled: bool = True
     trade_chart_count: int = 3
     trade_chart_lookback_days: int = 90

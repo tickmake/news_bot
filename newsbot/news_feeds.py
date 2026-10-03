@@ -216,7 +216,7 @@ def _fetch_rss_items(
                 headers={"User-Agent": MARKET_DATA_USER_AGENT},
                 timeout=SETTINGS.request_timeout_seconds,
             ),
-            f"rss_{hashlib.sha1(feed_url.encode('utf-8')).hexdigest()[:8]}",
+            f"rss_{hashlib.sha1(feed_url.encode('utf-8'), usedforsecurity=False).hexdigest()[:8]}",
             retries=2,
         )
         response.raise_for_status()

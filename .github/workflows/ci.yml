@@ -8,29 +8,70 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what the Docker image runs; 3.14 is what local development uses.
+        python-version: ["3.11", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Lint (pyflakes rules only)
+      - name: Lint (rules in ruff.toml)
         run: |
           pip install ruff
-          ruff check --select F news_bot.py newsbot test_*.py
+          ruff check news_bot.py newsbot test_*.py
 
       - name: Audit pinned dependencies
         run: |
           pip install pip-audit
           pip-audit -r requirements.txt --no-deps
 
-      - name: Run unit tests
-        run: python -m unittest -v
+      - name: Run unit tests with coverage
+        # ResourceWarning as an error catches leaked SQLite connections and files.
+        run: |
+          pip install coverage
+          coverage run -W error::ResourceWarning -m unittest -v
+          coverage report
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t news-bot-ci .
+
+      - name: Entrypoint drops privileges and fixes a root-owned volume
+        run: |
+          vol="$(mktemp -d)"
+          # Simulate a volume left behind by an older, root-running image.
+          sudo sh -c "echo old > '$vol/.news_bot_state.json'"
+          docker run --rm --read-only --tmpfs /tmp \
+            --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges:true \
+            -v "$vol":/app/data news-bot-ci \
+            sh -c 'test "$(id -u)" = 10001 && echo "ok: running as $(id -un)" \
+              && echo new > /app/data/written.txt && cat /app/data/.news_bot_state.json'
+
+      - name: Application imports under the hardened runtime
+        run: |
+          docker run --rm --read-only --tmpfs /tmp \
+            --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges:true \
+            -e TELEGRAM_TOKEN=x -e TELEGRAM_CHAT_ID=1 \
+            -e STATE_FILE=/app/data/.news_bot_state.json \
+            -e TRADE_HISTORY_DB_FILE=/app/data/.news_bot_trade_history.db \
+            -v news_bot_ci_data:/app/data news-bot-ci \
+            python -c "import newsbot.bot, newsbot.charts as c; print('imports ok')"
