@@ -1,6 +1,7 @@
 """Live quotes, screeners and the market snapshot."""
 
 import time
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests.exceptions
@@ -10,7 +11,9 @@ from newsbot import news_feeds
 from newsbot.config import BUSINESS_NEWS_FEEDS, FUND_SCREENERS, MARKET_DATA_USER_AGENT, SETTINGS, STOCK_SCREENERS, YAHOO_SCREENER_ENDPOINTS
 from newsbot.logsetup import SYS_LOG
 from newsbot.news_feeds import Selection
-from newsbot.state import CACHE_LOCK, FINNHUB_QUOTE_CACHE, HISTORY_CACHE, LIVE_QUOTES_CACHE, TICKER_INFO_CACHE
+from newsbot.state import (
+    CACHE_LOCK, EVENT_PROFILE_CACHE, FINNHUB_QUOTE_CACHE, HISTORY_CACHE, LIVE_QUOTES_CACHE, TICKER_INFO_CACHE,
+)
 from newsbot.util import _render_pre_table, _truncate, _with_retry
 
 
@@ -437,3 +440,53 @@ def _fetch_ticker_fundamentals(symbol: str) -> Dict[str, Any]:
     with CACHE_LOCK:
         TICKER_INFO_CACHE[cache_key] = (time.time(), info)
     return info
+
+
+_EVENT_PROFILE_TTL_SECONDS = 12 * 3600
+_EVENT_PROFILE_RETRY_SECONDS = 30 * 60
+
+
+def _next_earnings_date(symbol: str) -> Optional[date]:
+    """The next scheduled earnings date from yfinance's calendar, or None.
+
+    Taken from `.calendar` rather than `.info`: the `earningsTimestamp` field in
+    `.info` is frequently the *previous* report (AAPL shows July in October),
+    while the calendar lists the upcoming one.
+    """
+    calendar = _with_retry(lambda: yf.Ticker(symbol).calendar, f"yf_calendar_{symbol}", retries=2)
+    raw = calendar.get("Earnings Date") if isinstance(calendar, dict) else None
+    today = datetime.now().date()
+    upcoming = []
+    for value in raw or []:
+        candidate = value.date() if isinstance(value, datetime) else value
+        if isinstance(candidate, date) and candidate >= today:
+            upcoming.append(candidate)
+    return min(upcoming) if upcoming else None
+
+
+def _fetch_event_profile(symbol: str) -> Dict[str, Any]:
+    """Sector and next earnings date for one symbol, cached.
+
+    Either field may be None: yfinance is patchy for smaller and non-US names,
+    and "unknown" must stay distinguishable from "no event soon". A lookup that
+    failed is cached briefly so a flaky symbol is retried, but not on every
+    command.
+    """
+    cache_key = f"event|{symbol}"
+    now_ts = time.time()
+    with CACHE_LOCK:
+        cached = EVENT_PROFILE_CACHE.get(cache_key)
+        if cached and now_ts - cached[0] <= cached[1].get("_ttl", _EVENT_PROFILE_TTL_SECONDS):
+            return cached[1]
+    profile: Dict[str, Any] = {"sector": None, "next_earnings": None, "complete": True}
+    sector = _fetch_ticker_fundamentals(symbol).get("sector")
+    profile["sector"] = sector.strip() if isinstance(sector, str) and sector.strip() else None
+    try:
+        profile["next_earnings"] = _next_earnings_date(symbol)
+    except Exception as exc:
+        SYS_LOG.debug("earnings_date_failed symbol=%s detail=%s", symbol, exc)
+        profile["complete"] = False
+    profile["_ttl"] = _EVENT_PROFILE_TTL_SECONDS if profile["complete"] else _EVENT_PROFILE_RETRY_SECONDS
+    with CACHE_LOCK:
+        EVENT_PROFILE_CACHE[cache_key] = (time.time(), profile)
+    return profile

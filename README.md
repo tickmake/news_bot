@@ -774,6 +774,39 @@ not untouched validation for changes motivated by these results. The command doe
 not tune rules or claim statistical significance. Large universes can produce
 multiple Telegram message parts.
 
+### Risk analytics and event risk
+
+Every backtest so far (issue #12, plus a ten-year check of momentum, reversal,
+low-volatility, 52-week-high and earnings-surprise signals on the evaluation
+basket) found no edge over holding the same stocks, and the bot's own gates did
+worse than the average stock at a 10-session hold. A ranked list therefore
+says less than it seems to. What holds up whatever the signal is how much to
+risk, whether the picks are really one bet, and whether a known event sits inside
+the holding period, so each candidate and `/analyze` now carry:
+
+- **A volatility stop and a position size.** The stop is `RISK_STOP_ATR_MULTIPLE`
+  (2) times the stock's ATR below the close. The size is
+  `RISK_PER_TRADE_PCT` (0.5%) of the portfolio divided by that stop distance, so a
+  calmer stock gets a larger position and a wilder one a smaller one, each losing
+  the same fraction if the stop is hit. No position exceeds `RISK_MAX_POSITION_PCT`
+  (20%). Set `RISK_ACCOUNT_SIZE` to see an amount too. This stop is separate from
+  the "invalidation" level in the sketch, which is the 20-session low. A gap through
+  the stop loses more than planned.
+- **An earnings flag** when the next report is within `RISK_EARNINGS_WARN_DAYS`
+  (7) calendar days, which covers the default 5-session hold. Dates come from
+  yfinance's calendar, not `.info` (whose earnings timestamp is often the previous
+  report). A missing date means unknown, not "none".
+- **A "Taken together" section** under the candidates: pairs whose last 60 daily
+  returns correlate at `RISK_CORR_THRESHOLD` (0.7) or more (compared on shared
+  trading dates, so US and European names line up), picks that share a sector, and
+  the total at work and at risk if every stop is hit, with a warning above
+  `RISK_MAX_TOTAL_PCT` (60%).
+
+The extra lookups (sector, earnings date) run in parallel within
+`RISK_CONTEXT_DEADLINE_SECONDS` and are cached for 12 hours; if they fail, the risk
+lines for that pick are simply missing and the screen is unaffected. Switch it all
+off with `RISK_ANALYTICS_ENABLED=false`.
+
 ### Briefing resilience
 
 Each briefing section (Norway news, global news, business & markets, trade

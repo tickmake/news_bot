@@ -173,6 +173,15 @@ services:
       - TRADE_CHART_ENABLED=${TRADE_CHART_ENABLED:-true}
       - TRADE_CHART_COUNT=${TRADE_CHART_COUNT:-3}
       - TRADE_CHART_LOOKBACK_DAYS=${TRADE_CHART_LOOKBACK_DAYS:-90}
+      # Risk analytics (sizing, clustering, earnings flags). See newsbot/risk.py.
+      - RISK_ANALYTICS_ENABLED=${RISK_ANALYTICS_ENABLED:-true}
+      - RISK_PER_TRADE_PCT=${RISK_PER_TRADE_PCT:-0.5}
+      - RISK_STOP_ATR_MULTIPLE=${RISK_STOP_ATR_MULTIPLE:-2.0}
+      - RISK_MAX_POSITION_PCT=${RISK_MAX_POSITION_PCT:-20}
+      - RISK_MAX_TOTAL_PCT=${RISK_MAX_TOTAL_PCT:-60}
+      - RISK_ACCOUNT_SIZE=${RISK_ACCOUNT_SIZE:-0}
+      - RISK_CORR_THRESHOLD=${RISK_CORR_THRESHOLD:-0.7}
+      - RISK_EARNINGS_WARN_DAYS=${RISK_EARNINGS_WARN_DAYS:-7}
       # Market-data alerting: a Telegram message when too many symbols return no
       # data, or prices go stale. See newsbot/data_health.py.
       - MARKET_DATA_ALERTS_ENABLED=${MARKET_DATA_ALERTS_ENABLED:-true}

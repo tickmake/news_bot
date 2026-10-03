@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 
-from newsbot import config, data_health, history_store, indicators, market_data
+from newsbot import config, data_health, history_store, indicators, market_data, risk as risk_analytics
 from newsbot.config import SETTINGS
 from newsbot.indicators import TRADE_GATES, TradeMetrics, _failed_gates
 from newsbot.logsetup import APP_LOG, SYS_LOG
@@ -264,7 +264,10 @@ def _entry_exit_sketch(metrics: TradeMetrics) -> str:
     )
 
 
-def _render_candidate(index: int, metrics: TradeMetrics, name: str) -> List[str]:
+def _render_candidate(
+    index: int, metrics: TradeMetrics, name: str,
+    risk: Optional[risk_analytics.PortfolioRisk] = None,
+) -> List[str]:
     """One candidate as a short block rather than a wide table row.
 
     A ten-column <pre> table runs about 100 characters, which Telegram either
@@ -296,6 +299,7 @@ def _render_candidate(index: int, metrics: TradeMetrics, name: str) -> List[str]
         f" · daily swing {metrics.atr_pct:.1f}%",
         f"    RSI {_rsi_label(metrics.rsi_14)} · volume {metrics.volume_trend}",
         _entry_exit_sketch(metrics),
+        *risk_analytics.candidate_lines(metrics.symbol, risk),
         f"    <i>from the {escape(metrics.session)} close</i>",
         "",
     ]
@@ -396,9 +400,12 @@ def build_trade_candidates_payload(
             f"{outcome.checked} passed</b>",
             "",
         ]
+        # Looked up once for the shown picks, within a deadline; a failure only
+        # means the risk lines are missing, never that the screen is.
+        risk = risk_analytics.build_context(shown)
         for index, metrics in enumerate(shown, 1):
             lines.extend(
-                _render_candidate(index, metrics, labels.get(metrics.symbol, metrics.symbol))
+                _render_candidate(index, metrics, labels.get(metrics.symbol, metrics.symbol), risk)
             )
         if qualified_count > len(shown):
             # Otherwise the header count and the number of blocks disagree.
@@ -406,6 +413,7 @@ def build_trade_candidates_payload(
                 f"<i>{qualified_count - len(shown)} more passed but are not shown.</i>"
             )
             lines.append("")
+        lines.extend(risk_analytics.portfolio_lines(risk))
     else:
         lines = [
             "📉 <b>Short-Term Trade Candidates — none qualified today</b>",
