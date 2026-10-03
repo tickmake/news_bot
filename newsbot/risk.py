@@ -1,0 +1,257 @@
+"""Risk analytics for trade candidates: sizing, clustering and event risk.
+
+Why this exists: backtests of the screen (issue #12, and a ten-year check of
+price factors and earnings drift on the evaluation basket) found no edge over
+holding the same stocks. A ranked pick list therefore says less than it seems to.
+What does hold up whatever the signal is how much to risk, whether the picks are
+really one bet, and whether a known event sits inside the holding period. These
+helpers answer those three questions from data the bot already has or can fetch
+cheaply, and every one of them degrades to "unknown" rather than raising.
+"""
+
+import math
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from html import escape
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from newsbot import market_data
+from newsbot.config import SETTINGS
+from newsbot.indicators import TradeMetrics, _drop_in_progress_bar
+from newsbot.logsetup import SYS_LOG
+
+
+@dataclass(frozen=True)
+class PositionSizing:
+    stop_pct: float        # distance to the volatility stop, percent of price
+    stop_price: float
+    weight_pct: float      # suggested share of the portfolio
+    risk_pct: float        # portfolio loss if stopped out at that weight
+    capped: bool           # the per-position cap, not the risk budget, set the weight
+    amount: Optional[float] = None  # only when RISK_ACCOUNT_SIZE is set
+
+
+def size_position(metrics: TradeMetrics) -> Optional[PositionSizing]:
+    """Fixed-fractional sizing from a volatility stop.
+
+    Weight = risk budget / stop distance, so a calmer stock gets a larger
+    position and a wilder one a smaller one, each losing the same fraction of
+    the portfolio if the stop is hit. Gaps can still lose more than the stop.
+    """
+    atr = metrics.atr_pct
+    if atr is None or not math.isfinite(atr) or atr <= 0:
+        return None
+    if SETTINGS.risk_per_trade_pct <= 0 or SETTINGS.risk_stop_atr_multiple <= 0:
+        return None
+    stop_pct = SETTINGS.risk_stop_atr_multiple * atr
+    raw_weight = SETTINGS.risk_per_trade_pct / stop_pct * 100.0
+    cap = SETTINGS.risk_max_position_pct
+    weight = min(raw_weight, cap) if cap > 0 else raw_weight
+    amount = SETTINGS.risk_account_size * weight / 100.0 if SETTINGS.risk_account_size > 0 else None
+    return PositionSizing(
+        stop_pct=stop_pct,
+        stop_price=metrics.last_close * (1.0 - stop_pct / 100.0),
+        weight_pct=weight,
+        risk_pct=weight * stop_pct / 100.0,
+        capped=weight < raw_weight,
+        amount=amount,
+    )
+
+
+@dataclass(frozen=True)
+class EventFlag:
+    kind: str
+    on: date
+    days: int
+
+    @property
+    def text(self) -> str:
+        when = "today" if self.days == 0 else "tomorrow" if self.days == 1 else f"in {self.days} days"
+        return f"earnings {when} ({self.on:%b %d})"
+
+
+def earnings_flag(profile: Optional[Dict[str, Any]], today: Optional[date] = None) -> Optional[EventFlag]:
+    """Earnings inside the warning window, or None (including "unknown")."""
+    if not profile or not isinstance(profile.get("next_earnings"), date):
+        return None
+    today = today or datetime.now().date()
+    on = profile["next_earnings"]
+    days = (on - today).days
+    if 0 <= days <= SETTINGS.risk_earnings_warn_days:
+        return EventFlag("earnings", on, days)
+    return None
+
+
+def _daily_returns(symbol: str) -> Optional[Any]:
+    history = _drop_in_progress_bar(market_data._fetch_ticker_history(symbol))
+    if history is None or len(history) < 20 or "Close" not in history:
+        return None
+    close = history["Close"].dropna()
+    # Align across markets by calendar date, not by position.
+    close.index = [stamp.strftime("%Y-%m-%d") for stamp in close.index]
+    close = close[~close.index.duplicated()]
+    return close.pct_change().dropna().tail(max(2, SETTINGS.risk_corr_window))
+
+
+def correlated_pairs(symbols: Sequence[str]) -> List[Tuple[str, str, float, int]]:
+    """Pairs whose recent daily returns moved together: (a, b, correlation, sessions).
+
+    Uses only dates both symbols traded, so a US and an Oslo stock are compared
+    on shared sessions. Pairs with too few shared sessions are left out rather
+    than guessed at.
+    """
+    returns: Dict[str, Any] = {}
+    for symbol in symbols:
+        try:
+            series = _daily_returns(symbol)
+        except Exception as exc:
+            SYS_LOG.debug("risk_returns_failed symbol=%s detail=%s", symbol, exc)
+            series = None
+        if series is not None:
+            returns[symbol] = series
+    pairs: List[Tuple[str, str, float, int]] = []
+    names = list(returns)
+    for i, first in enumerate(names):
+        for second in names[i + 1:]:
+            joined = returns[first].to_frame("a").join(returns[second].rename("b"), how="inner")
+            if len(joined) < SETTINGS.risk_corr_min_obs:
+                continue
+            value = joined["a"].corr(joined["b"])
+            if value is not None and math.isfinite(value) and value >= SETTINGS.risk_corr_threshold:
+                pairs.append((first, second, float(value), len(joined)))
+    return sorted(pairs, key=lambda item: -item[2])
+
+
+@dataclass
+class PortfolioRisk:
+    sizing: Dict[str, PositionSizing] = field(default_factory=dict)
+    profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    events: Dict[str, EventFlag] = field(default_factory=dict)
+    pairs: List[Tuple[str, str, float, int]] = field(default_factory=list)
+    sector_groups: Dict[str, List[str]] = field(default_factory=dict)
+    total_weight_pct: float = 0.0
+    max_loss_pct: float = 0.0
+    warnings: List[str] = field(default_factory=list)
+    unknown_profiles: int = 0
+
+
+def assess(picks: Sequence[TradeMetrics], profiles: Dict[str, Dict[str, Any]],
+           pairs: Sequence[Tuple[str, str, float, int]], today: Optional[date] = None) -> PortfolioRisk:
+    """Combine per-pick sizing, events, clustering and totals into warnings. Pure."""
+    risk = PortfolioRisk(profiles=dict(profiles), pairs=list(pairs))
+    for metrics in picks:
+        sized = size_position(metrics)
+        if sized is not None:
+            risk.sizing[metrics.symbol] = sized
+        flag = earnings_flag(profiles.get(metrics.symbol), today)
+        if flag is not None:
+            risk.events[metrics.symbol] = flag
+        if not profiles.get(metrics.symbol):
+            risk.unknown_profiles += 1
+
+    by_sector: Dict[str, List[str]] = {}
+    for metrics in picks:
+        sector = (profiles.get(metrics.symbol) or {}).get("sector")
+        if sector:
+            by_sector.setdefault(sector, []).append(metrics.symbol)
+    risk.sector_groups = {sector: names for sector, names in by_sector.items() if len(names) >= 2}
+
+    risk.total_weight_pct = sum(item.weight_pct for item in risk.sizing.values())
+    risk.max_loss_pct = sum(item.risk_pct for item in risk.sizing.values())
+
+    for first, second, value, sessions in risk.pairs:
+        combined = sum(risk.sizing[s].weight_pct for s in (first, second) if s in risk.sizing)
+        risk.warnings.append(
+            f"{first} and {second} moved together (correlation {value:.2f} over {sessions} sessions): "
+            f"sized separately they put {combined:.0f}% of the portfolio into what is close to one bet."
+        )
+    for sector, names in risk.sector_groups.items():
+        risk.warnings.append(f"{', '.join(names)} are all {sector}.")
+    if (len(risk.sizing) >= 2 and SETTINGS.risk_max_total_pct > 0
+            and risk.total_weight_pct > SETTINGS.risk_max_total_pct):
+        risk.warnings.append(
+            f"Taking all {len(risk.sizing)} at these sizes puts {risk.total_weight_pct:.0f}% of the "
+            f"portfolio to work; if every stop is hit that is a {risk.max_loss_pct:.1f}% loss, "
+            "and more if they move together or gap."
+        )
+    return risk
+
+
+def build_context(picks: Sequence[TradeMetrics]) -> PortfolioRisk:
+    """Fetch what `assess` needs, within a deadline. Never raises, never blocks long."""
+    if not SETTINGS.risk_analytics_enabled or not picks:
+        return PortfolioRisk()
+    symbols = [metrics.symbol for metrics in picks]
+    profiles: Dict[str, Dict[str, Any]] = {}
+    pool = ThreadPoolExecutor(max_workers=max(1, min(5, len(symbols))), thread_name_prefix="risk")
+    try:
+        futures = {symbol: pool.submit(market_data._fetch_event_profile, symbol) for symbol in symbols}
+        deadline_ok = True
+        end = time.monotonic() + max(2, SETTINGS.risk_context_deadline_seconds)
+        for symbol, future in futures.items():
+            try:
+                profiles[symbol] = future.result(timeout=max(0.0, end - time.monotonic()))
+            except FuturesTimeoutError:
+                deadline_ok = False
+            except Exception as exc:
+                SYS_LOG.debug("risk_profile_failed symbol=%s detail=%s", symbol, exc)
+        if not deadline_ok:
+            SYS_LOG.warning("risk_context_deadline_reached got=%s of=%s", len(profiles), len(symbols))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    try:
+        pairs = correlated_pairs(symbols) if len(symbols) >= 2 else []
+    except Exception as exc:
+        SYS_LOG.warning("risk_correlation_failed detail=%s", exc)
+        pairs = []
+    return assess(picks, profiles, pairs)
+
+
+def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
+    """Extra lines under one candidate: sizing and any event flag."""
+    if risk is None:
+        return []
+    lines: List[str] = []
+    sized = risk.sizing.get(symbol)
+    if sized is not None:
+        text = (
+            f"    risk: volatility stop {sized.stop_price:,.2f} ({sized.stop_pct:.1f}% away)"
+            f" · size {sized.weight_pct:.0f}% of portfolio"
+        )
+        if sized.capped:
+            text += f" (capped; risks {sized.risk_pct:.2f}%)"
+        else:
+            text += f" for {sized.risk_pct:.2f}% risk"
+        if sized.amount is not None:
+            text += f" ≈ {sized.amount:,.0f}"
+        lines.append(text)
+    flag = risk.events.get(symbol)
+    if flag is not None:
+        lines.append(f"    ⚠️ {escape(flag.text)} — inside a typical {SETTINGS.trade_outcome_lookback_days}-session hold")
+    return lines
+
+
+def portfolio_lines(risk: Optional[PortfolioRisk]) -> List[str]:
+    """The cross-pick section: clustering and totals. Empty when there is nothing to say."""
+    if risk is None or not risk.sizing:
+        return []
+    lines = ["<b>Taken together</b>"]
+    lines.extend(f"    ⚠️ {escape(warning)}" for warning in risk.warnings)
+    if not risk.warnings:
+        lines.append(
+            f"    {len(risk.sizing)} picks at these sizes: {risk.total_weight_pct:.0f}% of the "
+            f"portfolio at work, {risk.max_loss_pct:.1f}% at risk if every stop is hit."
+        )
+    elif len(risk.sizing) >= 2:
+        lines.append(f"    Totals: {risk.total_weight_pct:.0f}% at work, {risk.max_loss_pct:.1f}% at risk if every stop is hit.")
+    if risk.unknown_profiles:
+        lines.append(f"    <i>Sector and earnings data unavailable for {risk.unknown_profiles} pick(s).</i>")
+    lines.append(
+        f"    <i>Sizes risk {SETTINGS.risk_per_trade_pct:g}% of the portfolio per pick on a "
+        f"{SETTINGS.risk_stop_atr_multiple:g}×ATR stop; a gap can lose more. The screen itself has "
+        "not been shown to beat holding the same stocks.</i>"
+    )
+    lines.append("")
+    return lines

@@ -19,6 +19,7 @@ FINNHUB_QUOTE_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}
 
 HISTORY_CACHE: Dict[str, Tuple[float, Any]] = {}
 TICKER_INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+EVENT_PROFILE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 # Last-known ranker state, surfaced by /health.
 RANKER_STATUS: Dict[str, Any] = {

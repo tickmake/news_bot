@@ -144,6 +144,28 @@ class AppSettings(BaseSettings):
     trade_max_atr_pct: float = 4.5
     trade_universe_max: int = 30
     trade_fetch_workers: int = 6
+    # Risk analytics shown with trade candidates. These are decision aids that
+    # hold whether or not the screen has an edge (it has not been shown to):
+    # volatility-based sizing, correlation and sector clustering across the
+    # picks, and earnings-date flags. The stop is a volatility stop, a multiple
+    # of ATR, and is separate from the "invalidation" level in the sketch.
+    risk_analytics_enabled: bool = True
+    # Portfolio loss, in percent, if a position is stopped out.
+    risk_per_trade_pct: float = 0.5
+    risk_stop_atr_multiple: float = 2.0
+    # No single position above this share of the portfolio, whatever the stop.
+    risk_max_position_pct: float = 20.0
+    # Warn when taking every shown pick would put more than this to work.
+    risk_max_total_pct: float = 60.0
+    # Optional. When set (in your account currency), sizes also show an amount.
+    risk_account_size: float = 0.0
+    risk_corr_threshold: float = 0.7
+    risk_corr_window: int = 60
+    risk_corr_min_obs: int = 30
+    # Calendar days; 7 covers the default 5-session hold.
+    risk_earnings_warn_days: int = 7
+    # Wall-clock allowance for the extra lookups; the screen never waits longer.
+    risk_context_deadline_seconds: int = 12
     # Market-data health. The container healthcheck only proves threads are
     # alive; if Yahoo returns nothing the bot stays "healthy" while every
     # screen is empty. A screen is "bad" when too many symbols come back with

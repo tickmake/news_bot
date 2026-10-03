@@ -4,7 +4,7 @@ from datetime import datetime
 from html import escape
 from typing import Any, List, Optional
 
-from newsbot import data_health, history_store, indicators, market_data
+from newsbot import data_health, history_store, indicators, market_data, risk as risk_analytics
 from newsbot.config import SETTINGS
 from newsbot.market_data import _as_float
 from newsbot.screener import _entry_exit_sketch, _rsi_label
@@ -157,6 +157,20 @@ def build_ticker_analysis(raw_symbol: str) -> str:
     else:
         lines.append("Not enough price history available from yfinance for this symbol.")
     lines.append("")
+
+    # 2b. Risk and event risk, from the same helpers /recommendations uses.
+    if metrics:
+        lines.append("<b>Risk &amp; Events</b>")
+        context = risk_analytics.build_context([metrics]) if SETTINGS.risk_analytics_enabled else None
+        sized_lines = risk_analytics.candidate_lines(symbol, context)
+        lines.extend(sized_lines or ["Position sizing unavailable (no usable volatility reading)."])
+        profile = (context.profiles.get(symbol) if context else None) or {}
+        upcoming = profile.get("next_earnings")
+        if upcoming and not (context and symbol in context.events):
+            lines.append(f"Next earnings: {upcoming:%b %d, %Y}.")
+        elif not upcoming and not (context and symbol in context.events):
+            lines.append("Next earnings date: not available.")
+        lines.append("")
 
     # 3. Valuation
     lines.append("<b>Valuation</b>")
