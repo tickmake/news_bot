@@ -5,6 +5,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from html import escape
 from typing import Dict, List, Optional, Tuple
 
 import requests.exceptions
@@ -92,6 +93,41 @@ _COMMANDS_IN_FLIGHT: set = set()
 _COMMANDS_LOCK = threading.Lock()
 
 
+def _save_inflight_locked() -> None:
+    """Persist the commands now running, so a restart can say what it interrupted.
+
+    The Telegram offset moves as soon as a command is dispatched (otherwise a
+    crash would redeliver it for ever), so a restart mid-command would drop it
+    without a word. Callers hold _COMMANDS_LOCK.
+    """
+    STATE.data["inflight_commands"] = [list(item) for item in sorted(_COMMANDS_IN_FLIGHT)]
+    STATE.save()
+
+
+def notify_interrupted_commands() -> int:
+    """At startup, tell each chat which command a restart cut short. Returns the count."""
+    with _COMMANDS_LOCK:
+        leftover = STATE.data.get("inflight_commands") or []
+        if not leftover:
+            return 0
+        STATE.data["inflight_commands"] = []
+        STATE.save()
+    sent = 0
+    for item in leftover:
+        try:
+            chat_id, command = str(item[0]), str(item[1])
+        except (IndexError, TypeError):
+            continue
+        SYS_LOG.warning("command_interrupted cmd=%s chat_id=%s", command.split()[0] if command else "", chat_id)
+        if messaging.send_telegram_message(
+            f"The bot restarted while running <code>{escape(command)}</code>. "
+            "Send it again if you still want it.",
+            chat_id=chat_id,
+        ):
+            sent += 1
+    return sent
+
+
 def _run_command_safely(command: str, chat_id: str, key: str, flight: Tuple[str, str]) -> None:
     try:
         _handle_command(command, chat_id)
@@ -104,6 +140,7 @@ def _run_command_safely(command: str, chat_id: str, key: str, flight: Tuple[str,
     finally:
         with _COMMANDS_LOCK:
             _COMMANDS_IN_FLIGHT.discard(flight)
+            _save_inflight_locked()
 
 
 def _dispatch_command(command: str, chat_id: str) -> None:
@@ -116,6 +153,7 @@ def _dispatch_command(command: str, chat_id: str) -> None:
             busy = True
         else:
             _COMMANDS_IN_FLIGHT.add(flight)
+            _save_inflight_locked()
             busy = False
     if busy:
         messaging.send_telegram_message(f"{key} is already running; wait for it to finish.", chat_id=chat_id)

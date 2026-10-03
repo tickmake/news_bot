@@ -10,6 +10,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from newsbot.briefing import job_catchup_briefing, job_health_ping, job_scheduled_briefing, job_daily_briefing
 from newsbot.commands import (
     _prepare_telegram_long_polling,
+    notify_interrupted_commands,
     _touch_heartbeat,
     run_command_long_polling_loop,
     run_healthcheck,
@@ -27,6 +28,7 @@ def main() -> None:
         raise SystemExit(1)
 
     _prepare_telegram_long_polling()
+    notify_interrupted_commands()
 
     # A small thread pool with single-instance jobs prevents overlapping runs
     # from racing on shared state, caches, and the state file.

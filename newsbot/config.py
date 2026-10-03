@@ -133,6 +133,10 @@ class AppSettings(BaseSettings):
     # note was taken while the model was short-circuiting to an empty array,
     # so it timed a no-op. 14 leaves headroom on both models.
     news_ranker_max_candidates: int = 14
+    # Wall-clock allowance for composing one briefing. Three LLM-ranked news
+    # sections can take ~240s each on the Pi, so sections that have not started
+    # when this runs out are skipped rather than letting a briefing run for ever.
+    briefing_budget_seconds: int = 900
     trade_min_week_momentum_pct: float = 1.0
     trade_min_day_change_pct: float = 0.0
     trade_min_volume_ratio: float = 1.2
