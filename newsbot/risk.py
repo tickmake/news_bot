@@ -17,9 +17,10 @@ from datetime import date, datetime
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from newsbot import market_data
+from newsbot import market_data, relative_strength
 from newsbot.config import SETTINGS
 from newsbot.indicators import TradeMetrics, _drop_in_progress_bar
+from newsbot.benchmarks import _backtest_benchmark_for
 from newsbot.logsetup import SYS_LOG
 
 
@@ -84,14 +85,20 @@ def earnings_flag(profile: Optional[Dict[str, Any]], today: Optional[date] = Non
     return None
 
 
-def _daily_returns(symbol: str) -> Optional[Any]:
-    history = _drop_in_progress_bar(market_data._fetch_ticker_history(symbol))
+def _date_closes(symbol: str, period: str = "3mo") -> Optional[Any]:
+    """Completed-session closes keyed by calendar date, so markets align by day."""
+    history = _drop_in_progress_bar(market_data._fetch_ticker_history(symbol, period=period))
     if history is None or len(history) < 20 or "Close" not in history:
         return None
     close = history["Close"].dropna()
-    # Align across markets by calendar date, not by position.
     close.index = [stamp.strftime("%Y-%m-%d") for stamp in close.index]
-    close = close[~close.index.duplicated()]
+    return close[~close.index.duplicated()]
+
+
+def _daily_returns(symbol: str) -> Optional[Any]:
+    close = _date_closes(symbol)
+    if close is None:
+        return None
     return close.pct_change().dropna().tail(max(2, SETTINGS.risk_corr_window))
 
 
@@ -135,6 +142,7 @@ class PortfolioRisk:
     max_loss_pct: float = 0.0
     warnings: List[str] = field(default_factory=list)
     unknown_profiles: int = 0
+    strength: Dict[str, relative_strength.RelativeStrength] = field(default_factory=dict)
 
 
 def assess(picks: Sequence[TradeMetrics], profiles: Dict[str, Dict[str, Any]],
@@ -206,7 +214,51 @@ def build_context(picks: Sequence[TradeMetrics]) -> PortfolioRisk:
     except Exception as exc:
         SYS_LOG.warning("risk_correlation_failed detail=%s", exc)
         pairs = []
-    return assess(picks, profiles, pairs)
+    context = assess(picks, profiles, pairs)
+    if SETTINGS.relative_strength_enabled:
+        context.strength = _relative_strength(picks, profiles)
+    return context
+
+
+def _relative_strength(
+    picks: Sequence[TradeMetrics], profiles: Dict[str, Dict[str, Any]]
+) -> Dict[str, relative_strength.RelativeStrength]:
+    """Relative strength per pick. Each distinct symbol (stock, market proxy,
+    sector ETF) is fetched once, in parallel, then every pick is computed from
+    those; a shared benchmark such as SPY is not requested once per pick."""
+    wanted: Dict[str, None] = {}
+    for metrics in picks:
+        wanted[metrics.symbol] = None
+        market = _backtest_benchmark_for(metrics.symbol)
+        if market:
+            wanted[market] = None
+        etf = relative_strength.sector_etf(metrics.symbol, (profiles.get(metrics.symbol) or {}).get("sector"))
+        if etf:
+            wanted[etf] = None
+
+    closes: Dict[str, Any] = {}
+    pool = ThreadPoolExecutor(max_workers=max(1, min(6, len(wanted))), thread_name_prefix="rs")
+    try:
+        futures = {symbol: pool.submit(_date_closes, symbol, "6mo") for symbol in wanted}
+        end = time.monotonic() + max(2, SETTINGS.risk_context_deadline_seconds)
+        for symbol, future in futures.items():
+            try:
+                closes[symbol] = future.result(timeout=max(0.0, end - time.monotonic()))
+            except FuturesTimeoutError:
+                SYS_LOG.warning("relative_strength_deadline_reached got=%s of=%s", len(closes), len(wanted))
+                break
+            except Exception as exc:
+                SYS_LOG.debug("relative_strength_fetch_failed symbol=%s detail=%s", symbol, exc)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    result: Dict[str, relative_strength.RelativeStrength] = {}
+    for metrics in picks:
+        sector = (profiles.get(metrics.symbol) or {}).get("sector")
+        strength = relative_strength.safe_compute(metrics.symbol, sector, closes.get)
+        if strength is not None:
+            result[metrics.symbol] = strength
+    return result
 
 
 def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
@@ -227,6 +279,9 @@ def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
         if sized.amount is not None:
             text += f" ≈ {sized.amount:,.0f}"
         lines.append(text)
+    strength_line = relative_strength.render_line(risk.strength.get(symbol))
+    if strength_line:
+        lines.append(escape(strength_line, quote=False))
     flag = risk.events.get(symbol)
     if flag is not None:
         lines.append(f"    ⚠️ {escape(flag.text)} — inside a typical {SETTINGS.trade_outcome_lookback_days}-session hold")

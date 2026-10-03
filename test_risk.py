@@ -40,6 +40,12 @@ def _history(returns, start_price=100.0, days_ago=10, tz="UTC"):
 
 
 class SettingsCase(unittest.TestCase):
+    def setUp(self):
+        # Relative strength fetches six months of history for the stock, its market
+        # proxy and its sector ETF. These tests are about the other risk analytics
+        # and must never reach yfinance; test_relative_strength.py covers that part.
+        self.use(relative_strength_enabled=False)
+
     def use(self, **values):
         for name, value in values.items():
             patcher = patch.object(nb_config.SETTINGS, name, value)
@@ -107,6 +113,7 @@ class EarningsFlagTests(SettingsCase):
 
 class CorrelationTests(SettingsCase):
     def setUp(self):
+        super().setUp()
         rng = np.random.default_rng(7)
         self.base = rng.normal(0, 0.01, 80)
         self.histories = {
@@ -373,6 +380,7 @@ class EventProfileLookupTests(unittest.TestCase):
 
 class IntegrationTests(SettingsCase):
     def setUp(self):
+        super().setUp()
         # Rendering a candidate reads its qualifying streak from the trade history;
         # give it a throwaway store so no real database is opened or leaked.
         store = nb_history_store.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "h.db"))

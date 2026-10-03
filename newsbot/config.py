@@ -166,6 +166,12 @@ class AppSettings(BaseSettings):
     risk_earnings_warn_days: int = 7
     # Wall-clock allowance for the extra lookups; the screen never waits longer.
     risk_context_deadline_seconds: int = 12
+    # Relative strength shown beside the risk lines: the stock's return over the
+    # last N completed sessions minus the market's (and its US sector ETF's), plus
+    # beta to the market. Context for reading a move, not a ranking signal.
+    relative_strength_enabled: bool = True
+    relative_strength_windows: str = "20,60"
+    relative_strength_beta_min_obs: int = 30
     # Market-data health. The container healthcheck only proves threads are
     # alive; if Yahoo returns nothing the bot stays "healthy" while every
     # screen is empty. A screen is "bad" when too many symbols come back with
