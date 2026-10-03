@@ -245,6 +245,7 @@ each send, which is what makes cross-outlet deduplication possible.
 | `NEWS_RANKER_URL` | `http://localhost:11434` | Ollama endpoint (compose sets `http://ollama:11434`) |
 | `NEWS_RANKER_MODEL` | `qwen2.5:3b` | Ranking model; must be pulled into Ollama |
 | `NEWS_RANKER_MAX_CANDIDATES` | `14` | Shortlist size sent to the LLM |
+| `BRIEFING_BUDGET_SECONDS` | `900` | Time allowed to compose a briefing; news sections not yet started when it runs out are skipped |
 | `NEWS_RANKER_TIMEOUT_SECONDS` | `240` | Per-call timeout |
 | `RANKER_NETWORK` | bundled net | Network carrying Ollama |
 | `RANKER_NETWORK_EXTERNAL` | `false` | Set `true` to reuse another project's network |
@@ -772,6 +773,17 @@ small number of hypotheses. An already inspected holdout is exploratory evidence
 not untouched validation for changes motivated by these results. The command does
 not tune rules or claim statistical significance. Large universes can produce
 multiple Telegram message parts.
+
+### Briefing resilience
+
+Each briefing section (Norway news, global news, business & markets, trade
+candidates) is isolated: if one fails or the time budget runs out, the briefing
+still goes out with a one-line notice in that section's place, and `/health`
+shows `Last run status: partial: <sections>`. The trade screen runs alongside the
+news sections. Only one briefing is composed at a time, so `/now` during a
+scheduled run is told to wait instead of sending a duplicate. A command that a
+restart cuts short is reported when the bot comes back up, with a prompt to send it
+again.
 
 ### `/forwardtest`
 

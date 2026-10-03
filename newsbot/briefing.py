@@ -1,9 +1,13 @@
 """Briefing composition and the scheduled jobs."""
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from newsbot import market_data, messaging, news_feeds, screener
 from newsbot.config import EVENING_GREETINGS, INSPIRATIONAL_QUOTES, MORNING_GREETINGS, SETTINGS
@@ -45,6 +49,8 @@ class Briefing:
     pending: List[Tuple[str, str]] = field(default_factory=list)
     titles: List[str] = field(default_factory=list)
     picks: List[TradeMetrics] = field(default_factory=list)
+    # Sections that raised or were skipped for time; the briefing still goes out.
+    failed_sections: List[str] = field(default_factory=list)
 
 
 def _pending_keys(section: str, selections: List[Selection]) -> List[Tuple[str, str]]:
@@ -57,12 +63,78 @@ def _pending_keys(section: str, selections: List[Selection]) -> List[Tuple[str, 
     return pending
 
 
+# One briefing at a time. The scheduled job and /now both compose, send and then
+# commit headline keys; interleaved, each would show the other's headlines as
+# new (duplicate sends) and race on the dedup state.
+_BRIEFING_LOCK = threading.Lock()
+BRIEFING_LOCK_WAIT_SECONDS = 1800
+
+
+@contextmanager
+def _briefing_slot(blocking: bool) -> Iterator[bool]:
+    """Yields whether this caller now holds the briefing lock."""
+    if blocking:
+        acquired = _BRIEFING_LOCK.acquire(timeout=BRIEFING_LOCK_WAIT_SECONDS)
+    else:
+        acquired = _BRIEFING_LOCK.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            _BRIEFING_LOCK.release()
+
+
+def _run_section(
+    label: str, build: Callable[[], Tuple[str, List[Selection]]],
+    deadline: float, failed: List[str],
+) -> Tuple[str, List[Selection]]:
+    """One news section, isolated: a failure costs that section, not the briefing."""
+    if time.monotonic() >= deadline:
+        APP_LOG.warning("briefing_section_skipped section=%s reason=out_of_time", label)
+        failed.append(label)
+        return f"⚠️ {label} skipped: ran out of time.\n\n", []
+    try:
+        return build()
+    except Exception as exc:
+        APP_LOG.error("briefing_section_failed section=%s detail=%s", label, exc)
+        failed.append(label)
+        return f"⚠️ {label} unavailable this time.\n\n", []
+
+
 def compose_briefing(now: Optional[datetime] = None) -> Briefing:
     now = now or datetime.now()
-    norway_text, norway_selections = news_feeds.get_norwegian_morning_news()
-    global_text, global_selections = news_feeds.get_global_news()
-    business_text, business_selections = market_data.get_business_and_stocks()
-    trade_text, trade_outcome, _labels = screener.build_trade_candidates_payload()
+    deadline = time.monotonic() + max(10, SETTINGS.briefing_budget_seconds)
+    failed: List[str] = []
+
+    # The trade screen waits on market-data HTTP while the news sections wait on
+    # feeds and the local LLM, so they overlap. News sections stay sequential:
+    # the ranker is a single small model and parallel calls would only slow each.
+    screen_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="briefing-screen")
+    screen_future = screen_pool.submit(screener.build_trade_candidates_payload)
+    try:
+        norway_text, norway_selections = _run_section(
+            "Norway news", news_feeds.get_norwegian_morning_news, deadline, failed)
+        global_text, global_selections = _run_section(
+            "Global news", news_feeds.get_global_news, deadline, failed)
+        business_text, business_selections = _run_section(
+            "Business & markets", market_data.get_business_and_stocks, deadline, failed)
+
+        picks: List[TradeMetrics] = []
+        try:
+            trade_text, trade_outcome, _labels = screen_future.result(
+                timeout=max(5.0, deadline - time.monotonic())
+            )
+            picks = trade_outcome.qualified[:5]
+        except FuturesTimeoutError:
+            APP_LOG.error("briefing_section_failed section=trade_candidates detail=timeout")
+            failed.append("Trade candidates")
+            trade_text = "⚠️ Trade candidates skipped: ran out of time.\n\n"
+        except Exception as exc:
+            APP_LOG.error("briefing_section_failed section=trade_candidates detail=%s", exc)
+            failed.append("Trade candidates")
+            trade_text = "⚠️ Trade candidates unavailable this time.\n\n"
+    finally:
+        screen_pool.shutdown(wait=False, cancel_futures=True)
 
     message = (
         build_daily_intro(now)
@@ -81,8 +153,8 @@ def compose_briefing(now: Optional[datetime] = None) -> Briefing:
     all_selections = norway_selections + global_selections + business_selections
     titles = [selection.candidate.title for selection in all_selections]
     return Briefing(
-        message=message, pending=pending, titles=titles,
-        picks=trade_outcome.qualified[:5],
+        message=message, pending=pending, titles=titles, picks=picks,
+        failed_sections=failed,
     )
 
 
@@ -154,18 +226,33 @@ def job_daily_briefing(force_hour: Optional[int] = None, slot: Optional[str] = N
     run_time = datetime.now()
     if force_hour is not None:
         run_time = run_time.replace(hour=force_hour, minute=0, second=0, microsecond=0)
-    APP_LOG.info("briefing_start at=%s", run_time.isoformat())
-    briefing = compose_briefing(run_time)
-    success = messaging._broadcast_message(briefing.message)
-    if success:
-        _commit_briefing(briefing)
-        if slot:
-            STATE.data["last_scheduled_slot"] = slot
-    else:
-        APP_LOG.warning("briefing_send_failed headlines_not_marked=%d", len(briefing.pending))
-    STATE.data["last_run_status"] = "success" if success else "failed"
-    STATE.save()
-    return success
+    with _briefing_slot(blocking=True) as held:
+        if not held:
+            APP_LOG.error("briefing_lock_timeout waited=%ds", BRIEFING_LOCK_WAIT_SECONDS)
+            return False
+        APP_LOG.info("briefing_start at=%s", run_time.isoformat())
+        try:
+            briefing = compose_briefing(run_time)
+            success = messaging._broadcast_message(briefing.message)
+        except Exception as exc:
+            # Nothing may escape into the scheduler: the status must say what
+            # happened, and the next slot must still run.
+            APP_LOG.error("briefing_failed detail=%s", exc)
+            STATE.data["last_run_status"] = "failed"
+            STATE.save()
+            return False
+        if success:
+            _commit_briefing(briefing)
+            if slot:
+                STATE.data["last_scheduled_slot"] = slot
+        else:
+            APP_LOG.warning("briefing_send_failed headlines_not_marked=%d", len(briefing.pending))
+        if success and briefing.failed_sections:
+            STATE.data["last_run_status"] = "partial: " + ", ".join(briefing.failed_sections)
+        else:
+            STATE.data["last_run_status"] = "success" if success else "failed"
+        STATE.save()
+        return success
 
 
 def job_health_ping() -> bool:
@@ -182,6 +269,12 @@ def job_health_ping() -> bool:
 
 
 def _send_briefing(now: datetime, chat_id: str) -> None:
-    briefing = compose_briefing(now)
-    if messaging._broadcast_message(briefing.message, chat_id=chat_id):
-        _commit_briefing(briefing)
+    with _briefing_slot(blocking=False) as held:
+        if not held:
+            messaging.send_telegram_message(
+                "A briefing is already being prepared; it will arrive shortly.", chat_id=chat_id
+            )
+            return
+        briefing = compose_briefing(now)
+        if messaging._broadcast_message(briefing.message, chat_id=chat_id):
+            _commit_briefing(briefing)

@@ -25,7 +25,7 @@ jobs:
       - name: Lint (pyflakes rules only)
         run: |
           pip install ruff
-          ruff check --select F news_bot.py newsbot test_news_bot.py test_hardening.py test_forward_test.py
+          ruff check --select F news_bot.py newsbot test_*.py
 
       - name: Audit pinned dependencies
         run: |
