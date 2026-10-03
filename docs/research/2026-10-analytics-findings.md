@@ -60,13 +60,33 @@ By year the top decile was negative or flat every year from 2016 to 2021 and pos
 from 2022 on, with 2026 (+3.08 pp/month) carrying much of the holdout. Monthly
 reversal was not significant in either period.
 
+## 4. The same test on small and mid caps
+
+Current S&P 400 and S&P 600 members (992 stocks with data), same monthly 12-1
+momentum and one-month reversal deciles, 10 bps per side. The Wikipedia lists carry
+no join dates, so **no survivorship control is possible here** and the numbers are
+flattering: the equal-weighted universe itself "returned" +1.7% a month.
+
+| Period | Momentum top decile vs universe | One-month reversal top decile vs universe |
+|---|---|---|
+| Development | +0.33 pp/month (t +0.55) | +4.29 (t +1.21) |
+| Holdout | +0.66 (t +0.90) | -0.19 (t -0.46) |
+| All 119 months | +0.42 (t +0.91, better in 60% of months) | +2.97 (t +1.18) |
+
+Momentum was positive in ten of eleven years, steadier than in large caps, but never
+significant, and a 10 bps cost is optimistic for small caps. The reversal result is
+large and noisy in development and vanishes in the holdout, which is what survivors-only
+data produces (losers that happened to survive bounce). Neither can be validated
+without point-in-time constituents and realistic costs.
+
 ## Conclusions
 
 1. Daily price gates, classic factors and earnings surprises show **no reliable edge**
    over holding the same stocks in this data. Treat `/recommendations` as a screen.
-2. 12-month momentum is **regime-dependent**: nothing before 2022, strong since. That
-   is a hypothesis to follow forward (the `/forwardtest` archive records what the
-   live screen does), not a rule to ship.
+2. 12-month momentum is **regime-dependent in large caps** (nothing before 2022,
+   strong since) and **steadier but unproven in small and mid caps** (survivor-biased
+   data). A hypothesis to follow forward (the `/forwardtest` archive records what the
+   live screen does) and to test on point-in-time data, not a rule to ship.
 3. What does not depend on a signal working is **how much to risk, whether the picks are
    one bet, and what events fall inside the hold**. That is what the risk and
    relative-strength lines in `/recommendations` and `/analyze` provide.
@@ -74,7 +94,7 @@ reversal was not significant in either period.
 ## Caveats
 
 - Today's index members only; delisted and acquired stocks are absent, and removals
-  from the index are not modelled.
+  from the index are not modelled. The small/mid-cap test has no join dates at all.
 - Equal-weighted universes; no sector neutralisation; one regime-heavy decade.
 - Holds overlap, so the t-values are rough. Costs are a flat 10 bps per side.
 - Daily bars only; nothing here tests intraday, options, fundamentals beyond earnings
