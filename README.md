@@ -935,8 +935,8 @@ CI (`.github/workflows/ci.yml`) runs on Python 3.11 (the Docker image) and 3.14:
 ruff with the rules in `ruff.toml` (pyflakes plus bugbear, bandit security
 checks and a few others; style-only families are left out), `pip-audit` on the
 pinned requirements, and the suite under coverage with `ResourceWarning` treated as
-an error. Coverage has a floor of 80% (`.coveragerc`); it is about 85% today, with
-`market_data.py` and `bot.py` the weakest. A separate job builds the Docker image and
+an error. Coverage has a floor of 80% (`.coveragerc`); it is about 92% today, with
+`indicators.py`, `briefing.py` and `commands.py` (84-88%) the weakest. A separate job builds the Docker image and
 checks the hardened runtime below.
 
 ## Docker
