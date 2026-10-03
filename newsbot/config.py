@@ -140,6 +140,18 @@ class AppSettings(BaseSettings):
     trade_max_atr_pct: float = 4.5
     trade_universe_max: int = 30
     trade_fetch_workers: int = 6
+    # Market-data health. The container healthcheck only proves threads are
+    # alive; if Yahoo returns nothing the bot stays "healthy" while every
+    # screen is empty. A screen is "bad" when too many symbols come back with
+    # no usable data, or the newest price session is stale.
+    market_data_alerts_enabled: bool = True
+    market_data_alert_ratio: float = 0.5
+    market_data_min_sample: int = 5
+    # Calendar days; 6 covers a long weekend plus a holiday without false alarms.
+    market_data_max_stale_days: int = 6
+    # Consecutive bad screens before alerting (a total outage alerts at once).
+    market_data_alert_after: int = 2
+    market_data_alert_reminder_hours: int = 24
     trade_history_cache_ttl_seconds: int = 600
     trade_total_deadline_seconds: int = 45
     trade_history_db_file: str = ".news_bot_trade_history.db"

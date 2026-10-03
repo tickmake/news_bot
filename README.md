@@ -791,6 +791,24 @@ plus mover discovery, not liquidity-filtered), not the whole market; holds overl
 and averages are not portfolio returns. Archiving starts at deploy; nothing is
 backfilled.
 
+### Market-data alerting
+
+The container healthcheck only proves the bot's threads are alive. If Yahoo
+throttles the bot or changes an endpoint, every screen would come back empty
+while the container stays "healthy". Each trade screen now records how many symbols
+returned usable data and the date of the newest price, and `/health` shows it
+(`Market data: ok / suspect / DEGRADED`).
+
+A screen is **bad** when more than `MARKET_DATA_ALERT_RATIO` (default 0.5) of
+the analysed symbols have no usable data, or the newest price session is more than
+`MARKET_DATA_MAX_STALE_DAYS` (default 6) calendar days old. Screens of fewer than
+5 symbols are ignored, so a slow run cut short by its deadline is not an outage.
+Two consecutive bad screens send one Telegram alert (a total outage alerts at
+once), a reminder follows every 24 hours while it persists, and one all-clear is
+sent on recovery. Alerts go to `HEALTH_PING_CHAT_ID` (or the main chat) and are
+mirrored to Slack. Set `MARKET_DATA_ALERTS_ENABLED=false` to record without
+alerting.
+
 ### `/pickperformance`
 
 Tracks the picks actually shown in successful **Telegram text deliveries** from
