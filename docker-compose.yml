@@ -184,6 +184,9 @@ services:
       - RISK_EARNINGS_WARN_DAYS=${RISK_EARNINGS_WARN_DAYS:-7}
       - RELATIVE_STRENGTH_ENABLED=${RELATIVE_STRENGTH_ENABLED:-true}
       - RELATIVE_STRENGTH_WINDOWS=${RELATIVE_STRENGTH_WINDOWS:-20,60}
+      - CATALYSTS_ENABLED=${CATALYSTS_ENABLED:-true}
+      - CATALYSTS_MAX_PER_PICK=${CATALYSTS_MAX_PER_PICK:-2}
+      - CATALYSTS_MAX_AGE_HOURS=${CATALYSTS_MAX_AGE_HOURS:-36}
       # Market-data alerting: a Telegram message when too many symbols return no
       # data, or prices go stale. See newsbot/data_health.py.
       - MARKET_DATA_ALERTS_ENABLED=${MARKET_DATA_ALERTS_ENABLED:-true}

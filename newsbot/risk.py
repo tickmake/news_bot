@@ -17,7 +17,7 @@ from datetime import date, datetime
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from newsbot import market_data, relative_strength
+from newsbot import catalysts, market_data, relative_strength
 from newsbot.config import SETTINGS
 from newsbot.indicators import TradeMetrics, _drop_in_progress_bar
 from newsbot.benchmarks import _backtest_benchmark_for
@@ -143,6 +143,7 @@ class PortfolioRisk:
     warnings: List[str] = field(default_factory=list)
     unknown_profiles: int = 0
     strength: Dict[str, relative_strength.RelativeStrength] = field(default_factory=dict)
+    headlines: Dict[str, List[catalysts.Headline]] = field(default_factory=dict)
 
 
 def assess(picks: Sequence[TradeMetrics], profiles: Dict[str, Dict[str, Any]],
@@ -187,7 +188,7 @@ def assess(picks: Sequence[TradeMetrics], profiles: Dict[str, Dict[str, Any]],
     return risk
 
 
-def build_context(picks: Sequence[TradeMetrics]) -> PortfolioRisk:
+def build_context(picks: Sequence[TradeMetrics], labels: Optional[Dict[str, str]] = None) -> PortfolioRisk:
     """Fetch what `assess` needs, within a deadline. Never raises, never blocks long."""
     if not SETTINGS.risk_analytics_enabled or not picks:
         return PortfolioRisk()
@@ -217,6 +218,7 @@ def build_context(picks: Sequence[TradeMetrics]) -> PortfolioRisk:
     context = assess(picks, profiles, pairs)
     if SETTINGS.relative_strength_enabled:
         context.strength = _relative_strength(picks, profiles)
+    context.headlines = catalysts.find(symbols, labels)
     return context
 
 
@@ -282,6 +284,7 @@ def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
     strength_line = relative_strength.render_line(risk.strength.get(symbol))
     if strength_line:
         lines.append(escape(strength_line, quote=False))
+    lines.extend(f"    {item.text}" for item in risk.headlines.get(symbol, []))
     flag = risk.events.get(symbol)
     if flag is not None:
         lines.append(f"    ⚠️ {escape(flag.text)} — inside a typical {SETTINGS.trade_outcome_lookback_days}-session hold")

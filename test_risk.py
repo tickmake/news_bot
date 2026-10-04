@@ -44,7 +44,7 @@ class SettingsCase(unittest.TestCase):
         # Relative strength fetches six months of history for the stock, its market
         # proxy and its sector ETF. These tests are about the other risk analytics
         # and must never reach yfinance; test_relative_strength.py covers that part.
-        self.use(relative_strength_enabled=False)
+        self.use(relative_strength_enabled=False, catalysts_enabled=False)
 
     def use(self, **values):
         for name, value in values.items():
