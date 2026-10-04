@@ -256,7 +256,15 @@ def _entry_exit_sketch(metrics: TradeMetrics) -> str:
     """
     reward = metrics.resistance_level - metrics.last_close
     risk = metrics.last_close - metrics.support_level
-    reward_risk = f"{reward / risk:.1f}:1" if risk > 0 else "n/a"
+    if risk <= 0:
+        reward_risk = "n/a"
+    elif reward <= 0:
+        # At or above its 20-session high there is no measured room to the old
+        # resistance; "0.0:1" read as a terrible trade when it is really "the
+        # range gives no target".
+        reward_risk = "no room to the 20-day high"
+    else:
+        reward_risk = f"{reward / risk:.1f}:1"
     return (
         f"    zone {metrics.support_level:,.2f}–{metrics.ema20:,.2f}"
         f" · invalidation below {metrics.support_level:,.2f}"
