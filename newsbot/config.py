@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_GLOBAL_NEWS_FEEDS = (
     "https://feeds.bbci.co.uk/news/world/rss.xml,"
     "https://www.cnbc.com/id/100727362/device/rss/rss.html,"
-    "https://feeds.apnews.com/apf-topnews"
+    "https://feeds.npr.org/1001/rss.xml"
 )
 DEFAULT_BUSINESS_NEWS_FEEDS = (
     "https://www.cnbc.com/id/10001147/device/rss/rss.html,"
@@ -101,7 +101,7 @@ class AppSettings(BaseSettings):
         # BBC item.
         "reuters.com,bloomberg.com,cnbc.com,finance.yahoo.com,yahoo.com,ft.com,"
         "bbc.com,bbc.co.uk,theguardian.com,nrk.no,aftenposten.no,e24.no,"
-        "apnews.com,marketwatch.com"
+        "apnews.com,marketwatch.com,npr.org"
     )
     blocked_news_domains: str = "news.google.com,pinterest.com,tiktok.com"
     news_max_age_hours: int = 30
