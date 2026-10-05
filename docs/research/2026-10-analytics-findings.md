@@ -79,22 +79,82 @@ large and noisy in development and vanishes in the holdout, which is what surviv
 data produces (losers that happened to survive bounce). Neither can be validated
 without point-in-time constituents and realistic costs.
 
+## 5. Point-in-time constituents: how big is the survivorship hole?
+
+October 2026 follow-up to the open item in issue #12. Sections 3 and 4 above are
+caveated by survivorship, so the question is whether that caveat can be removed.
+It splits in two, and only one half is fixable for free.
+
+**Membership is reconstructable.** The article's "selected changes to the list"
+table -- what the usual recipe walks backwards from today's members -- is no longer
+in the page. Instead `research/pit_members.py` asks the MediaWiki API for the
+article's own revision at each quarter end and parses the constituents table out
+of that revision, which is true membership for the date including names later
+removed: 47 quarters, 2015-03 to 2026-09, 502-505 symbols each, 782 distinct
+symbols in all, of which **279 have left the index**.
+
+**Prices for dead listings are not obtainable.** Yahoo drops daily history when a
+listing dies, so only **105 of those 279 departed names (38%)** still return usable
+bars; the other 174 -- ATVI, SIVB, FRC, TWTR, XLNX, CERN, DISCA, ANTM and so on --
+return nothing at all. Knowing SIVB was in the index in 2022 does not let you price
+it. Stooq, the usual free fallback, now gates its CSV endpoint behind a JavaScript
+proof-of-work challenge for every symbol, including live ones.
+
+So `research/pit_coverage.py` measures the hole rather than correcting it
+(`docs/research/data/sp500-pit-coverage.csv`):
+
+| Year | True members | Unpriceable today | Share of the index |
+|---|---|---|---|
+| 2015 | 503 | 129 | **25.6%** |
+| 2016 | 505 | 113 | 22.4% |
+| 2017 | 505 | 102 | 20.1% |
+| 2018 | 505 | 88 | 17.3% |
+| 2019 | 505 | 74 | 14.6% |
+| 2020 | 505 | 60 | 11.9% |
+| 2021 | 505 | 51 | 10.0% |
+| 2022 | 504 | 37 | 7.3% |
+| 2023 | 503 | 26 | 5.2% |
+| 2024 | 503 | 19 | 3.7% |
+| 2025 | 503 | 13 | 2.5% |
+| 2026 | 503 | 3 | **0.7%** |
+
+**This reframes section 3.** The large-cap momentum result there was "flat or negative
+to 2021, positive since 2022" and was read as regime-dependence. But the data hole
+falls almost perfectly along the same line: 10% or more of the index is invisible in
+every year through 2021, and 7.3% or less from 2022 on. The two explanations are
+confounded, and a decade-long test run on today's members is measuring a universe that
+is a quarter wrong at its start and nearly right at its end. Nothing in section 3
+distinguishes a momentum regime from a coverage artefact, so **the 2022-onward result
+should not be treated as a finding at all** until it is rerun on data that prices
+delisted names.
+
+**What that would take:** a dataset with delisted history -- CRSP, Sharadar via Nasdaq
+Data Link, Norgate, EODHD or Polygon. The membership half is now solved and committed,
+so such a dataset plugs into `momentum_sp500.py` by swapping the eligibility filter for
+the quarter's symbol set. Until then the `/forwardtest` archive, which records what the
+live screen actually did with no survivorship question at all, is the only clean
+out-of-sample read.
+
 ## Conclusions
 
 1. Daily price gates, classic factors and earnings surprises show **no reliable edge**
    over holding the same stocks in this data. Treat `/recommendations` as a screen.
-2. 12-month momentum is **regime-dependent in large caps** (nothing before 2022,
-   strong since) and **steadier but unproven in small and mid caps** (survivor-biased
-   data). A hypothesis to follow forward (the `/forwardtest` archive records what the
-   live screen does) and to test on point-in-time data, not a rule to ship.
+2. 12-month momentum looked **regime-dependent in large caps** (nothing before 2022,
+   strong since) and **steadier but unproven in small and mid caps**. Section 5 undercuts
+   the first half: the share of the index that cannot be priced today falls from 26% in
+   2015 to 0.7% in 2026, tracking the same 2022 boundary, so regime and data coverage are
+   confounded. Treat neither as a finding. A hypothesis to follow forward (the
+   `/forwardtest` archive records what the live screen does) and to retest on data that
+   prices delisted names, not a rule to ship.
 3. What does not depend on a signal working is **how much to risk, whether the picks are
    one bet, and what events fall inside the hold**. That is what the risk and
    relative-strength lines in `/recommendations` and `/analyze` provide.
 
 ## Caveats
 
-- Today's index members only; delisted and acquired stocks are absent, and removals
-  from the index are not modelled. The small/mid-cap test has no join dates at all.
+- Sections 1-4 use today's index members only; delisted and acquired stocks are absent,
+  and removals from the index are not modelled. The small/mid-cap test has no join dates
+  at all. Section 5 quantifies what this costs: up to a quarter of the 2015 index.
 - Equal-weighted universes; no sector neutralisation; one regime-heavy decade.
 - Holds overlap, so the t-values are rough. Costs are a flat 10 bps per side.
 - Daily bars only; nothing here tests intraday, options, fundamentals beyond earnings
