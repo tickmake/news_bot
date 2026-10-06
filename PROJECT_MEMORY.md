@@ -20,11 +20,17 @@ Telegram is the only control channel.
 
 Ten years of daily data found no reliable edge in the screen or in simple price and
 earnings signals over holding the same stocks; the gates are significantly worse than
-the average stock at a 10-session hold. Momentum is regime-dependent (nothing before
-2022, strong since). Details, tables and caveats: `docs/research/2026-10-analytics-findings.md`;
-scripts in `research/`. Issue #12 holds the earlier audit. `/recommendations` is a
-screen, not a signal. Do not tune thresholds further without a paired test against the
-ungated baseline on development data first.
+the average stock at a 10-session hold. **The thresholds have now been swept** (issue
+#47): of all 3,456 combinations of the five gates, none is positive in both development
+and holdout at 5, 10 or 20 sessions, so there is nothing to tune toward -- do not
+re-tune them, and treat a request to do so as already answered. Momentum looked
+regime-dependent (nothing before 2022, strong since), but the share of the index that
+cannot be priced today falls across the same boundary, so regime and survivorship are
+confounded and neither is a finding. Details, tables and caveats:
+`docs/research/2026-10-analytics-findings.md`; scripts in `research/`. Issue #12 holds
+the earlier audit. `/recommendations` is a screen, not a signal, and since the ordering
+between two qualifying names cannot be justified, picks are grouped into tiers rather
+than ranked 1-5.
 
 ## What the bot does now
 
@@ -35,9 +41,15 @@ ungated baseline on development data first.
   `/forwardtest`, `/health`.
 - Risk analytics under each candidate and in `/analyze` (`newsbot/risk.py`): a 2xATR
   volatility stop, fixed-fractional position size, earnings-date flags, correlation
-  and sector clustering, totals at work and at risk.
+  and sector clustering, totals at work and at risk. Reward:risk is measured to that
+  same stop, not to the 20-day low. Correlated picks also get a combined
+  stopped-out-together figure, and the footer states the measured frequency with which
+  the stop gaps through (about one in seven) rather than only warning that it can.
 - Relative strength and beta versus the market and, for US stocks, the sector ETF
   (`newsbot/relative_strength.py`). Context, not a ranking.
+- Candidates grouped as volume-confirmed / unconfirmed / extended (RSI 70+) and listed
+  alphabetically inside each group. `signal_archive` still records the underlying rank
+  so `/forwardtest` can test whether rank predicted anything.
 - A permanent `signal_archive` of every screened symbol, settled by `/forwardtest`
   into out-of-sample results (needs about 60 paired dates before it can say anything).
 - Market-data alerting when too many symbols return no data or prices go stale.

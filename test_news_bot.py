@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, mock_open, patch
 from zoneinfo import ZoneInfo
@@ -3414,13 +3415,59 @@ class TradeRenderingTests(unittest.TestCase):
         self.assertIn("Why the other 2 didn't qualify", result)
         self.assertIn("1 \u00b7 no usable price data", result)
 
-    def test_ranked_order_in_output(self):
+    def test_output_is_grouped_by_tier_and_alphabetical_inside_it(self):
+        """Stronger momentum no longer sorts a name higher in the rendered list.
+
+        The gate sweep found no threshold combination that beats holding the
+        same stocks, so an order between two qualifying names is noise. Both
+        of these are volume-confirmed, so they share a tier and appear
+        alphabetically regardless of the 9:1 momentum difference.
+        """
         def side_effect(symbol):
             return self._qualifying(symbol, {"AAA": 1.0, "BBB": 9.0}[symbol])
 
         with patch("newsbot.indicators._compute_trade_metrics", side_effect=side_effect):
             result = nb_screener.get_trade_candidates(universe={"A": "AAA", "B": "BBB"}, top_n=2)
+        self.assertIn(nb_screener.TIER_CONFIRMED, result)
+        self.assertLess(result.index("AAA"), result.index("BBB"))
+        self.assertIn("not ranked", result)
+        self.assertNotIn("<b>1. ", result)
+
+    def test_extended_names_are_tiered_below_confirmed_ones(self):
+        def side_effect(symbol):
+            metrics = self._qualifying(symbol, 5.0)
+            return replace(metrics, rsi_14=80.0) if symbol == "AAA" else metrics
+
+        with patch("newsbot.indicators._compute_trade_metrics", side_effect=side_effect):
+            result = nb_screener.get_trade_candidates(universe={"A": "AAA", "B": "BBB"}, top_n=2)
+        # AAA is alphabetically first but extended, so it renders last.
+        self.assertLess(result.index(nb_screener.TIER_CONFIRMED),
+                        result.index(nb_screener.TIER_EXTENDED))
         self.assertLess(result.index("BBB"), result.index("AAA"))
+
+    def test_rank_is_still_recorded_for_the_forward_test(self):
+        """Tiering is presentation only: the archive keeps the underlying rank
+        so `/forwardtest` can still ask whether rank predicted anything.
+
+        Needs its own store: a rank is written once per symbol and session,
+        so a sibling test screening the same session first would otherwise
+        decide what this one reads back.
+        """
+        store = nb_history_store.TradeHistoryStore(
+            os.path.join(tempfile.mkdtemp(), "ranks.db"))
+        self.addCleanup(store.close)
+
+        def side_effect(symbol):
+            return self._qualifying(symbol, {"AAA": 1.0, "BBB": 9.0}[symbol])
+
+        with patch.object(nb_history_store, "TRADE_HISTORY", store), patch(
+            "newsbot.indicators._compute_trade_metrics", side_effect=side_effect
+        ):
+            nb_screener.get_trade_candidates(universe={"A": "AAA", "B": "BBB"}, top_n=2)
+        ranks = {row["symbol"]: row["rank"]
+                 for row in store.archive_rows() if row["rank"] is not None}
+        self.assertEqual(ranks.get("BBB"), 1)
+        self.assertEqual(ranks.get("AAA"), 2)
 
     def test_signal_enrichment_lines_appear_for_a_qualifying_candidate(self):
         metrics = nb_indicators.TradeMetrics(

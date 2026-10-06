@@ -20,6 +20,11 @@ python research/momentum_sp500.py /tmp/sp500.pkl sp500.csv                 # mon
 # 3. Point-in-time membership, and how much of it can still be priced
 python research/pit_members.py /tmp/pit_members.pkl                        # 47 quarter-end constituent lists from Wikipedia revisions (~20 min, rate-limited)
 python research/pit_coverage.py /tmp/pit_members.pkl sp500_wiki.html docs/research/data/sp500-pit-coverage.csv
+
+# 4. Are the gate thresholds worth anything, and does the stop hold? (issue #47)
+# Both read the same basket pickle as step 1.
+python research/gate_sweep.py /tmp/basket.pkl /tmp/gate_sweep.pkl          # 3,456 threshold combinations x 3 hold lengths
+python research/gap_risk.py /tmp/basket.pkl                                # how often a 2xATR stop gaps through
 ```
 
 `pit_coverage.py` needs the current-members page saved alongside the snapshots
