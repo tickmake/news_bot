@@ -391,9 +391,9 @@ class IntegrationTests(SettingsCase):
 
     def test_candidate_block_includes_risk_lines(self):
         context = risk.assess([_m("AAA")], {}, [], TODAY)
-        lines = nb_screener._render_candidate(1, _m("AAA"), "Alpha", context)
+        lines = nb_screener._render_candidate(_m("AAA"), "Alpha", context)
         self.assertTrue(any("volatility stop" in line for line in lines))
-        plain = nb_screener._render_candidate(1, _m("AAA"), "Alpha")
+        plain = nb_screener._render_candidate(_m("AAA"), "Alpha")
         self.assertFalse(any("volatility stop" in line for line in plain))
 
     def test_recommendations_text_has_per_pick_and_portfolio_sections(self):
@@ -449,6 +449,100 @@ class IntegrationTests(SettingsCase):
             report = nb_reports.build_ticker_analysis("AAA")
         self.assertIn(f"Next earnings: {far:%b %d, %Y}", report)
         self.assertNotIn("⚠️ earnings", report)
+
+
+class CorrelatedClusterTests(SettingsCase):
+    """Sizing treats each pick as its own bet; clustering says when it is not."""
+
+    def test_transitive_pairs_become_one_cluster(self):
+        pairs = [("AAA", "BBB", 0.9, 90), ("BBB", "CCC", 0.85, 90)]
+        clusters = risk.correlated_clusters(["AAA", "BBB", "CCC", "DDD"], pairs)
+        self.assertEqual(clusters, [["AAA", "BBB", "CCC"]])
+
+    def test_a_symbol_with_no_pair_is_not_a_cluster(self):
+        self.assertEqual(risk.correlated_clusters(["AAA", "BBB"], []), [])
+
+    def test_pairs_naming_unknown_symbols_are_ignored(self):
+        clusters = risk.correlated_clusters(["AAA"], [("AAA", "ZZZ", 0.9, 90)])
+        self.assertEqual(clusters, [])
+
+    def test_largest_cluster_comes_first(self):
+        pairs = [("AAA", "BBB", 0.9, 90), ("CCC", "DDD", 0.9, 90), ("DDD", "EEE", 0.9, 90)]
+        clusters = risk.correlated_clusters(["AAA", "BBB", "CCC", "DDD", "EEE"], pairs)
+        self.assertEqual(clusters[0], ["CCC", "DDD", "EEE"])
+
+    def test_cluster_loss_adds_up_the_whole_group(self):
+        picks = [_m("AAA"), _m("BBB"), _m("CCC")]
+        pairs = [("AAA", "BBB", 0.9, 90), ("BBB", "CCC", 0.88, 90)]
+        context = risk.assess(picks, {}, pairs, TODAY)
+        expected = sum(context.sizing[s].risk_pct for s in ("AAA", "BBB", "CCC"))
+        self.assertAlmostEqual(context.cluster_loss_pct, expected, places=6)
+        self.assertAlmostEqual(context.cluster_weight_pct,
+                               sum(context.sizing[s].weight_pct
+                                   for s in ("AAA", "BBB", "CCC")), places=6)
+        self.assertLess(context.cluster_loss_pct, context.max_loss_pct + 1e-9)
+
+    def test_three_way_cluster_is_called_out_in_words(self):
+        picks = [_m("AAA"), _m("BBB"), _m("CCC")]
+        pairs = [("AAA", "BBB", 0.9, 90), ("BBB", "CCC", 0.88, 90)]
+        context = risk.assess(picks, {}, pairs, TODAY)
+        self.assertTrue(any("all move together" in warning for warning in context.warnings))
+
+    def test_a_mere_pair_is_left_to_the_pair_warning(self):
+        """Two names already get a pair warning; repeating it with arithmetic
+        adds nothing, so the cluster sentence starts at three."""
+        context = risk.assess([_m("AAA"), _m("BBB")], {},
+                              [("AAA", "BBB", 0.9, 90)], TODAY)
+        self.assertEqual(context.clusters, [["AAA", "BBB"]])
+        self.assertFalse(any("all move together" in w for w in context.warnings))
+
+
+class StopConsistencyTests(SettingsCase):
+    """One candidate block must not show two different stops."""
+
+    def setUp(self):
+        super().setUp()
+        store = nb_history_store.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "h.db"))
+        self.addCleanup(store.close)
+        patcher = patch.object(nb_history_store, "TRADE_HISTORY", store)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_reward_risk_is_measured_to_the_sizing_stop(self):
+        metrics = _m("AAA", atr=2.0, close=100.0)
+        context = risk.assess([metrics], {}, [], TODAY)
+        sized = context.sizing["AAA"]
+        sketch = nb_screener._entry_exit_sketch(metrics, context)
+        self.assertIn(f"invalidation below {sized.stop_price:,.2f} (stop)", sketch)
+        expected = (metrics.resistance_level - metrics.last_close) / (
+            metrics.last_close - sized.stop_price)
+        self.assertIn(f"reward:risk {expected:.1f}:1", sketch)
+
+    def test_the_block_shows_only_one_stop_price(self):
+        metrics = _m("AAA", atr=2.0, close=100.0)
+        context = risk.assess([metrics], {}, [], TODAY)
+        lines = nb_screener._render_candidate(metrics, "Alpha", context)
+        block = "\n".join(lines)
+        sized = context.sizing["AAA"]
+        self.assertEqual(block.count(f"{sized.stop_price:,.2f}"), 2)
+        # The 20-day low still appears as the zone floor, never as the stop.
+        self.assertNotIn(f"invalidation below {metrics.support_level:,.2f}", block)
+
+    def test_without_sizing_it_falls_back_to_the_low_and_labels_it(self):
+        metrics = _m("AAA")
+        sketch = nb_screener._entry_exit_sketch(metrics, None)
+        self.assertIn(f"invalidation below {metrics.support_level:,.2f} (20-day low)", sketch)
+
+    def test_no_room_to_the_high_survives_the_new_denominator(self):
+        metrics = _m("AAA", close=110.0, resistance_level=104.0)
+        context = risk.assess([metrics], {}, [], TODAY)
+        self.assertIn("no room to the 20-day high",
+                      nb_screener._entry_exit_sketch(metrics, context))
+
+    def test_footer_states_the_measured_gap_frequency(self):
+        context = risk.assess([_m("AAA")], {}, [], TODAY)
+        footer = "\n".join(nb_screener.risk_analytics.portfolio_lines(context))
+        self.assertIn("one stop in seven", footer)
 
 
 if __name__ == "__main__":

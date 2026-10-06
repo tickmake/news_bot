@@ -4,7 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from html import escape
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from newsbot import config, data_health, history_store, indicators, market_data, risk as risk_analytics
 from newsbot.config import SETTINGS
@@ -246,17 +246,32 @@ def _rsi_label(rsi: Optional[float]) -> str:
     return f"{rsi:.0f}"
 
 
-def _entry_exit_sketch(metrics: TradeMetrics) -> str:
+def _entry_exit_sketch(
+    metrics: TradeMetrics, risk: Optional[risk_analytics.PortfolioRisk] = None
+) -> str:
     """A plain-technical entry/exit sketch from the recent 20-session range.
 
     Not a standalone signal -- it reads alongside the rest of the block and
-    the "informational only" footer in `get_trade_candidates`. Reward/risk
-    is measured against the same 20-session support/resistance the drawdown
-    gate already uses, so it does not introduce a second notion of range.
+    the "informational only" footer in `get_trade_candidates`.
+
+    The downside is measured to the **same stop the sizing line uses** (the
+    2xATR volatility stop) whenever risk analytics produced one. This line
+    used to measure risk to the 20-session low while the risk line directly
+    below it placed a volatility stop somewhere else entirely, so one block
+    showed two different stops and a reward:risk computed against the one the
+    reader was not told to use. Without sizing -- analytics disabled, or ATR
+    unavailable -- it falls back to the 20-session low and labels it.
     """
+    sized = risk.sizing.get(metrics.symbol) if risk is not None else None
+    if sized is not None:
+        stop_price = sized.stop_price
+        stop_label = "stop"
+    else:
+        stop_price = metrics.support_level
+        stop_label = "20-day low"
     reward = metrics.resistance_level - metrics.last_close
-    risk = metrics.last_close - metrics.support_level
-    if risk <= 0:
+    downside = metrics.last_close - stop_price
+    if downside <= 0:
         reward_risk = "n/a"
     elif reward <= 0:
         # At or above its 20-session high there is no measured room to the old
@@ -264,16 +279,56 @@ def _entry_exit_sketch(metrics: TradeMetrics) -> str:
         # range gives no target".
         reward_risk = "no room to the 20-day high"
     else:
-        reward_risk = f"{reward / risk:.1f}:1"
+        reward_risk = f"{reward / downside:.1f}:1"
     return (
         f"    zone {metrics.support_level:,.2f}–{metrics.ema20:,.2f}"
-        f" · invalidation below {metrics.support_level:,.2f}"
-        f" · reward:risk {reward_risk}"
+        f" · invalidation below {stop_price:,.2f} ({stop_label})"
+        f" · reward:risk {reward_risk} to the 20-day high"
     )
 
 
+# The ordering within a tier is not validated, so the reader is not given one.
+# `research/gate_sweep.py` swept all 3,456 threshold combinations of the five
+# gates over ten years: none was positive in both development and holdout at
+# 5, 10 or 20 sessions, and the shipped settings cost 0.08-0.19 pp against
+# simply holding the same stocks. A confident "1., 2., 3." over numbers that
+# cannot be shown to sort anything is the one claim the footer cannot walk
+# back, so picks are grouped by what *is* directly observed about them --
+# whether today's move came on real volume, and whether the name is already
+# extended -- and listed alphabetically inside each group.
+TIER_CONFIRMED = "Move confirmed by volume"
+TIER_UNCONFIRMED = "Move not confirmed by volume"
+TIER_EXTENDED = "Extended (RSI 70+) — worst moment to open"
+
+
+def _tier_of(metrics: TradeMetrics) -> str:
+    """Which group a qualifying candidate is shown under.
+
+    The same two booleans `ranking._rank_key` sorts on, surfaced as headings
+    instead of hidden in a sort order.
+    """
+    if metrics.rsi_14 is not None and metrics.rsi_14 >= 70:
+        return TIER_EXTENDED
+    if (metrics.volume_ratio is not None
+            and metrics.volume_ratio >= SETTINGS.trade_min_volume_ratio):
+        return TIER_CONFIRMED
+    return TIER_UNCONFIRMED
+
+
+def _group_into_tiers(
+    picks: Sequence[TradeMetrics],
+) -> List[Tuple[str, List[TradeMetrics]]]:
+    """Picks grouped by tier, alphabetical within each, empty tiers dropped."""
+    groups: Dict[str, List[TradeMetrics]] = {}
+    for metrics in picks:
+        groups.setdefault(_tier_of(metrics), []).append(metrics)
+    return [(tier, sorted(groups[tier], key=lambda m: m.symbol))
+            for tier in (TIER_CONFIRMED, TIER_UNCONFIRMED, TIER_EXTENDED)
+            if groups.get(tier)]
+
+
 def _render_candidate(
-    index: int, metrics: TradeMetrics, name: str,
+    metrics: TradeMetrics, name: str,
     risk: Optional[risk_analytics.PortfolioRisk] = None,
 ) -> List[str]:
     """One candidate as a short block rather than a wide table row.
@@ -299,14 +354,14 @@ def _render_candidate(
     streak = history_store.TRADE_HISTORY.recent_qualifying_streak(metrics.symbol)
     streak_note = f" · {streak}-session streak" if streak >= 2 else ""
     return [
-        f"<b>{index}. {escape(name)}</b> · {escape(metrics.symbol)}",
+        f"<b>{escape(name)}</b> · {escape(metrics.symbol)}",
         f"    {metrics.last_close:,.2f}   {metrics.day_change_pct:+.2f}% today"
         f"   {metrics.week_momentum_pct:+.2f}% over 5 days{streak_note}",
         f"    volume {volume_text}{confirmed}"
         f" · {metrics.drawdown_pct:.1f}% below 20-day high"
         f" · daily swing {metrics.atr_pct:.1f}%",
         f"    RSI {_rsi_label(metrics.rsi_14)} · volume {metrics.volume_trend}",
-        _entry_exit_sketch(metrics),
+        _entry_exit_sketch(metrics, risk),
         *risk_analytics.candidate_lines(metrics.symbol, risk),
         f"    <i>from the {escape(metrics.session)} close</i>",
         "",
@@ -411,10 +466,20 @@ def build_trade_candidates_payload(
         # Looked up once for the shown picks, within a deadline; a failure only
         # means the risk lines are missing, never that the screen is.
         risk = risk_analytics.build_context(shown, labels)
-        for index, metrics in enumerate(shown, 1):
-            lines.extend(
-                _render_candidate(index, metrics, labels.get(metrics.symbol, metrics.symbol), risk)
-            )
+        for tier, members in _group_into_tiers(shown):
+            lines.append(f"<b>{escape(tier)}</b>")
+            lines.append("")
+            for metrics in members:
+                lines.extend(
+                    _render_candidate(metrics, labels.get(metrics.symbol, metrics.symbol), risk)
+                )
+        lines.append(
+            "<i>Listed alphabetically within each group, not ranked: a sweep of all "
+            "3,456 threshold combinations of the five checks found none that beat simply "
+            "holding the same stocks, so any order between two qualifying names would be "
+            "noise presented as a judgement.</i>"
+        )
+        lines.append("")
         if qualified_count > len(shown):
             # Otherwise the header count and the number of blocks disagree.
             lines.append(

@@ -24,6 +24,20 @@ from newsbot.benchmarks import _backtest_benchmark_for
 from newsbot.logsetup import SYS_LOG
 
 
+# Measured, not asserted: `research/gap_risk.py` over the 44-stock evaluation
+# basket, 2016-2026, placing this same stop on all 26,645 sessions where a
+# symbol passed the shipped gates. 46% of those entries were stopped out, and
+# 13.9% of the stops gapped through rather than filling at the stop -- 6.4% of
+# all entries. The overshoot beyond the stop averaged 0.93 pp on a ~4% stop
+# (1.23x the intended loss), with a 90th percentile of 2.3 pp and a worst case
+# of 10.8 pp. Restate the numbers if the study is rerun.
+GAP_RISK_NOTE = (
+    "About one stop in seven gaps through instead of filling at the stop, "
+    "costing roughly a quarter more than planned on average and several times "
+    "that at worst."
+)
+
+
 @dataclass(frozen=True)
 class PositionSizing:
     stop_pct: float        # distance to the volatility stop, percent of price
@@ -131,6 +145,40 @@ def correlated_pairs(symbols: Sequence[str]) -> List[Tuple[str, str, float, int]
     return sorted(pairs, key=lambda item: -item[2])
 
 
+def correlated_clusters(
+    symbols: Sequence[str], pairs: Sequence[Tuple[str, str, float, int]]
+) -> List[List[str]]:
+    """Groups of symbols joined, directly or transitively, by a correlated pair.
+
+    Sizing treats every pick as its own bet, so the "if every stop is hit"
+    total implicitly assumes they fall independently. They often do not --
+    `correlated_pairs` already proves it pair by pair. A cluster is the
+    transitive closure of those pairs: if A moves with B and B with C, one
+    shock plausibly stops out all three, so their risk adds up at once.
+    Correlation is not causation and a cluster is not a guarantee; this only
+    puts a number on a concentration the reader can already see pair by pair.
+    """
+    parent: Dict[str, str] = {symbol: symbol for symbol in symbols}
+
+    def find(symbol: str) -> str:
+        while parent[symbol] != symbol:
+            parent[symbol] = parent[parent[symbol]]
+            symbol = parent[symbol]
+        return symbol
+
+    for first, second, _value, _sessions in pairs:
+        if first in parent and second in parent:
+            a, b = find(first), find(second)
+            if a != b:
+                parent[b] = a
+    groups: Dict[str, List[str]] = {}
+    for symbol in symbols:
+        groups.setdefault(find(symbol), []).append(symbol)
+    # Only multi-symbol groups say anything; a lone symbol is not a cluster.
+    return sorted((sorted(group) for group in groups.values() if len(group) > 1),
+                  key=lambda group: (-len(group), group))
+
+
 @dataclass
 class PortfolioRisk:
     sizing: Dict[str, PositionSizing] = field(default_factory=dict)
@@ -140,6 +188,9 @@ class PortfolioRisk:
     sector_groups: Dict[str, List[str]] = field(default_factory=dict)
     total_weight_pct: float = 0.0
     max_loss_pct: float = 0.0
+    clusters: List[List[str]] = field(default_factory=list)
+    cluster_weight_pct: float = 0.0   # the largest cluster's combined weight
+    cluster_loss_pct: float = 0.0     # loss if that whole cluster stops out
     warnings: List[str] = field(default_factory=list)
     unknown_profiles: int = 0
     strength: Dict[str, relative_strength.RelativeStrength] = field(default_factory=dict)
@@ -170,6 +221,14 @@ def assess(picks: Sequence[TradeMetrics], profiles: Dict[str, Dict[str, Any]],
     risk.total_weight_pct = sum(item.weight_pct for item in risk.sizing.values())
     risk.max_loss_pct = sum(item.risk_pct for item in risk.sizing.values())
 
+    risk.clusters = correlated_clusters([m.symbol for m in picks], risk.pairs)
+    if risk.clusters:
+        largest = risk.clusters[0]
+        risk.cluster_weight_pct = sum(
+            risk.sizing[symbol].weight_pct for symbol in largest if symbol in risk.sizing)
+        risk.cluster_loss_pct = sum(
+            risk.sizing[symbol].risk_pct for symbol in largest if symbol in risk.sizing)
+
     for first, second, value, sessions in risk.pairs:
         combined = sum(risk.sizing[s].weight_pct for s in (first, second) if s in risk.sizing)
         risk.warnings.append(
@@ -178,6 +237,15 @@ def assess(picks: Sequence[TradeMetrics], profiles: Dict[str, Dict[str, Any]],
         )
     for sector, names in risk.sector_groups.items():
         risk.warnings.append(f"{', '.join(names)} are all {sector}.")
+    # Only worth saying for a cluster bigger than the pair warnings above
+    # already cover, otherwise it restates them with extra arithmetic.
+    if len(risk.clusters) and len(risk.clusters[0]) >= 3 and risk.cluster_loss_pct > 0:
+        largest = risk.clusters[0]
+        risk.warnings.append(
+            f"{', '.join(largest)} all move together: one shock stopping out the whole group "
+            f"costs {risk.cluster_loss_pct:.1f}%, not the "
+            f"{risk.cluster_loss_pct / len(largest):.1f}% a single pick risks."
+        )
     if (len(risk.sizing) >= 2 and SETTINGS.risk_max_total_pct > 0
             and risk.total_weight_pct > SETTINGS.risk_max_total_pct):
         risk.warnings.append(
@@ -308,7 +376,7 @@ def portfolio_lines(risk: Optional[PortfolioRisk]) -> List[str]:
         lines.append(f"    <i>Sector and earnings data unavailable for {risk.unknown_profiles} pick(s).</i>")
     lines.append(
         f"    <i>Sizes risk {SETTINGS.risk_per_trade_pct:g}% of the portfolio per pick on a "
-        f"{SETTINGS.risk_stop_atr_multiple:g}×ATR stop; a gap can lose more. The screen itself has "
+        f"{SETTINGS.risk_stop_atr_multiple:g}×ATR stop. {GAP_RISK_NOTE} The screen itself has "
         "not been shown to beat holding the same stocks.</i>"
     )
     lines.append("")

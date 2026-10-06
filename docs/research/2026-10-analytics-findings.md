@@ -135,10 +135,90 @@ the quarter's symbol set. Until then the `/forwardtest` archive, which records w
 live screen actually did with no survivorship question at all, is the only clean
 out-of-sample read.
 
+## 6. Sweeping the gate thresholds: do any settings work?
+
+Issue #47 part 1. Sections 1-5 tested the gates only at their shipped values.
+This sweeps them. `research/gate_sweep.py` walks the full grid of the five
+gates on the 44-stock basket over ten years, same yardstick as section 1:
+next-open entry, exit at the close N sessions later, 10 bps per side, excess
+over the same-date average of every priced symbol.
+
+| Gate | Shipped | Values swept |
+|---|---|---|
+| price above its 20-day EMA | on | on, off |
+| 5-day momentum | >= 1.0% | -2, -1, 0, 0.5, 1, 2, 3, off |
+| 1-day change | > 0.0% | -2, -1, 0, 0.5, 1, off |
+| ATR | <= 4.5% | 2.5, 3.5, 4.5, 6, 8, off |
+| drawdown from the 20-day high | <= 8% | 2, 4, 8, 12, 20, off |
+
+That is 3,456 combinations per hold length. The result does not need a table:
+
+| Hold | Positive in development | Positive in **both** development and holdout |
+|---|---|---|
+| 5 sessions | 10 of 3,456 | **0 of 3,456** |
+| 10 sessions | 8 of 3,456 | **0 of 3,456** |
+| 20 sessions | 0 of 3,456 | **0 of 3,456** |
+
+Not one setting of the gates beats holding the same stocks out of sample. The
+best development combination at each hold length (+0.02, +0.01, -0.05 pp) turns
+negative on the holdout (-0.19, -0.11, -0.30). The shipped settings cost
+-0.08 pp at 5 sessions, -0.16 at 10 and -0.19 at 20, and the picks beat the
+universe average on only 45-46% of dates.
+
+Dropping each gate in turn is also informative: every drop *improves* the
+result, and the closer the gates get to admitting everything, the smaller the
+damage. At 10 sessions the shipped set is -0.16 pp; without the momentum gate
+-0.11; without the ATR gate -0.21 (the one gate whose removal hurts, by
+admitting the most volatile names). Loosening is not an edge either -- it is
+regression toward the universe, which is the thing that cannot be beaten here.
+
+**What follows from this.** No retuning: there is nothing to tune toward. The
+gates stay as an attention filter -- a way to look at eight names instead of
+thirty -- and `/recommendations` keeps saying so. What changed in the product
+is the part that was overclaiming: the numbered 1-5 ranking. An order between
+two qualifying names cannot be justified by anything measured here, so picks
+are now grouped by what *is* directly observed (volume confirmation, and
+whether the name is already extended) and listed alphabetically inside each
+group. The `signal_archive` still records the underlying rank, so
+`/forwardtest` can keep asking whether rank predicted anything.
+
+## 7. How often does the stop actually hold?
+
+Issue #47 part 3. `risk.portfolio_lines` warned that "a gap can lose more"
+than the 2xATR stop without saying how much more. `research/gap_risk.py`
+measures it: place that stop on every session in the basket where a symbol
+passed the shipped gates, then walk the hold forward session by session the
+way a stop order would be hit, filling at the open when the open is already
+through the stop.
+
+| | |
+|---|---|
+| qualifying entries | 26,645 |
+| stopped out | 12,364 (46.4%) |
+| gapped through the stop | 1,718 (13.9% of stops, 6.4% of entries) |
+| extra loss when it gapped, mean | 0.93 pp on a ~4% stop (1.23x intended) |
+| median / 90th percentile / worst | 0.51 / 2.29 / 10.82 pp |
+| across all stops, intended vs realised | 4.03% vs 4.16% |
+
+So the stop holds most of the time, and the tail is real but not ruinous: about
+one stop in seven gaps through, costing roughly a quarter more than planned on
+average, with a worst observed case near three times the intended loss. The
+footer now says that instead of gesturing at it. Two related fixes shipped with
+it: the entry/exit sketch now measures reward:risk against the **same** stop the
+sizing line places (it used the 20-session low while the line below it placed a
+volatility stop elsewhere, so one block showed two different stops), and
+`risk.correlated_clusters` adds up the risk of transitively correlated picks,
+since sizing otherwise treats every pick as an independent bet while
+`correlated_pairs` separately proves they are not.
+
 ## Conclusions
 
 1. Daily price gates, classic factors and earnings surprises show **no reliable edge**
    over holding the same stocks in this data. Treat `/recommendations` as a screen.
+   Section 6 closes the obvious follow-up question: it is not a matter of the wrong
+   thresholds. None of the 3,456 settings of the five gates is positive out of sample
+   at any hold length, so there is nothing to tune toward, and the ranking that implied
+   otherwise has been replaced by tiers.
 2. 12-month momentum looked **regime-dependent in large caps** (nothing before 2022,
    strong since) and **steadier but unproven in small and mid caps**. Section 5 undercuts
    the first half: the share of the index that cannot be priced today falls from 26% in
@@ -148,7 +228,9 @@ out-of-sample read.
    prices delisted names, not a rule to ship.
 3. What does not depend on a signal working is **how much to risk, whether the picks are
    one bet, and what events fall inside the hold**. That is what the risk and
-   relative-strength lines in `/recommendations` and `/analyze` provide.
+   relative-strength lines in `/recommendations` and `/analyze` provide. Section 7 puts
+   measured numbers behind two of its disclaimers: the stop gaps through about one time
+   in seven, and correlated picks now have their combined loss stated rather than implied.
 
 ## Caveats
 
