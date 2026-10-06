@@ -536,8 +536,18 @@ class StopConsistencyTests(SettingsCase):
     def test_no_room_to_the_high_survives_the_new_denominator(self):
         metrics = _m("AAA", close=110.0, resistance_level=104.0)
         context = risk.assess([metrics], {}, [], TODAY)
-        self.assertIn("no room to the 20-day high",
-                      nb_screener._entry_exit_sketch(metrics, context))
+        sketch = nb_screener._entry_exit_sketch(metrics, context)
+        self.assertIn("no room to the 20-day high", sketch)
+        # The yardstick is named once: a live screen rendered
+        # "no room to the 20-day high to the 20-day high".
+        self.assertEqual(sketch.count("to the 20-day high"), 1)
+
+    def test_a_ratio_names_what_it_is_measured_against(self):
+        metrics = _m("AAA", atr=2.0, close=100.0)
+        context = risk.assess([metrics], {}, [], TODAY)
+        sketch = nb_screener._entry_exit_sketch(metrics, context)
+        self.assertRegex(sketch, r"reward:risk \d+\.\d:1 to the 20-day high")
+        self.assertEqual(sketch.count("to the 20-day high"), 1)
 
     def test_footer_states_the_measured_gap_frequency(self):
         context = risk.assess([_m("AAA")], {}, [], TODAY)
