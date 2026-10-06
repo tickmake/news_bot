@@ -271,6 +271,10 @@ def _entry_exit_sketch(
         stop_label = "20-day low"
     reward = metrics.resistance_level - metrics.last_close
     downside = metrics.last_close - stop_price
+    # The "to the 20-day high" suffix names what the reward is measured
+    # against, so it belongs only on an actual ratio -- the no-room branch
+    # already names the high, and appending it there read as
+    # "no room to the 20-day high to the 20-day high".
     if downside <= 0:
         reward_risk = "n/a"
     elif reward <= 0:
@@ -279,11 +283,11 @@ def _entry_exit_sketch(
         # range gives no target".
         reward_risk = "no room to the 20-day high"
     else:
-        reward_risk = f"{reward / downside:.1f}:1"
+        reward_risk = f"{reward / downside:.1f}:1 to the 20-day high"
     return (
         f"    zone {metrics.support_level:,.2f}–{metrics.ema20:,.2f}"
         f" · invalidation below {stop_price:,.2f} ({stop_label})"
-        f" · reward:risk {reward_risk} to the 20-day high"
+        f" · reward:risk {reward_risk}"
     )
 
 
