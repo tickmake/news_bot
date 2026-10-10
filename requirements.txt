@@ -5,7 +5,7 @@ yfinance==1.7.0
 # yfinance now imports curl_cffi unconditionally, so it must be installed
 # (the old YF_NO_CURL_CFFI / uninstall workaround no longer applies).
 curl_cffi==0.16.3
-apscheduler==3.10.4
+apscheduler==3.11.3
 # Feed bodies are untrusted third-party input; stdlib ElementTree is
 # vulnerable to XML entity-expansion denial of service.
 defusedxml==0.7.1
