@@ -13,7 +13,12 @@ DEFAULT_GLOBAL_NEWS_FEEDS = (
 )
 DEFAULT_BUSINESS_NEWS_FEEDS = (
     "https://www.cnbc.com/id/10001147/device/rss/rss.html,"
-    "https://finance.yahoo.com/news/rssindex,"
+    # finance.yahoo.com/news/rssindex was retired and 404s on every briefing.
+    # Yahoo's surviving headline feed is a poor replacement here: most of its
+    # items link to fool.com, benzinga.com and stocktwits.com, which the
+    # trusted-domain allowlist drops. BBC Business links to bbc.co.uk, which
+    # is already trusted.
+    "https://feeds.bbci.co.uk/news/business/rss.xml,"
     "https://feeds.marketwatch.com/marketwatch/topstories/"
 )
 DEFAULT_NORWAY_NEWS_FEEDS = (
