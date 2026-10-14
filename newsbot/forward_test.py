@@ -21,7 +21,7 @@ from newsbot import history_store, market_data
 from newsbot.benchmarks import _matched_benchmark_return
 from newsbot.config import SETTINGS
 from newsbot.indicators import _drop_in_progress_bar
-from newsbot.logsetup import SYS_LOG
+from newsbot.logsetup import APP_LOG, SYS_LOG
 
 # Dates needed before the paired comparison is worth reading at all. The
 # backtest's per-variant standard error was ~0.1 pp over ~400 dates; far fewer
@@ -127,6 +127,30 @@ def settle_pending(today: Optional[datetime] = None) -> Tuple[int, int]:
         store.complete_archive_row(row["symbol"], row["signal_session"], outcome)
         settled += 1
     return settled, failed
+
+
+def job_settle_forward_test() -> bool:
+    """Settle every outcome whose holding period has passed. Never raises.
+
+    `build_forward_test_report` settles lazily, so without this job the archive
+    only advances when someone asks for the report. Late is the smaller problem:
+    settling needs price history covering the signal session, and a symbol that
+    stops returning it -- renamed, delisted, dropped by the provider -- can
+    never be settled afterwards. Every row left pending is a permanent hole in
+    the only out-of-sample record this project keeps, and the holes land on
+    exactly the names whose outcomes were worst, so the sample does not just
+    shrink, it flatters itself.
+    """
+    try:
+        settled, failed = settle_pending()
+    except Exception as exc:
+        SYS_LOG.error("forward_settle_failed detail=%s", exc)
+        return False
+    if failed:
+        SYS_LOG.warning("forward_settle_unavailable settled=%d lost=%d", settled, failed)
+    elif settled:
+        APP_LOG.info("forward_settle settled=%d", settled)
+    return not failed
 
 
 def _by_date(rows: List[Dict[str, Any]]) -> Dict[str, float]:

@@ -262,6 +262,35 @@ class SettleTests(unittest.TestCase):
         self.assertIsNone(json.loads(self.store.archive_rows()[0]["outcome_json"])["benchmark_return_pct"])
 
 
+class SettleJobTests(unittest.TestCase):
+    """The nightly job wrapper: it must report honestly and never raise."""
+
+    def test_a_clean_run_settles_and_reports_success(self):
+        with patch.object(nb_forward, "settle_pending", return_value=(3, 0)) as settle, \
+             self.assertLogs("news_bot", level="INFO") as logs:
+            self.assertTrue(nb_forward.job_settle_forward_test())
+        settle.assert_called_once_with()
+        self.assertIn("forward_settle settled=3", "\n".join(logs.output))
+
+    def test_unavailable_rows_warn_and_fail_the_run(self):
+        with patch.object(nb_forward, "settle_pending", return_value=(1, 2)), \
+             self.assertLogs("news_bot", level="WARNING") as logs:
+            self.assertFalse(nb_forward.job_settle_forward_test())
+        self.assertIn("forward_settle_unavailable settled=1 lost=2", "\n".join(logs.output))
+
+    def test_an_unexpected_error_is_logged_rather_than_raised(self):
+        with patch.object(nb_forward, "settle_pending", side_effect=RuntimeError("db gone")), \
+             self.assertLogs("news_bot", level="ERROR") as logs:
+            self.assertFalse(nb_forward.job_settle_forward_test())
+        self.assertIn("forward_settle_failed", "\n".join(logs.output))
+
+    def test_nothing_to_settle_succeeds_quietly(self):
+        with patch.object(nb_forward, "settle_pending", return_value=(0, 0)), \
+             patch.object(nb_forward.APP_LOG, "info") as info:
+            self.assertTrue(nb_forward.job_settle_forward_test())
+        info.assert_not_called()
+
+
 class RenderingTests(unittest.TestCase):
     def test_delta_line_shapes(self):
         empty = {"dates": 0}
