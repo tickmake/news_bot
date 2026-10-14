@@ -20,31 +20,54 @@ _KEY = "market_data_health"
 
 
 def assess(
-    analysed: int, no_data: int, newest_session: Optional[str], today: datetime
+    analysed: int, no_data: int, sessions: Optional[Dict[str, str]], today: datetime
 ) -> Tuple[bool, List[str]]:
     """(bad, reasons) for one screen. Too small a sample is never bad.
 
     A run cut short by its deadline has few analysed symbols, so the sample
     floor also keeps a slow-but-working feed from looking like an outage.
+
+    Freshness is judged per market, because taking the newest session across
+    the whole universe let a single fresh US symbol stand in for every stale
+    one behind it: on 2026-10-13 Oslo, Xetra and Euronext were all missing
+    Monday while New York was not, and this check reported one day old. The
+    laggard decides, so a market going dark is visible even while others run.
     """
     if analysed < max(1, SETTINGS.market_data_min_sample):
         return False, []
     reasons: List[str] = []
     if no_data / analysed > SETTINGS.market_data_alert_ratio:
         reasons.append(f"{no_data} of {analysed} symbols returned no usable price data")
-    if newest_session:
+    for market, session in sorted((sessions or {}).items()):
         try:
-            age = (today.date() - datetime.strptime(newest_session, "%Y-%m-%d").date()).days
+            age = (today.date() - datetime.strptime(session, "%Y-%m-%d").date()).days
         except ValueError:
-            age = 0
+            continue
         if age > SETTINGS.market_data_max_stale_days:
-            reasons.append(f"newest price session is {newest_session} ({age} days old)")
+            reasons.append(f"{market}: newest price session is {session} ({age} days old)")
     return bool(reasons), reasons
 
 
+def _market_of(symbol: str) -> str:
+    """Exchange suffix, or "US" for the unsuffixed symbols Yahoo uses there."""
+    _, dot, suffix = symbol.rpartition(".")
+    return suffix.upper() if dot and suffix else "US"
+
+
+def _sessions_by_market(outcome: Any) -> Dict[str, str]:
+    """Newest session each market produced; symbols in one share a calendar."""
+    newest: Dict[str, str] = {}
+    rows = list(outcome.qualified) + [metrics for metrics, _failed in outcome.rejected]
+    for metrics in rows:
+        market = _market_of(metrics.symbol)
+        if metrics.session > newest.get(market, ""):
+            newest[market] = metrics.session
+    return newest
+
+
 def _newest_session(outcome: Any) -> Optional[str]:
-    sessions = [metrics.session for metrics in outcome.qualified]
-    sessions += [metrics.session for metrics, _failed in outcome.rejected]
+    """The freshest session anywhere, for display rather than for judgement."""
+    sessions = _sessions_by_market(outcome).values()
     return max(sessions) if sessions else None
 
 
@@ -61,8 +84,9 @@ def record_screen(outcome: Any, now: Optional[datetime] = None) -> None:
 
 
 def _record_screen(outcome: Any, now: datetime) -> None:
-    newest = _newest_session(outcome)
-    bad, reasons = assess(outcome.analysed, outcome.no_data, newest, now)
+    sessions = _sessions_by_market(outcome)
+    newest = max(sessions.values()) if sessions else None
+    bad, reasons = assess(outcome.analysed, outcome.no_data, sessions, now)
     sampled = outcome.analysed >= max(1, SETTINGS.market_data_min_sample)
     total_outage = sampled and outcome.no_data == outcome.analysed
 
@@ -93,6 +117,7 @@ def _record_screen(outcome: Any, now: datetime) -> None:
             "analysed": outcome.analysed,
             "no_data": outcome.no_data,
             "newest_session": newest,
+            "sessions_by_market": sessions,
             "bad": bad,
             "reasons": reasons,
             "bad_streak": streak,
