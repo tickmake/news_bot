@@ -124,6 +124,9 @@ class ScreenOutcome:
     # trade-worthy today -- and counts alone cannot answer that.
     rejected: List[Tuple[TradeMetrics, List[str]]] = field(default_factory=list)
     no_data_symbols: List[str] = field(default_factory=list)
+    # Freshest session any symbol produced; the yardstick _apply_staleness_gate
+    # measures every other symbol against. None when nothing was measured.
+    newest_session: Optional[str] = None
 
 
 def _effective_history_retention_days() -> int:
@@ -167,12 +170,6 @@ def _screen_universe(
             outcome.rejected.append((metrics, failed))
         else:
             outcome.qualified.append(metrics)
-        history_store.TRADE_HISTORY.record(
-            metrics, qualified=not failed, failed_gate=(failed[0] if failed else None)
-        )
-        history_store.TRADE_HISTORY.archive_signal(
-            metrics, qualified=not failed, failed_gate=(failed[0] if failed else None)
-        )
 
     def _expire(future_to_symbol: Dict[Any, str]) -> None:
         APP_LOG.warning(
@@ -219,10 +216,92 @@ def _screen_universe(
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
+    _apply_staleness_gate(outcome)
+    _record_screened(outcome)
     outcome.qualified.sort(key=_rank_key)
     history_store.TRADE_HISTORY.prune(_effective_history_retention_days())
     data_health.record_screen(outcome)
     return outcome, labels
+
+
+STALE_GATE = "stale"
+
+
+def _apply_staleness_gate(outcome: ScreenOutcome) -> None:
+    """Disqualify symbols whose newest bar lags the freshest one in the screen.
+
+    Yahoo drops daily bars a market at a time: on 2026-10-13 Oslo, Xetra and
+    Euronext Amsterdam had no Monday session while New York did, so four of the
+    five published picks quoted Friday's close as "today" -- entry zones and
+    stops included. Nothing noticed, because the health check compared the
+    *newest* session across the whole universe against today, and one fresh US
+    symbol was enough to hide every stale European one behind it.
+
+    Lagging the leader by a single session is enough to disqualify. This screen
+    ranks symbols against each other, and _drop_in_progress_bar already refuses
+    to compare momentum windows offset by a day; a stale bar is that same defect
+    arriving from upstream instead of from the clock. A local market holiday
+    trips this too, which is the right answer for ranking purposes -- those
+    prices really are a session behind the ones they would be ranked against.
+
+    Rejected rows are re-attributed rather than left alone: their gate verdicts
+    were computed from the same stale bars, so blaming a symbol's momentum for a
+    number that predates the missing session would send the reader tuning a
+    threshold to fix a data outage.
+    """
+    rows = list(outcome.qualified) + [metrics for metrics, _failed in outcome.rejected]
+    if not rows:
+        return
+    newest = max(metrics.session for metrics in rows)
+    outcome.newest_session = newest
+
+    stale = 0
+    fresh: List[TradeMetrics] = []
+    rejected: List[Tuple[TradeMetrics, List[str]]] = []
+    for metrics in outcome.qualified:
+        if metrics.session < newest:
+            stale += 1
+            rejected.append((metrics, [STALE_GATE]))
+        else:
+            fresh.append(metrics)
+    for metrics, failed in outcome.rejected:
+        if metrics.session < newest:
+            stale += 1
+            remaining = outcome.failed_counts.get(failed[0], 0) - 1
+            if remaining > 0:
+                outcome.failed_counts[failed[0]] = remaining
+            else:
+                outcome.failed_counts.pop(failed[0], None)
+            rejected.append((metrics, [STALE_GATE] + failed))
+        else:
+            rejected.append((metrics, failed))
+
+    outcome.qualified = fresh
+    outcome.rejected = rejected
+    if stale:
+        outcome.failed_counts[STALE_GATE] = stale
+        APP_LOG.warning(
+            "stale_candidates newest=%s stale=%s of=%s", newest, stale, len(rows)
+        )
+
+
+def _record_screened(outcome: ScreenOutcome) -> None:
+    """Persist every measured symbol, once staleness has had its say.
+
+    Recording waits for the whole screen rather than running as each fetch
+    returns, because a symbol's verdict is not final until then: staleness is
+    measured against the freshest session anywhere in the universe. Archiving a
+    stale row as qualified would seed the forward test's qualified cohort with
+    a pick the briefing never published.
+    """
+    for metrics in outcome.qualified:
+        history_store.TRADE_HISTORY.record(metrics, qualified=True, failed_gate=None)
+        history_store.TRADE_HISTORY.archive_signal(metrics, qualified=True, failed_gate=None)
+    for metrics, failed in outcome.rejected:
+        history_store.TRADE_HISTORY.record(metrics, qualified=False, failed_gate=failed[0])
+        history_store.TRADE_HISTORY.archive_signal(
+            metrics, qualified=False, failed_gate=failed[0]
+        )
 
 
 # Plain-English rendering of each gate, for readers who are not going to
@@ -233,6 +312,7 @@ TRADE_GATE_LABELS: Dict[str, str] = {
     "momentum_1d": "fell on the day",
     "volatility": "too volatile",
     "drawdown": "too far below their 20-day high",
+    STALE_GATE: "price data older than the rest of the screen",
 }
 
 
@@ -385,6 +465,11 @@ def _render_blockers(outcome: ScreenOutcome) -> List[str]:
         if outcome.failed_counts.get(gate)
     ]
     rows.sort(key=lambda row: -row[1])
+    # Appended after the sort, with no-data: neither is a verdict on the stock,
+    # and leaving them among the tunable gates invites tuning a threshold to
+    # fix a feed outage.
+    if outcome.failed_counts.get(STALE_GATE):
+        rows.append((TRADE_GATE_LABELS[STALE_GATE], outcome.failed_counts[STALE_GATE]))
     if outcome.no_data:
         rows.append(("no usable price data", outcome.no_data))
     if not rows:
@@ -395,6 +480,25 @@ def _render_blockers(outcome: ScreenOutcome) -> List[str]:
     lines.extend(f"    {count:>2} · {label}" for label, count in rows)
     lines.append("")
     return lines
+
+
+def _render_stale_notice(outcome: ScreenOutcome) -> List[str]:
+    """Say so when symbols were held back for stale prices.
+
+    Without this the reader sees a thinner briefing than usual and no reason
+    for it, which looks like a quiet market rather than a data outage. Naming
+    the session matters more than the count: it is the difference between
+    "nothing qualified today" and "today never arrived for these markets".
+    """
+    stale = outcome.failed_counts.get(STALE_GATE, 0)
+    if not stale:
+        return []
+    return [
+        f"⚠️ <i>{stale} symbol{'s' if stale != 1 else ''} held back: their newest "
+        f"close predates {escape(outcome.newest_session or '')}, so their prices and "
+        "momentum are a session or more behind the rest of the screen.</i>",
+        "",
+    ]
 
 
 def _render_deadline_notice(outcome: ScreenOutcome) -> List[str]:
@@ -467,6 +571,7 @@ def build_trade_candidates_payload(
             f"{outcome.checked} passed</b>",
             "",
         ]
+        lines.extend(_render_stale_notice(outcome))
         # Looked up once for the shown picks, within a deadline; a failure only
         # means the risk lines are missing, never that the screen is.
         risk = risk_analytics.build_context(shown, labels)
@@ -498,6 +603,7 @@ def build_trade_candidates_payload(
             "No stock passed all five checks.",
             "",
         ]
+        lines.extend(_render_stale_notice(outcome))
 
     lines.extend(_render_deadline_notice(outcome))
     lines.extend(_render_blockers(outcome))

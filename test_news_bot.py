@@ -2702,6 +2702,105 @@ def _metrics(**overrides):
     return nb_indicators.TradeMetrics(**base)
 
 
+class StalenessGateTests(unittest.TestCase):
+    """Symbols whose newest bar lags the screen are held back, not ranked."""
+
+    def _screen(self, qualified=(), rejected=()):
+        return nb_screener.ScreenOutcome(
+            checked=len(qualified) + len(rejected),
+            analysed=len(qualified) + len(rejected),
+            qualified=list(qualified),
+            rejected=list(rejected),
+            failed_counts={},
+        )
+
+    def test_a_lagging_symbol_is_disqualified_and_counted(self):
+        fresh = _metrics(symbol="AAPL", session="2026-10-12")
+        stale = _metrics(symbol="EQNR.OL", session="2026-10-09")
+        outcome = self._screen(qualified=[fresh, stale])
+        nb_screener._apply_staleness_gate(outcome)
+        self.assertEqual([m.symbol for m in outcome.qualified], ["AAPL"])
+        self.assertEqual(outcome.failed_counts[nb_screener.STALE_GATE], 1)
+        self.assertEqual(outcome.rejected[0][1], [nb_screener.STALE_GATE])
+        self.assertEqual(outcome.newest_session, "2026-10-12")
+
+    def test_a_uniformly_old_screen_has_nothing_to_compare_against(self):
+        """Every market behind together is a different fault; this gate is relative."""
+        rows = [_metrics(symbol="A.OL", session="2026-10-09"),
+                _metrics(symbol="B.OL", session="2026-10-09")]
+        outcome = self._screen(qualified=rows)
+        nb_screener._apply_staleness_gate(outcome)
+        self.assertEqual(len(outcome.qualified), 2)
+        self.assertNotIn(nb_screener.STALE_GATE, outcome.failed_counts)
+
+    def test_a_stale_rejection_is_reattributed_away_from_its_gate(self):
+        fresh = _metrics(symbol="AAPL", session="2026-10-12")
+        stale = _metrics(symbol="SAP.DE", session="2026-10-09")
+        outcome = self._screen(qualified=[fresh], rejected=[(stale, ["trend"])])
+        outcome.failed_counts["trend"] = 1
+        nb_screener._apply_staleness_gate(outcome)
+        self.assertNotIn("trend", outcome.failed_counts)
+        self.assertEqual(outcome.failed_counts[nb_screener.STALE_GATE], 1)
+        self.assertEqual(outcome.rejected[0][1], [nb_screener.STALE_GATE, "trend"])
+
+    def test_a_gate_shared_with_a_fresh_rejection_keeps_the_remainder(self):
+        """Only the stale share moves; the fresh symbol still blames its gate."""
+        fresh = _metrics(symbol="AAPL", session="2026-10-12")
+        stale = _metrics(symbol="SAP.DE", session="2026-10-09")
+        outcome = self._screen(
+            rejected=[(fresh, ["trend"]), (stale, ["trend"])]
+        )
+        outcome.failed_counts["trend"] = 2
+        nb_screener._apply_staleness_gate(outcome)
+        self.assertEqual(outcome.failed_counts["trend"], 1)
+        self.assertEqual(outcome.failed_counts[nb_screener.STALE_GATE], 1)
+
+    def test_a_fresh_rejection_keeps_its_gate(self):
+        fresh = _metrics(symbol="AAPL", session="2026-10-12")
+        outcome = self._screen(rejected=[(fresh, ["trend"])])
+        outcome.failed_counts["trend"] = 1
+        nb_screener._apply_staleness_gate(outcome)
+        self.assertEqual(outcome.failed_counts, {"trend": 1})
+
+    def test_an_empty_screen_is_left_alone(self):
+        outcome = self._screen()
+        nb_screener._apply_staleness_gate(outcome)
+        self.assertIsNone(outcome.newest_session)
+
+    def test_recording_runs_after_the_gate_so_stale_rows_are_not_archived_qualified(self):
+        fresh = _metrics(symbol="AAPL", session="2026-10-12")
+        stale = _metrics(symbol="EQNR.OL", session="2026-10-09")
+        outcome = self._screen(qualified=[fresh, stale])
+        nb_screener._apply_staleness_gate(outcome)
+        with patch.object(nb_screener.history_store, "TRADE_HISTORY") as store:
+            nb_screener._record_screened(outcome)
+        archived = {
+            call.args[0].symbol: call.kwargs
+            for call in store.archive_signal.call_args_list
+        }
+        self.assertTrue(archived["AAPL"]["qualified"])
+        self.assertFalse(archived["EQNR.OL"]["qualified"])
+        self.assertEqual(archived["EQNR.OL"]["failed_gate"], nb_screener.STALE_GATE)
+
+    def test_the_notice_names_the_session_the_stale_rows_missed(self):
+        outcome = self._screen()
+        outcome.newest_session = "2026-10-12"
+        outcome.failed_counts[nb_screener.STALE_GATE] = 4
+        notice = "\n".join(nb_screener._render_stale_notice(outcome))
+        self.assertIn("4 symbols held back", notice)
+        self.assertIn("2026-10-12", notice)
+
+    def test_no_notice_when_nothing_was_held_back(self):
+        self.assertEqual(nb_screener._render_stale_notice(self._screen()), [])
+
+    def test_the_blocker_footer_lists_stale_rows(self):
+        outcome = self._screen()
+        outcome.checked = 3
+        outcome.failed_counts[nb_screener.STALE_GATE] = 3
+        footer = "\n".join(nb_screener._render_blockers(outcome))
+        self.assertIn("3 · price data older than the rest of the screen", footer)
+
+
 class TradeGateTests(unittest.TestCase):
     def test_qualifying_metrics_fail_nothing(self):
         self.assertEqual(nb_indicators._failed_gates(_metrics()), [])
