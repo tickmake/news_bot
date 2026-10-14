@@ -16,6 +16,7 @@ from newsbot.commands import (
     run_healthcheck,
 )
 from newsbot.config import SETTINGS, get_missing_required_config
+from newsbot.forward_test import job_settle_forward_test
 
 
 def main() -> None:
@@ -41,6 +42,11 @@ def main() -> None:
     )
     scheduler.add_job(job_scheduled_briefing, "cron", hour="7,19", minute=0)
     scheduler.add_job(job_health_ping, "cron", hour=12, minute=0)
+    # 03:00: the last US session closed hours ago, so its bar is final and the
+    # in-progress-bar guard will not discard it. Each run settles every row that
+    # has become computable, not just yesterday's, so a night the Pi spends down
+    # costs nothing -- the backlog clears on the next run.
+    scheduler.add_job(job_settle_forward_test, "cron", hour=3, minute=0)
     scheduler.add_job(_touch_heartbeat, "interval", minutes=1, args=["scheduler"])
     _touch_heartbeat("scheduler")
     # One-off, run by the scheduler as soon as it starts: sends a briefing the
