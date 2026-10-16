@@ -7,6 +7,7 @@ from typing import Optional
 from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
 from apscheduler.schedulers.blocking import BlockingScheduler
 
+from newsbot.backup import job_backup_trade_history
 from newsbot.briefing import job_catchup_briefing, job_health_ping, job_scheduled_briefing, job_daily_briefing
 from newsbot.commands import (
     _prepare_telegram_long_polling,
@@ -47,6 +48,11 @@ def main() -> None:
     # has become computable, not just yesterday's, so a night the Pi spends down
     # costs nothing -- the backlog clears on the next run.
     scheduler.add_job(job_settle_forward_test, "cron", hour=3, minute=0)
+    # 03:30: half an hour after the settle job, so the snapshot carries that
+    # night's outcomes. The two are separate jobs rather than one chained call
+    # because a settle that fails should still be followed by a backup -- the
+    # rows already in the archive are what is irreplaceable.
+    scheduler.add_job(job_backup_trade_history, "cron", hour=3, minute=30)
     scheduler.add_job(_touch_heartbeat, "interval", minutes=1, args=["scheduler"])
     _touch_heartbeat("scheduler")
     # One-off, run by the scheduler as soon as it starts: sends a briefing the
