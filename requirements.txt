@@ -11,7 +11,7 @@ apscheduler==3.11.3
 defusedxml==0.7.1
 # The news ranker talks to a local Ollama endpoint over plain HTTP via
 # `requests`, so no LLM SDK is needed.
-pydantic==2.13.5
+pydantic==2.14.1
 pydantic-settings==2.15.0
 # Technical-analysis charts for /recommendations, rendered locally and
 # uploaded via Telegram's sendPhoto. Imported lazily in render_candidate_charts
