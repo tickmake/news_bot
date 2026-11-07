@@ -1,7 +1,7 @@
 # Pinned for reproducible builds. yfinance is version-sensitive (see the
 # DNSError shim in news_bot.py); upgrade deliberately.
 requests==2.34.2
-yfinance==1.7.0
+yfinance==1.8.0
 # yfinance now imports curl_cffi unconditionally, so it must be installed
 # (the old YF_NO_CURL_CFFI / uninstall workaround no longer applies).
 curl_cffi==0.16.3
