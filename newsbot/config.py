@@ -172,6 +172,9 @@ class AppSettings(BaseSettings):
     broker_fee_pct: float = 0.12
     # Evening alert when a stock I own is this far below my average buy price.
     holding_alert_drop_pct: float = 15.0
+    # The money's alternative (#69): the monthly scorecard compares with it.
+    benchmark_fund_symbol: str = "0P00018V9L.IR"
+    benchmark_fund_name: str = "KLP AksjeGlobal Indeks P"
     risk_corr_threshold: float = 0.7
     risk_corr_window: int = 60
     risk_corr_min_obs: int = 30

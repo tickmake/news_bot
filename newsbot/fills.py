@@ -16,6 +16,11 @@ from newsbot.history_store import TRADE_HISTORY
 from newsbot.logsetup import APP_LOG, SYS_LOG
 from newsbot.state import TRADE_HISTORY_LOCK
 
+DEPOSIT_USAGE = (
+    "Usage: /deposit AMOUNT_NOK [YYYY-MM-DD]\n"
+    "Example: /deposit 50000. Use a minus amount for money taken out: /deposit -5000"
+)
+
 USAGE = (
     "Usage: /fill BUY|SELL TICKER SHARES PRICE FEE_NOK [YYYY-MM-DD] [!]\n"
     "Example: /fill BUY EQNR.OL 40 285.40 59\n"
@@ -49,10 +54,21 @@ _TABLE = """
 """
 
 
+_DEPOSITS_TABLE = """
+    CREATE TABLE IF NOT EXISTS deposits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        amount_nok REAL NOT NULL,
+        deposit_date TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    )
+"""
+
+
 def _connection() -> sqlite3.Connection:
     """The bot's own database connection; callers hold TRADE_HISTORY_LOCK."""
     conn = TRADE_HISTORY._connection()
     conn.execute(_TABLE)
+    conn.execute(_DEPOSITS_TABLE)
     return conn
 
 
@@ -62,9 +78,9 @@ def currency_for(symbol: str) -> Optional[str]:
     return _SUFFIX_CURRENCY.get(symbol.rsplit(".", 1)[1])
 
 
-def _close_on_or_before(symbol: str, day: date) -> Optional[float]:
+def _close_on_or_before(symbol: str, day: date, period: str = "1y") -> Optional[float]:
     """Last daily close up to and including `day`, or None if Yahoo has none."""
-    history = market_data._fetch_ticker_history(symbol, period="1y")
+    history = market_data._fetch_ticker_history(symbol, period=period)
     if history is None or len(history) == 0:
         return None
     closes = history["Close"]
@@ -299,19 +315,87 @@ def build_portfolio_report() -> str:
     lines.append(f"Profit from shares already sold: {realised:+,.0f} NOK")
     fees = sum(row["fee_nok"] for row in rows)
     lines.append(f"Fees paid so far: {fees:,.0f} NOK in {len(rows)} trades")
-    if SETTINGS.risk_account_size > 0:
-        cash = SETTINGS.risk_account_size + cash_change
-        total = cash + value_total
-        lines.append(
-            f"Cash left: {cash:,.0f} NOK (start {SETTINGS.risk_account_size:,.0f} NOK minus buys, plus sells)"
-        )
-        if not unpriced:
-            change = total - SETTINGS.risk_account_size
+    money_in = deposits(rows)
+    if money_in:
+        put_in = sum(amount for _, amount in money_in)
+        cash = put_in + cash_change
+        lines.append(f"Cash left: {cash:,.0f} NOK (money put in {put_in:,.0f} NOK, minus buys, plus sells)")
+        if not unpriced and put_in > 0:
+            total = cash + value_total
+            change = total - put_in
             lines.append(
                 f"<b>Account total: {total:,.0f} NOK, {change:+,.0f} NOK "
-                f"({change / SETTINGS.risk_account_size * 100:+.1f}%) since the start</b>"
+                f"({change / put_in * 100:+.1f}%) on the money put in</b>"
             )
     if unpriced:
         lines.append(f"<i>Not in the totals (no price today): {escape(', '.join(unpriced))}</i>")
     lines.append("<i>Prices are the latest Yahoo has and may be delayed.</i>")
     return "\n".join(lines)
+
+
+def deposits(rows: Optional[List[Dict[str, Any]]] = None) -> List[Tuple[str, float]]:
+    """(date, NOK) for each sum put into the account, oldest first.
+
+    Without any /deposit, RISK_ACCOUNT_SIZE counts as one deposit on the day
+    of the first trade, so the numbers work before anyone types /deposit.
+    """
+    with TRADE_HISTORY_LOCK:
+        saved = _connection().execute(
+            "SELECT deposit_date, amount_nok FROM deposits ORDER BY deposit_date, id"
+        ).fetchall()
+    if saved:
+        return [(day, float(amount)) for day, amount in saved]
+    rows = trade_rows() if rows is None else rows
+    if rows and SETTINGS.risk_account_size > 0:
+        return [(rows[0]["trade_date"], float(SETTINGS.risk_account_size))]
+    return []
+
+
+def record_deposit(argument: str) -> str:
+    words = argument.split()
+    if len(words) not in (1, 2):
+        return DEPOSIT_USAGE
+    try:
+        amount = float(words[0].replace(",", "."))
+    except ValueError:
+        return DEPOSIT_USAGE
+    if not math.isfinite(amount) or amount == 0:
+        return "The amount must be a number other than 0."
+    day = date.today()
+    if len(words) == 2:
+        try:
+            day = date.fromisoformat(words[1])
+        except ValueError:
+            return "The date must look like 2026-11-10."
+        if day > date.today():
+            return "The date can't be in the future."
+    with TRADE_HISTORY_LOCK:
+        conn = _connection()
+        first = conn.execute("SELECT COUNT(*) FROM deposits").fetchone()[0] == 0
+        with conn:
+            conn.execute(
+                "INSERT INTO deposits (amount_nok, deposit_date, recorded_at) VALUES (?, ?, ?)",
+                (amount, day.isoformat(), datetime.now(timezone.utc).isoformat()),
+            )
+        total = conn.execute("SELECT SUM(amount_nok) FROM deposits").fetchone()[0]
+    APP_LOG.info("deposit_saved amount=%s date=%s", amount, day)
+    kind = "Deposit" if amount > 0 else "Withdrawal"
+    note = (
+        "\nFrom now on only /deposit amounts count as money put in, not RISK_ACCOUNT_SIZE."
+        if first and SETTINGS.risk_account_size > 0 else ""
+    )
+    return f"Saved: {kind} of {abs(amount):,.0f} NOK on {day.isoformat()}.\nMoney put in so far: {total:,.0f} NOK.{note}"
+
+
+def holdings_value(holdings: Dict[str, Dict[str, Any]]) -> Tuple[float, List[str]]:
+    """Today's NOK value of the holdings, and the symbols with no price."""
+    value = 0.0
+    unpriced: List[str] = []
+    for symbol, held in holdings.items():
+        price = _latest_price(symbol)
+        fx = 1.0 if held["currency"] == "NOK" else _latest_price(f"{held['currency']}NOK=X")
+        if price is None or fx is None:
+            unpriced.append(symbol)
+            continue
+        value += held["shares"] * price * fx
+    return value, unpriced

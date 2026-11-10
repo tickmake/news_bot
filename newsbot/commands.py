@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests.exceptions
 
-from newsbot import backtest_reports, charts, fills, forward_test, history_store, market_data, messaging, news_feeds, reports, screener
+from newsbot import backtest_reports, charts, fills, forward_test, scorecard, history_store, market_data, messaging, news_feeds, reports, screener
 from newsbot.briefing import _send_briefing
 from newsbot.config import SETTINGS
 from newsbot.history_store import _record_published_picks
@@ -38,6 +38,8 @@ def _command_help_text() -> str:
         "/fills - List the last 20 real trades\n"
         "/unfill - Delete the last real trade\n"
         "/portfolio - What I hold now, its value today and profit or loss\n"
+        "/deposit AMOUNT_NOK [YYYY-MM-DD] - Save money put in (minus for money taken out)\n"
+        "/scorecard - My trades vs the index fund\n"
     )
 
 
@@ -88,6 +90,10 @@ def _handle_command(command: str, chat_id: str) -> None:
         messaging.send_telegram_message(fills.delete_last_fill(), chat_id=chat_id)
     elif normalized == "/portfolio":
         messaging.send_telegram_message(fills.build_portfolio_report(), chat_id=chat_id)
+    elif normalized == "/deposit":
+        messaging.send_telegram_message(fills.record_deposit(argument), chat_id=chat_id)
+    elif normalized == "/scorecard":
+        messaging.send_telegram_message(scorecard.scorecard_reply(), chat_id=chat_id)
     else:
         messaging._broadcast_message(_command_help_text(), chat_id=chat_id)
 
@@ -103,7 +109,7 @@ def _authorized_chat_ids() -> set:
 
 
 # Commands that change saved data, so an edited copy must not run them again.
-_WRITE_COMMANDS = {"/fill", "/unfill"}
+_WRITE_COMMANDS = {"/fill", "/unfill", "/deposit"}
 
 
 # Commands run off the poller thread so a multi-minute /performance cannot
@@ -223,7 +229,7 @@ def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
                     elif "message" not in update and text.split()[0].lower() in _WRITE_COMMANDS:
                         # Editing a sent /fill must not save the trade twice.
                         messaging.send_telegram_message(
-                            "Edited messages are ignored for /fill and /unfill. "
+                            "Edited messages are ignored for /fill, /unfill and /deposit. "
                             "Use /unfill, then send /fill again.",
                             chat_id=chat_id,
                         )
