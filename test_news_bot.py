@@ -1922,6 +1922,37 @@ class PublishedPickTests(unittest.TestCase):
         self.assertIn("1 unavailable", report)
         self.assertNotIn("hit rate", report)
 
+    def test_nightly_settle_scores_every_pick_not_only_the_newest_100(self):
+        self._publish()
+        with patch.object(self.store, "published_picks", side_effect=AssertionError("capped list used")), \
+             patch.object(nb_market_data, "_fetch_ticker_history", return_value=self._history()):
+            self.assertEqual(nb_history_store.settle_published_picks(), (1, 0))
+        outcome = json.loads(self.store.published_picks()[0]["outcome_json"])
+        self.assertAlmostEqual(outcome["net_return_pct"], 9.8)
+        self.assertEqual(self.store.unsettled_published_picks(), [])
+
+    def test_nightly_settle_leaves_pending_and_bad_data_for_tomorrow(self):
+        self._publish("AAA")
+        self._publish("BBB")
+        histories = {"AAA": self._history().iloc[:3], "BBB": None, "BENCH": None}
+        with patch.object(nb_market_data, "_fetch_ticker_history",
+                          side_effect=lambda symbol, period: histories[symbol]), \
+             self.assertLogs("news_bot", level="WARNING"):
+            self.assertEqual(nb_history_store.settle_published_picks(), (0, 1))
+        self.assertEqual(len(self.store.unsettled_published_picks()), 2)
+
+    def test_settle_job_reports_honestly_and_never_raises(self):
+        cases = [((2, 0), True, "INFO", "published_pick_settle settled=2"),
+                 ((1, 3), False, "WARNING", "published_pick_settle settled=1 retry_tomorrow=3"),
+                 (RuntimeError("db gone"), False, "ERROR", "published_pick_settle_failed")]
+        for result, ok, level, message in cases:
+            effect = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+            with self.subTest(result=result), \
+                 patch.object(nb_history_store, "settle_published_picks", **effect), \
+                 self.assertLogs("news_bot", level=level) as logs:
+                self.assertEqual(nb_history_store.job_settle_published_picks(), ok)
+            self.assertIn(message, "\n".join(logs.output))
+
     def test_empty_ledger_does_not_fetch(self):
         with patch.object(nb_market_data, "_fetch_ticker_history") as fetch:
             report = nb_history_store.build_published_pick_report()
