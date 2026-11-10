@@ -20,7 +20,7 @@ import yfinance as yf
 from newsbot import history_store, market_data
 from newsbot.benchmarks import _matched_benchmark_return
 from newsbot.config import SETTINGS
-from newsbot.indicators import _drop_in_progress_bar
+from newsbot.indicators import _drop_unfinished_bar
 from newsbot.logsetup import APP_LOG, SYS_LOG
 
 # Dates needed before the paired comparison is worth reading at all. The
@@ -56,12 +56,18 @@ def forward_outcome(
     if exit_position >= len(history):
         return None
     prices = history.iloc[entry:exit_position + 1][["Open", "Close"]]
-    if (
-        prices.isna().any().any()
-        or prices.isin([float("inf"), float("-inf")]).any().any()
-        or (prices <= 0).any().any()
-    ):
-        raise ValueError("invalid prices during holding period")
+    bad = prices[
+        prices.isna().any(axis=1)
+        | prices.isin([float("inf"), float("-inf")]).any(axis=1)
+        | (prices <= 0).any(axis=1)
+    ]
+    if len(bad):
+        # Name the bad bars: the nightly runs hit these and the afternoon
+        # reruns do not, so the log line is the only evidence of why (#89).
+        detail = "; ".join(
+            f"{stamp:%Y-%m-%d} open={row['Open']} close={row['Close']}" for stamp, row in bad.iterrows()
+        )
+        raise ValueError(f"invalid prices during holding period: {detail}")
     entry_price = float(history.iloc[entry]["Open"])
     exit_price = float(history.iloc[exit_position]["Close"])
     gross = (exit_price / entry_price - 1.0) * 100.0
@@ -103,7 +109,7 @@ def settle_pending(today: Optional[datetime] = None) -> Tuple[int, int]:
             return None
         if symbol not in cache:
             try:
-                cache[symbol] = _drop_in_progress_bar(
+                cache[symbol] = _drop_unfinished_bar(
                     market_data._fetch_ticker_history(symbol, period="2y")
                 )
             except (requests.exceptions.RequestException, yf.exceptions.YFException,
@@ -147,7 +153,8 @@ def job_settle_forward_test() -> bool:
         SYS_LOG.error("forward_settle_failed detail=%s", exc)
         return False
     if failed:
-        SYS_LOG.warning("forward_settle_unavailable settled=%d lost=%d", settled, failed)
+        # Failed rows stay pending and are retried the next night.
+        SYS_LOG.warning("forward_settle settled=%d retry_tomorrow=%d", settled, failed)
     elif settled:
         APP_LOG.info("forward_settle settled=%d", settled)
     return not failed

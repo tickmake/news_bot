@@ -15,7 +15,7 @@ import yfinance as yf
 from newsbot import market_data
 from newsbot.benchmarks import _backtest_benchmark_for, _matched_benchmark_return
 from newsbot.config import SETTINGS
-from newsbot.indicators import TradeMetrics, _drop_in_progress_bar
+from newsbot.indicators import TradeMetrics, _drop_unfinished_bar
 from newsbot.logsetup import APP_LOG, SYS_LOG
 from newsbot.state import TRADE_HISTORY_LOCK
 
@@ -558,12 +558,18 @@ def _published_pick_outcome(
     if exit_position >= len(history):
         return None
     prices = history.iloc[entry:exit_position + 1][["Open", "Close"]]
-    if (
-        prices.isna().any().any()
-        or prices.isin([float("inf"), float("-inf")]).any().any()
-        or (prices <= 0).any().any()
-    ):
-        raise ValueError("invalid prices during holding period")
+    bad = prices[
+        prices.isna().any(axis=1)
+        | prices.isin([float("inf"), float("-inf")]).any(axis=1)
+        | (prices <= 0).any(axis=1)
+    ]
+    if len(bad):
+        # Name the bad bars: the nightly runs hit these and the afternoon
+        # reruns do not, so the log line is the only evidence of why (#89).
+        detail = "; ".join(
+            f"{stamp:%Y-%m-%d} open={row['Open']} close={row['Close']}" for stamp, row in bad.iterrows()
+        )
+        raise ValueError(f"invalid prices during holding period: {detail}")
     entry_price = float(history.iloc[entry]["Open"])
     exit_price = float(history.iloc[exit_position]["Close"])
     gross = (exit_price / entry_price - 1.0) * 100.0
@@ -590,7 +596,7 @@ def _pick_history_loader() -> Callable[[Optional[str]], Any]:
             return None
         if symbol not in history_cache:
             try:
-                history_cache[symbol] = _drop_in_progress_bar(
+                history_cache[symbol] = _drop_unfinished_bar(
                     market_data._fetch_ticker_history(symbol, period="max")
                 )
             except (requests.RequestException, yf.exceptions.YFException, ValueError, RuntimeError, OSError) as exc:
