@@ -106,6 +106,33 @@ class VolumeTrendTests(unittest.TestCase):
         self.assertEqual(ind._compute_volume_trend(None), "unknown")
 
 
+class UnfinishedBarTests(unittest.TestCase):
+    """The settle jobs keep a session once that exchange's day is over (#89)."""
+
+    def _bars(self, tz):
+        index = pd.DatetimeIndex([pd.Timestamp("2026-11-09", tz=tz), pd.Timestamp("2026-11-10", tz=tz)])
+        return pd.DataFrame({"Close": [1.0, 2.0]}, index=index)
+
+    def test_us_session_is_kept_at_three_in_the_night_oslo_time(self):
+        # 03:00 Oslo on 11 Nov is 21:00 on 10 Nov in New York: the day is over.
+        oslo_3am = pd.Timestamp("2026-11-11 03:00", tz="Europe/Oslo").to_pydatetime()
+        bars = self._bars("America/New_York")
+        self.assertEqual(len(ind._drop_unfinished_bar(bars, now=oslo_3am)), 2)
+
+    def test_running_session_is_dropped(self):
+        noon = pd.Timestamp("2026-11-10 12:00", tz="Europe/Oslo").to_pydatetime()
+        self.assertEqual(len(ind._drop_unfinished_bar(self._bars("Europe/Oslo"), now=noon)), 1)
+
+    def test_after_the_close_the_bar_is_kept(self):
+        evening = pd.Timestamp("2026-11-10 18:30", tz="Europe/Oslo").to_pydatetime()
+        self.assertEqual(len(ind._drop_unfinished_bar(self._bars("Europe/Oslo"), now=evening)), 2)
+
+    def test_empty_and_naive_fall_back(self):
+        self.assertIsNone(ind._drop_unfinished_bar(None))
+        frame = _frame([1, 2, 3], days_ago=10, tz=None)
+        self.assertEqual(len(ind._drop_unfinished_bar(frame)), 3)
+
+
 class InProgressBarTests(unittest.TestCase):
     def test_none_and_empty_pass_through(self):
         self.assertIsNone(ind._drop_in_progress_bar(None))

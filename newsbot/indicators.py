@@ -1,7 +1,7 @@
 """Per-symbol indicators, trade metrics, gates and ranking."""
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, List, Optional, Tuple
 
 import pandas as pd
@@ -155,6 +155,31 @@ def _drop_in_progress_bar(history: Any) -> Any:
     tz = getattr(index, "tz", None)
     today = datetime.now(tz).date() if tz is not None else datetime.now().date()
     if index[-1].date() == today:
+        return history.iloc[:-1]
+    return history
+
+
+# Local exchange time after which today's bar is final. Oslo closes 16:20,
+# the big EU exchanges 17:30 and New York 16:00, so 18:00 covers them all.
+SESSION_FINISHED_HOUR = 18
+
+
+def _drop_unfinished_bar(history: Any, now: Optional[datetime] = None) -> Any:
+    """Drop the final row only while that exchange's day is still running.
+
+    For scoring results, not for the screen. `_drop_in_progress_bar` drops
+    every bar dated today on purpose; the nightly settle jobs run at 03:00
+    Oslo time, when it is still the previous evening in New York, so that
+    rule threw away a finished US session and every US result came a night
+    late (#89).
+    """
+    if history is None or len(history) == 0:
+        return history
+    tz = getattr(history.index, "tz", None)
+    if tz is None:
+        return _drop_in_progress_bar(history)
+    local_now = (now or datetime.now(timezone.utc)).astimezone(tz)
+    if history.index[-1].date() == local_now.date() and local_now.hour < SESSION_FINISHED_HOUR:
         return history.iloc[:-1]
     return history
 

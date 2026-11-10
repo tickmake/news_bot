@@ -155,7 +155,7 @@ class ReportTests(unittest.TestCase):
             return up if symbol == "AAA" else flat
 
         with patch("newsbot.market_data._fetch_ticker_history", side_effect=fake_history), \
-             patch.object(nb_forward, "_drop_in_progress_bar", side_effect=lambda h: h), \
+             patch.object(nb_forward, "_drop_unfinished_bar", side_effect=lambda h: h), \
              patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 3):
             # Archive rows carry the horizon at recording time.
             with self.store._connection() as conn:
@@ -201,6 +201,12 @@ class OutcomeGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             nb_forward.forward_outcome({**self.ROW, "signal_session": "2026-08-01"}, self._history(), None)
 
+    def test_bad_price_error_names_the_bar(self):
+        history = self._history()
+        history.iloc[3, history.columns.get_loc("Open")] = float("nan")
+        with self.assertRaisesRegex(ValueError, "holding period: 2026-09-04 open=nan close=12.5"):
+            nb_forward.forward_outcome(self.ROW, history, None)
+
     def test_signal_on_the_last_bar_is_pending(self):
         self.assertIsNone(
             nb_forward.forward_outcome({**self.ROW, "signal_session": "2026-09-08"}, self._history(), None)
@@ -214,7 +220,7 @@ class SettleTests(unittest.TestCase):
         patcher = patch.object(nb_history_store, "TRADE_HISTORY", self.store)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.drop = patch.object(nb_forward, "_drop_in_progress_bar", side_effect=lambda h: h)
+        self.drop = patch.object(nb_forward, "_drop_unfinished_bar", side_effect=lambda h: h)
         self.drop.start()
         self.addCleanup(self.drop.stop)
 
@@ -276,7 +282,7 @@ class SettleJobTests(unittest.TestCase):
         with patch.object(nb_forward, "settle_pending", return_value=(1, 2)), \
              self.assertLogs("news_bot", level="WARNING") as logs:
             self.assertFalse(nb_forward.job_settle_forward_test())
-        self.assertIn("forward_settle_unavailable settled=1 lost=2", "\n".join(logs.output))
+        self.assertIn("forward_settle settled=1 retry_tomorrow=2", "\n".join(logs.output))
 
     def test_an_unexpected_error_is_logged_rather_than_raised(self):
         with patch.object(nb_forward, "settle_pending", side_effect=RuntimeError("db gone")), \
