@@ -1,68 +1,160 @@
-# Titles and ready-made reports for the data viewer (docker-compose `datasette`).
-# Every query here is read-only; the database is opened in read-only mode.
+# Front page, plain-English reports and table notes for the data viewer
+# (docker-compose `datasette`). Every query is read-only. The raw tables are
+# hidden from the front page because their columns are meant for the code;
+# the reports below show the same data with readable names and rounding.
 title: news_bot data
-description: >-
-  Read-only view of what the bot records. trade_metrics_history keeps the
-  last 14 days of screens; signal_archive and published_picks are permanent.
+description_html: |-
+  <h2>How the bot collects data</h2>
+  <ol>
+    <li><b>Every weekday at 07:00</b> (Oslo time) the bot checks about 20-40 stocks:
+        your watch lists plus the day's big movers.</li>
+    <li>For each stock it saves the price and a few numbers: change today, change over
+        5 days, how much the price swings in a normal day, and how far it is below its
+        recent high.</li>
+    <li>It applies <b>5 filters</b>. A stock that passes all 5 becomes a <b>pick</b>
+        and is sent to Slack and Telegram:
+      <ul>
+        <li>price above its 20-day average (going up, not down)</li>
+        <li>up at least 1% over the last 5 trading days</li>
+        <li>not down today</li>
+        <li>normal daily swing of 4.5% or less (not too risky)</li>
+        <li>no more than 8% below its 20-day high</li>
+      </ul></li>
+    <li><b>5 trading days later</b> (every night at 03:00) the bot works out what each
+        stock actually did, after fees, and compares it with the stock market index.</li>
+  </ol>
+  <p>That last step is the test: <b>if picks do not do better than the stocks that were
+     skipped, the filters are not helping.</b></p>
+  <h2>Start here</h2>
+  <ol>
+    <li><a href="/trade_history/todays_screen">Latest screen</a>: what the bot looked at and why each stock was picked or skipped</li>
+    <li><a href="/trade_history/scorecard">Scorecard</a>: did the picks do better than the rest? One line answer.</li>
+    <li><a href="/trade_history/day_by_day">Day by day</a>: the same test for each day</li>
+    <li><a href="/trade_history/sent_picks">Picks sent to Slack/Telegram</a>: and their results</li>
+    <li><a href="/trade_history/one_stock">Look up one stock</a>: its full history</li>
+    <li><a href="/trade_history/collected_per_day">Data collected per day</a>: is the bot running every day?</li>
+  </ol>
+  <p><small>All numbers are percent unless the column says otherwise. "After fees"
+  assumes 0.10% per buy and per sell. Real DNB fees are higher on small trades
+  (59 NOK minimum), see issue #70.</small></p>
 databases:
   trade_history:
+    description: The reports below explain the data in plain English. The raw tables are under "hidden tables", and are meant for the code, not for reading.
     tables:
       signal_archive:
-        description: Every screened stock, every day, picked or not. Results fill in after 5 trading days.
-        sort_desc: signal_session
+        hidden: true
+        description: Every screened stock, every day, picked or not. Kept forever. Results fill in after 5 trading days.
       published_picks:
-        description: Picks that were sent to Slack and Telegram.
-        sort_desc: published_at
+        hidden: true
+        description: Picks that were sent to Slack and Telegram. Kept forever.
       trade_metrics_history:
-        description: Daily screen measurements. Only the last 14 days are kept.
-        sort_desc: session_date
+        hidden: true
+        description: Daily screen numbers. Only the last 14 days are kept.
     queries:
-      collected_per_day:
-        title: Data collected per day
-        description: How many stocks were screened each day, how many passed, and how many have a result yet.
+      todays_screen:
+        title: 1. Latest screen - picked or skipped, and why
+        description: Every stock the bot checked on its latest run. "Skipped" says which filter it failed.
         sql: |-
-          SELECT signal_session AS day,
-                 COUNT(*) AS screened,
-                 SUM(qualified) AS passed_filters,
-                 SUM(outcome_json IS NOT NULL) AS have_result
-          FROM signal_archive
-          GROUP BY signal_session
-          ORDER BY signal_session DESC
-      picks_vs_all_per_day:
-        title: Forward test - picks vs all screened stocks
-        description: Average return after fees, 5 trading days later. If picks are not above "all", the filters add nothing.
+          SELECT symbol AS "Stock",
+                 CASE WHEN qualified THEN 'PICKED'
+                      ELSE 'Skipped: ' || CASE failed_gate
+                        WHEN 'trend' THEN 'below its 20-day average'
+                        WHEN 'momentum_5d' THEN 'not up 1% over 5 days'
+                        WHEN 'momentum_1d' THEN 'down today'
+                        WHEN 'volatility' THEN 'swings too much'
+                        WHEN 'drawdown' THEN 'too far below its high'
+                        WHEN 'stale' THEN 'price data is old'
+                        ELSE failed_gate END
+                 END AS "Result",
+                 ROUND(last_close, 2) AS "Price",
+                 ROUND(day_change_pct, 1) AS "Today %",
+                 ROUND(week_momentum_pct, 1) AS "Last 5 days %",
+                 ROUND(atr_pct, 1) AS "Normal daily swing %",
+                 ROUND(drawdown_pct, 1) AS "Below 20-day high %",
+                 ROUND(volume_ratio, 1) AS "Trading volume vs normal (x)",
+                 session_date AS "Trading day"
+          FROM trade_metrics_history
+          WHERE session_date = (SELECT MAX(session_date) FROM trade_metrics_history)
+          ORDER BY qualified DESC, week_momentum_pct DESC
+      scorecard:
+        title: 2. Scorecard - did the picks do better than the rest?
+        description: All days that have results so far. Returns are per stock, after fees, 5 trading days after the pick.
         sql: |-
-          SELECT signal_session AS day,
-                 SUM(qualified) AS picks,
-                 ROUND(AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END), 2) AS picks_avg_net_pct,
-                 COUNT(*) AS all_stocks,
-                 ROUND(AVG(json_extract(outcome_json, '$.net_return_pct')), 2) AS all_avg_net_pct
+          WITH days AS (
+            SELECT signal_session,
+                   AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END) AS picks,
+                   AVG(CASE WHEN NOT qualified THEN json_extract(outcome_json, '$.net_return_pct') END) AS skipped
+            FROM signal_archive
+            WHERE outcome_json IS NOT NULL
+            GROUP BY signal_session
+          )
+          SELECT COUNT(*) AS "Days with results",
+                 ROUND(AVG(picks), 2) AS "Picks: average %",
+                 ROUND(AVG(skipped), 2) AS "Skipped stocks: average %",
+                 ROUND(AVG(picks) - AVG(skipped), 2) AS "Difference %",
+                 SUM(picks > skipped) || ' of ' || SUM(picks IS NOT NULL AND skipped IS NOT NULL) AS "Days picks did better",
+                 CASE WHEN AVG(picks) > AVG(skipped) THEN 'Picks did better so far (too early to trust)'
+                      ELSE 'Picks did NOT do better' END AS "In short"
+          FROM days
+      day_by_day:
+        title: 3. Day by day - picks vs skipped stocks
+        description: Each row is one day's screen. Returns are after fees, 5 trading days later.
+        sql: |-
+          SELECT signal_session AS "Day picked",
+                 SUM(qualified) AS "Picks",
+                 ROUND(AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END), 2) AS "Picks: average %",
+                 SUM(NOT qualified) AS "Skipped",
+                 ROUND(AVG(CASE WHEN NOT qualified THEN json_extract(outcome_json, '$.net_return_pct') END), 2) AS "Skipped: average %",
+                 CASE WHEN SUM(qualified) = 0 THEN 'no picks'
+                      WHEN AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END)
+                         > AVG(CASE WHEN NOT qualified THEN json_extract(outcome_json, '$.net_return_pct') END)
+                      THEN 'picks better' ELSE 'picks worse' END AS "Verdict"
           FROM signal_archive
           WHERE outcome_json IS NOT NULL
           GROUP BY signal_session
           ORDER BY signal_session DESC
-      published_pick_results:
-        title: Published picks and their results
-        description: Each pick sent to Slack and Telegram. An empty result means it was never scored (see issue #66).
+      sent_picks:
+        title: 4. Picks sent to Slack/Telegram
+        description: Each pick the bot sent. "Waiting" means it was never scored; that is a known bug (issue #66).
         sql: |-
-          SELECT published_at,
-                 symbol,
-                 signal_session,
-                 benchmark_symbol,
-                 ROUND(json_extract(outcome_json, '$.net_return_pct'), 2) AS net_return_pct,
-                 ROUND(json_extract(outcome_json, '$.excess_return_pct'), 2) AS vs_index_pct
+          SELECT substr(published_at, 1, 10) AS "Sent on",
+                 symbol AS "Stock",
+                 CASE WHEN outcome_json IS NULL THEN 'Waiting (bug #66)'
+                      ELSE ROUND(json_extract(outcome_json, '$.net_return_pct'), 2) END AS "Result after fees %",
+                 ROUND(json_extract(outcome_json, '$.excess_return_pct'), 2) AS "Better than index by %",
+                 benchmark_symbol AS "Index compared with"
           FROM published_picks
-          ORDER BY published_at DESC
-      latest_screen:
-        title: Latest screen - why each stock passed or failed
-        description: The most recent day's screen, with the filter each stock failed.
+          ORDER BY published_at DESC, symbol
+      one_stock:
+        title: 5. Look up one stock
+        description: Type a ticker as the bot writes it, for example EQNR.OL, AAPL or SAP.DE.
         sql: |-
-          SELECT symbol, qualified, failed_gate, last_close,
-                 ROUND(day_change_pct, 2) AS day_change_pct,
-                 ROUND(week_momentum_pct, 2) AS week_momentum_pct,
-                 ROUND(volume_ratio, 2) AS volume_ratio,
-                 ROUND(atr_pct, 2) AS atr_pct,
-                 ROUND(drawdown_pct, 2) AS drawdown_pct
-          FROM trade_metrics_history
-          WHERE session_date = (SELECT MAX(session_date) FROM trade_metrics_history)
-          ORDER BY qualified DESC, symbol
+          SELECT signal_session AS "Day",
+                 CASE WHEN qualified THEN 'PICKED'
+                      ELSE 'Skipped: ' || CASE failed_gate
+                        WHEN 'trend' THEN 'below its 20-day average'
+                        WHEN 'momentum_5d' THEN 'not up 1% over 5 days'
+                        WHEN 'momentum_1d' THEN 'down today'
+                        WHEN 'volatility' THEN 'swings too much'
+                        WHEN 'drawdown' THEN 'too far below its high'
+                        WHEN 'stale' THEN 'price data is old'
+                        ELSE failed_gate END
+                 END AS "Result",
+                 ROUND(last_close, 2) AS "Price",
+                 ROUND(day_change_pct, 1) AS "Today %",
+                 ROUND(week_momentum_pct, 1) AS "Last 5 days %",
+                 ROUND(json_extract(outcome_json, '$.net_return_pct'), 2) AS "5 days later, after fees %"
+          FROM signal_archive
+          WHERE symbol = upper(:stock)
+          ORDER BY signal_session DESC
+      collected_per_day:
+        title: 6. Data collected per day
+        description: A gap in the dates means the bot did not run that day (weekends and holidays are normal gaps). "With result" fills in 5 trading days later.
+        sql: |-
+          SELECT signal_session AS "Day",
+                 COUNT(*) AS "Stocks checked",
+                 SUM(qualified) AS "Picked",
+                 SUM(outcome_json IS NOT NULL) AS "With result"
+          FROM signal_archive
+          GROUP BY signal_session
+          ORDER BY signal_session DESC
