@@ -11,6 +11,7 @@ Source order, per #73:
 Nothing reads this table yet; Phase 2 will.
 """
 
+import time
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -79,10 +80,29 @@ def _connection():
     return conn
 
 
+# filings.xbrl.org answers "429 Too Many Requests" to a fast loop, so every
+# request waits a moment, and a 429 waits longer and tries again.
+REQUEST_PAUSE_SECONDS = 1.0
+RATE_LIMIT_WAITS = (10, 30, 60)
+
+
+class NotInEsef(Exception):
+    """The company has no ESEF entry; Yahoo is the source for it."""
+
+
 def _get_json(url: str) -> Any:
-    response = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
-    response.raise_for_status()
-    return response.json()
+    for wait in (*RATE_LIMIT_WAITS, None):
+        time.sleep(REQUEST_PAUSE_SECONDS)
+        response = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
+        if response.status_code == 429 and wait is not None:
+            SYS_LOG.info("esef_rate_limited wait=%ss", wait)
+            time.sleep(wait)
+            continue
+        if response.status_code == 404:
+            raise NotInEsef(url)
+        response.raise_for_status()
+        return response.json()
+    raise RuntimeError("unreachable")
 
 
 def lei_for_isin(isin: str) -> Optional[str]:
@@ -201,12 +221,22 @@ def load_company_numbers(rows: Optional[List[Dict[str, str]]] = None) -> Dict[st
     rows = rows if rows is not None else stock_list.load()
     summary: Dict[str, Any] = {"saved": 0, "failed": []}
     for row in rows:
-        try:
-            if row["region"] != "US":
+        esef_ok = yahoo_ok = True
+        if row["region"] != "US":
+            try:
                 summary["saved"] += load_esef(row["ticker"], row["isin"])
+            except NotInEsef:
+                pass  # common for German, UK and new listings; Yahoo covers it
+            except Exception as exc:
+                SYS_LOG.warning("esef_numbers_failed symbol=%s detail=%s", row["ticker"], exc)
+                esef_ok = False
+        # Yahoo runs whatever ESEF did: it fills the items ESEF lacks.
+        try:
             summary["saved"] += load_yahoo(row["ticker"])
         except Exception as exc:
-            SYS_LOG.warning("company_numbers_failed symbol=%s detail=%s", row["ticker"], exc)
+            SYS_LOG.warning("yahoo_numbers_failed symbol=%s detail=%s", row["ticker"], exc)
+            yahoo_ok = False
+        if not esef_ok and not yahoo_ok:
             summary["failed"].append(row["ticker"])
     return summary
 

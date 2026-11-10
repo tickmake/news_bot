@@ -38,6 +38,9 @@ class EsefTests(unittest.TestCase):
 
 class LoadTests(unittest.TestCase):
     def setUp(self):
+        sleeper = patch.object(cn.time, "sleep")
+        self.sleep = sleeper.start()
+        self.addCleanup(sleeper.stop)
         self.store = nb_history_store.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "h.db"))
         self.addCleanup(self.store.close)
         patcher = patch.object(cn, "TRADE_HISTORY", self.store)
@@ -85,9 +88,32 @@ class LoadTests(unittest.TestCase):
                 patch.object(cn.yf, "Ticker", return_value=self._yahoo()):
             summary = cn.load_company_numbers([{"ticker": "AAPL", "isin": "US0378331005", "region": "US"}])
         self.assertEqual(summary["failed"], [])
-        with patch.object(cn, "_get_json", side_effect=RuntimeError("down")):
+        # ESEF down but Yahoo fine: not a failure, Yahoo still saves.
+        with patch.object(cn, "_get_json", side_effect=RuntimeError("down")), \
+                patch.object(cn.yf, "Ticker", return_value=self._yahoo()):
+            summary = cn.load_company_numbers([{"ticker": "EQNR.OL", "isin": "NO1", "region": "Oslo"}])
+        self.assertEqual(summary["failed"], [])
+        with patch.object(cn, "_get_json", side_effect=RuntimeError("down")), \
+                patch.object(cn.yf, "Ticker", side_effect=RuntimeError("down too")):
             summary = cn.load_company_numbers([{"ticker": "EQNR.OL", "isin": "NO1", "region": "Oslo"}])
         self.assertEqual(summary["failed"], ["EQNR.OL"])
+
+    def test_not_in_esef_falls_back_to_yahoo_quietly(self):
+        with patch.object(cn, "_get_json", side_effect=cn.NotInEsef("404")), \
+                patch.object(cn.yf, "Ticker", return_value=self._yahoo()):
+            summary = cn.load_company_numbers([{"ticker": "IFX.DE", "isin": "DE1", "region": "EU"}])
+        self.assertEqual(summary, {"saved": 4, "failed": []})
+
+    def test_rate_limit_waits_and_retries(self):
+        responses = [MagicMock(status_code=429), MagicMock(status_code=429), MagicMock(status_code=200)]
+        responses[2].json.return_value = {"ok": 1}
+        with patch.object(cn.requests, "get", side_effect=responses):
+            self.assertEqual(cn._get_json("u"), {"ok": 1})
+        self.assertIn(unittest.mock.call(10), self.sleep.call_args_list)
+        self.assertIn(unittest.mock.call(30), self.sleep.call_args_list)
+        with patch.object(cn.requests, "get", return_value=MagicMock(status_code=404)):
+            with self.assertRaises(cn.NotInEsef):
+                cn._get_json("u")
 
     def test_job_never_raises(self):
         with patch.object(cn, "load_company_numbers", side_effect=RuntimeError("x")):
