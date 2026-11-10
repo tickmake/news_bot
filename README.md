@@ -1014,6 +1014,21 @@ the three the entrypoint needs (which are gone once it has dropped to `app`), an
 sets `no-new-privileges`. If you add a feature that writes elsewhere, give it a
 path under `/app/data` rather than loosening `read_only`.
 
+## Backups off the Pi
+
+The bot saves a checked copy of its database every night at 04:00 into
+`TRADE_BACKUP_HOST_DIR` on the Pi. To survive losing the Pi itself, copy those
+files to another machine with `scripts/pull_backups.sh`. It runs on the other
+machine and *pulls*, so the Pi holds no key that could delete the copies. Each
+new copy is checked with `PRAGMA integrity_check`, and the newest 60 are kept.
+
+Install once on the receiving machine (`ssh raspberrypi5-02 true` must work):
+
+```
+crontab -e
+30 5 * * * /path/to/news_bot/scripts/pull_backups.sh >> ~/news_bot_backups/pull.log 2>&1
+```
+
 ## Message Sections
 
 Each briefing includes:
