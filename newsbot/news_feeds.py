@@ -366,7 +366,7 @@ def _news_provider_priority() -> List[str]:
 
 # Topic categories drive both selectors: the LLM receives the names and
 # weights, the heuristic additionally matches the keyword sets. Keywords cover
-# English and Norwegian because the Norway section is Norwegian-language.
+# English and Norwegian because NewsAPI and FreeNews results can be either.
 TOPIC_CATEGORIES: Dict[str, Dict[str, Any]] = {
     "markets": {
         "weight": 2.0,
@@ -849,7 +849,10 @@ def _collect_candidates(scope: str, feed_urls: List[str], pool_size: int) -> Lis
             raw.append((title, url, published, provider))
 
     now = datetime.now(timezone.utc)
-    max_age = max(1, SETTINGS.news_max_age_hours)
+    configured_age = (
+        SETTINGS.norway_news_max_age_hours if scope == "norway" else SETTINGS.news_max_age_hours
+    )
+    max_age = max(1, configured_age)
     candidates: List[Candidate] = []
     seen_exact: set = set()
 
