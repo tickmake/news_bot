@@ -1,18 +1,18 @@
 # Pinned for reproducible builds. yfinance is version-sensitive (see the
 # DNSError shim in news_bot.py); upgrade deliberately.
 requests==2.34.2
-yfinance==1.7.0
+yfinance==1.8.0
 # yfinance now imports curl_cffi unconditionally, so it must be installed
 # (the old YF_NO_CURL_CFFI / uninstall workaround no longer applies).
-curl_cffi==0.16.3
+curl_cffi==0.17.0
 apscheduler==3.11.3
 # Feed bodies are untrusted third-party input; stdlib ElementTree is
 # vulnerable to XML entity-expansion denial of service.
 defusedxml==0.7.1
 # The news ranker talks to a local Ollama endpoint over plain HTTP via
 # `requests`, so no LLM SDK is needed.
-pydantic==2.13.5
-pydantic-settings==2.15.0
+pydantic==2.14.3
+pydantic-settings==2.16.2
 # Technical-analysis charts for /recommendations, rendered locally and
 # uploaded via Telegram's sendPhoto. Imported lazily in render_candidate_charts
 # so an install without it degrades to text-only rather than failing to start.

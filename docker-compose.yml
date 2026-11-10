@@ -218,6 +218,43 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Read-only web page over the bot's database: browse tables, filter, export
+  # CSV, run the ready-made reports in datasette/metadata.yml. The volume is
+  # mounted read-only and Datasette opens the file read-only too, so nothing
+  # here can change the bot's data. No login, so the port must stay on the
+  # home network / VPN -- never forward it from the router.
+  datasette:
+    build: ./datasette
+    container_name: news_bot_datasette
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - news_bot_data:/app/data:ro
+      - ./datasette/metadata.yml:/etc/datasette/metadata.yml:ro
+    command:
+      - datasette
+      - serve
+      - /db/trade_history.db
+      - --metadata=/etc/datasette/metadata.yml
+      - --host=0.0.0.0
+      - --port=8001
+      - --setting
+      - sql_time_limit_ms
+      - "5000"
+    ports:
+      - "${DATASETTE_PORT:-8001}:8001"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   default:
   # Network carrying the Ollama the bot should talk to.
