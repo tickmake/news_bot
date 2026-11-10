@@ -7,7 +7,7 @@ import statistics
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from html import escape
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests.exceptions
 import yfinance as yf
@@ -269,6 +269,18 @@ class TradeHistoryStore:
                 ORDER BY published_at DESC, symbol ASC LIMIT ?
                 """,
                 (limit,),
+            )
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
+    def unsettled_published_picks(self) -> List[Dict[str, Any]]:
+        """Every delivered pick still without an outcome, however old."""
+        with TRADE_HISTORY_LOCK:
+            cursor = self._connection().execute(
+                """
+                SELECT * FROM published_picks WHERE outcome_json IS NULL
+                ORDER BY published_at ASC, symbol ASC
+                """
             )
             columns = [column[0] for column in cursor.description]
             return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
@@ -548,19 +560,8 @@ def _published_pick_outcome(
     }
 
 
-def build_published_pick_report() -> str:
-    """Evaluate the latest 100 delivered signals, retaining completed outcomes."""
-    lines = ["<b>Published Pick Performance</b>", ""]
-    try:
-        picks = TRADE_HISTORY.published_picks()
-    except (sqlite3.Error, OSError) as exc:
-        SYS_LOG.error("published_picks_read_failed detail=%s", exc)
-        return "\n".join(lines + ["Pick ledger unavailable. Check bot logs."])
-    if not picks:
-        return "\n".join(lines + [
-            "No published picks recorded yet. Tracking starts with successful Telegram "
-            "delivery of /recommendations, /now, or scheduled briefings.",
-        ])
+def _pick_history_loader() -> Callable[[Optional[str]], Any]:
+    """One fetch per symbol per run, shared by every pick that needs it."""
     history_cache: Dict[str, Any] = {}
 
     def history_for(symbol: Optional[str]) -> Any:
@@ -576,6 +577,64 @@ def build_published_pick_report() -> str:
                 history_cache[symbol] = None
         return history_cache[symbol]
 
+    return history_for
+
+
+def settle_published_picks() -> Tuple[int, int]:
+    """Score every delivered pick whose holding period has passed.
+
+    Returns (settled, failed). /pickperformance only scores the newest 100 and
+    only when someone asks, so without this older picks were never scored, and
+    a symbol that later stops returning prices could never be scored at all --
+    usually the worst picks, which would flatter the record.
+    """
+    history_for = _pick_history_loader()
+    settled = failed = 0
+    for pick in TRADE_HISTORY.unsettled_published_picks():
+        try:
+            outcome = _published_pick_outcome(
+                pick, history_for(pick["symbol"]), history_for(pick["benchmark_symbol"]),
+            )
+            if outcome is None:
+                continue
+            TRADE_HISTORY.complete_pick(pick, outcome)
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as exc:
+            SYS_LOG.warning("published_pick_evaluation_failed symbol=%s detail=%s", pick["symbol"], exc)
+            failed += 1
+            continue
+        settled += 1
+    return settled, failed
+
+
+def job_settle_published_picks() -> bool:
+    """Nightly wrapper for settle_published_picks. Never raises."""
+    try:
+        settled, failed = settle_published_picks()
+    except Exception as exc:
+        SYS_LOG.error("published_pick_settle_failed detail=%s", exc)
+        return False
+    if failed:
+        # Failed picks stay unscored and are retried the next night.
+        SYS_LOG.warning("published_pick_settle settled=%d retry_tomorrow=%d", settled, failed)
+    elif settled:
+        APP_LOG.info("published_pick_settle settled=%d", settled)
+    return not failed
+
+
+def build_published_pick_report() -> str:
+    """Evaluate the latest 100 delivered signals, retaining completed outcomes."""
+    lines = ["<b>Published Pick Performance</b>", ""]
+    try:
+        picks = TRADE_HISTORY.published_picks()
+    except (sqlite3.Error, OSError) as exc:
+        SYS_LOG.error("published_picks_read_failed detail=%s", exc)
+        return "\n".join(lines + ["Pick ledger unavailable. Check bot logs."])
+    if not picks:
+        return "\n".join(lines + [
+            "No published picks recorded yet. Tracking starts with successful Telegram "
+            "delivery of /recommendations, /now, or scheduled briefings.",
+        ])
+    history_for = _pick_history_loader()
     completed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     pending = unavailable = 0
     for pick in picks:
