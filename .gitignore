@@ -8,3 +8,6 @@ __pycache__/
 .news_bot_trade_history.db
 .coverage
 .ruff_cache/
+# Default TRADE_BACKUP_HOST_DIR when the host sets none. Snapshots of the
+# trade-history DB are data, never code.
+backups/

@@ -200,6 +200,13 @@ class AppSettings(BaseSettings):
     trade_total_deadline_seconds: int = 45
     trade_history_db_file: str = ".news_bot_trade_history.db"
     trade_history_retention_days: int = 14
+    # Nightly snapshots of the trade-history DB. It holds signal_archive and
+    # published_picks -- the only out-of-sample record this project keeps, and
+    # the only thing here that git cannot reproduce. Unset means no backup
+    # runs, so the compose file points this at a bind mount outside the data
+    # volume; a path inside it would survive DB corruption but not the volume.
+    trade_backup_dir: str = ""
+    trade_backup_keep: int = 14
     # Legacy variable name; this is the fixed backtest holding period in sessions.
     trade_outcome_lookback_days: int = 5
     trade_backtest_period: str = "2y"

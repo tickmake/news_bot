@@ -88,6 +88,10 @@ class SchedulerWiringTests(_MainHarness):
         self.assertEqual((settle.args[1], settle.kwargs), ("cron", {"hour": 3, "minute": 0}))
         picks = jobs["job_settle_published_picks"]
         self.assertEqual((picks.args[1], picks.kwargs), ("cron", {"hour": 3, "minute": 30}))
+        snapshot = jobs["job_backup_trade_history"]
+        self.assertEqual(
+            (snapshot.args[1], snapshot.kwargs), ("cron", {"hour": 4, "minute": 0})
+        )
         beat = jobs["_touch_heartbeat"]
         self.assertEqual((beat.args[1], beat.kwargs["minutes"], beat.kwargs["args"]),
                          ("interval", 1, ["scheduler"]))

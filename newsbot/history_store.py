@@ -393,6 +393,27 @@ class TradeHistoryStore:
             streak += 1
         return streak
 
+    def backup_to(self, destination: str) -> None:
+        """Copy the database to `destination` via SQLite's online-backup API.
+
+        Not `cp`: the bot holds this connection open across the whole process
+        lifetime, so a file copy can catch a half-written page and produce an
+        image that only fails to open months later, when it is the last copy
+        left. The backup API reads under SQLite's own locking and restarts the
+        copy if a write lands mid-flight, so the result is always a consistent
+        snapshot of some committed state.
+
+        Raises on failure -- the caller decides whether a missed backup is
+        worth an alert, and must not leave a partial file behind as if it were
+        a good one.
+        """
+        with TRADE_HISTORY_LOCK:
+            target = sqlite3.connect(destination, timeout=10)
+            try:
+                self._connection().backup(target)
+            finally:
+                target.close()
+
     def close(self) -> None:
         with TRADE_HISTORY_LOCK:
             if self._conn is not None:

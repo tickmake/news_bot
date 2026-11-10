@@ -79,6 +79,12 @@ services:
       # qualifying streaks, /analyze outcomes and /stocks weekly picks to
       # empty until enough sessions re-accumulate.
       - news_bot_data:/app/data
+      # Backup target for the nightly snapshot, deliberately a bind mount and
+      # not a second named volume: the point is to survive losing
+      # news_bot_data, and `docker volume rm` or a bad recreate takes volumes,
+      # not host paths. Defaults next to the compose project; on the Pi set
+      # TRADE_BACKUP_HOST_DIR to a path on the NVMe, off the SD card.
+      - ${TRADE_BACKUP_HOST_DIR:-./backups}:/app/backups
     # The image carries no .env of its own (the Dockerfile copies only the code,
     # evaluation_universe.csv and the entrypoint), and the explicit `environment` list
     # below is an allowlist -- so every setting missing from it was simply
@@ -102,6 +108,11 @@ services:
       # compose file, not user config -- change it here if you need it moved.
       - STATE_FILE=/app/data/.news_bot_state.json
       - TRADE_HISTORY_DB_FILE=/app/data/.news_bot_trade_history.db
+      # Pinned here for the same reason as the two paths above: this is the
+      # container-side mount point, not user config. How many snapshots to
+      # keep is user config, so that one stays interpolated.
+      - TRADE_BACKUP_DIR=/app/backups
+      - TRADE_BACKUP_KEEP=${TRADE_BACKUP_KEEP:-14}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       # Slack mirror. The image has no .env of its own, so anything absent from this

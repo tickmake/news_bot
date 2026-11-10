@@ -7,6 +7,7 @@ from typing import Optional
 from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
 from apscheduler.schedulers.blocking import BlockingScheduler
 
+from newsbot.backup import job_backup_trade_history
 from newsbot.briefing import job_catchup_briefing, job_health_ping, job_scheduled_briefing, job_daily_briefing
 from newsbot.commands import (
     _prepare_telegram_long_polling,
@@ -51,6 +52,11 @@ def main() -> None:
     # Same idea for the picks actually sent to Slack/Telegram; half an hour
     # later so the two jobs do not hit the price provider at the same time.
     scheduler.add_job(job_settle_published_picks, "cron", hour=3, minute=30)
+    # 04:00: after both settle jobs, so the snapshot carries that night's
+    # outcomes. Separate jobs rather than one chained call because a settle
+    # that fails should still be followed by a backup -- the rows already in
+    # the archive are what is irreplaceable.
+    scheduler.add_job(job_backup_trade_history, "cron", hour=4, minute=0)
     scheduler.add_job(_touch_heartbeat, "interval", minutes=1, args=["scheduler"])
     _touch_heartbeat("scheduler")
     # One-off, run by the scheduler as soon as it starts: sends a briefing the
