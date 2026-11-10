@@ -541,6 +541,14 @@ def get_trade_candidates(universe: Optional[Dict[str, str]] = None, top_n: int =
     return build_trade_candidates_payload(universe=universe, top_n=top_n)[0]
 
 
+# #67: the picks look like trade ideas, but in testing they did no better
+# than a random stock, so say so before anyone acts on them.
+WATCH_LIST_WARNING = (
+    "⚠️ <b>Watch list only, not a buy list.</b> In testing, these picks "
+    "did no better than a random stock."
+)
+
+
 def build_trade_candidates_payload(
     universe: Optional[Dict[str, str]] = None, top_n: int = 5
 ) -> Tuple[str, "ScreenOutcome", Dict[str, str]]:
@@ -569,6 +577,7 @@ def build_trade_candidates_payload(
         lines = [
             f"📈 <b>Short-Term Trade Candidates — {qualified_count} of "
             f"{outcome.checked} passed</b>",
+            WATCH_LIST_WARNING,
             "",
         ]
         lines.extend(_render_stale_notice(outcome))

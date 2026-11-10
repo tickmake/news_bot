@@ -272,7 +272,8 @@ class RenderingTests(SettingsCase):
         lines = risk.candidate_lines("AAA", context)
         self.assertIn("volatility stop 96.00 (4.0% away)", lines[0])
         self.assertIn("size 12% of portfolio for 0.50% risk", lines[0])
-        self.assertIn("⚠️ earnings in 2 days", lines[1])
+        self.assertIn("fees: at least 118 NOK to buy and sell + currency exchange fee", lines[1])
+        self.assertIn("⚠️ earnings in 2 days", lines[2])
 
     def test_capped_size_says_so_and_amount_is_shown(self):
         self.use(risk_account_size=50_000.0)
@@ -281,9 +282,18 @@ class RenderingTests(SettingsCase):
         self.assertIn("(capped; risks", text)
         self.assertIn("≈ 10,000", text)
 
-    def test_no_context_or_unknown_symbol_gives_no_lines(self):
-        self.assertEqual(risk.candidate_lines("AAA", None), [])
-        self.assertEqual(risk.candidate_lines("ZZZ", self._context()), [])
+    def test_fee_line_shows_the_minimum_as_a_share_of_the_position(self):
+        self.assertEqual(risk.fee_line("EQNR.OL", 4_500.0),
+                         "    fees: 118 NOK to buy and sell (2.6% of 4,500 NOK)")
+        # Above ~49,000 NOK the 0.12% rate beats the 59 NOK minimum.
+        self.assertIn("144 NOK to buy and sell (0.2% of 60,000 NOK) + currency exchange fee",
+                      risk.fee_line("AAPL", 60_000.0))
+        self.assertEqual(risk.fee_line("EQNR.OL", None), "    fees: at least 118 NOK to buy and sell")
+
+    def test_without_context_or_sizing_only_the_fee_shows(self):
+        self.assertEqual(risk.candidate_lines("AAA", None), ["    fees: at least 118 NOK to buy and sell + currency exchange fee"])
+        self.assertEqual(risk.candidate_lines("ZZZ", self._context()),
+                         ["    fees: at least 118 NOK to buy and sell + currency exchange fee"])
 
     def test_portfolio_section_totals_and_disclaimer(self):
         lines = risk.portfolio_lines(risk.assess([_m("AAA"), _m("BBB")], {}, [], TODAY))
@@ -411,6 +421,8 @@ class IntegrationTests(SettingsCase):
         self.assertIn("earnings tomorrow", text)
         self.assertIn("<b>Taken together</b>", text)
         self.assertIn("AAA, BBB are all Energy", text)
+        self.assertEqual(text.count("fees: "), 2)
+        self.assertIn("Watch list only, not a buy list.", text.splitlines()[1])
 
     def test_disabled_feature_leaves_the_text_unchanged(self):
         self.use(risk_analytics_enabled=False)
@@ -420,6 +432,7 @@ class IntegrationTests(SettingsCase):
             text, _, _ = nb_screener.build_trade_candidates_payload(universe={"A": "AAA"})
         self.assertNotIn("volatility stop", text)
         self.assertNotIn("Taken together", text)
+        self.assertIn("fees: at least 118 NOK", text)
 
     def test_analyze_has_a_risk_section(self):
         self.use(risk_analytics_enabled=True)

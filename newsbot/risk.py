@@ -331,10 +331,25 @@ def _relative_strength(
     return result
 
 
+def fee_line(symbol: str, amount: Optional[float]) -> str:
+    """What buying and later selling would cost at the broker, in NOK."""
+    minimum = 2 * SETTINGS.broker_fee_min_nok
+    fx_note = "" if symbol.upper().endswith(".OL") else " + currency exchange fee"
+    if amount is None or amount <= 0:
+        return f"    fees: at least {minimum:,.0f} NOK to buy and sell{fx_note}"
+    per_side = max(SETTINGS.broker_fee_min_nok, amount * SETTINGS.broker_fee_pct / 100.0)
+    round_trip = 2 * per_side
+    return (
+        f"    fees: {round_trip:,.0f} NOK to buy and sell"
+        f" ({round_trip / amount * 100:.1f}% of {amount:,.0f} NOK){fx_note}"
+    )
+
+
 def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
-    """Extra lines under one candidate: sizing and any event flag."""
+    """Extra lines under one candidate: sizing, fees and any event flag."""
     if risk is None:
-        return []
+        # The fee is known without any lookups, so it shows even then.
+        return [fee_line(symbol, None)]
     lines: List[str] = []
     sized = risk.sizing.get(symbol)
     if sized is not None:
@@ -349,6 +364,7 @@ def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
         if sized.amount is not None:
             text += f" ≈ {sized.amount:,.0f}"
         lines.append(text)
+    lines.append(fee_line(symbol, sized.amount if sized is not None else None))
     strength_line = relative_strength.render_line(risk.strength.get(symbol))
     if strength_line:
         lines.append(escape(strength_line, quote=False))

@@ -148,6 +148,8 @@ class AppSettings(BaseSettings):
     trade_max_drawdown_pct: float = 8.0
     trade_max_atr_pct: float = 4.5
     trade_universe_max: int = 30
+    # Stocks in the nightly analyst-estimate snapshot (configured ones first).
+    snapshot_max_symbols: int = 120
     trade_fetch_workers: int = 6
     # Risk analytics shown with trade candidates. These are decision aids that
     # hold whether or not the screen has an edge (it has not been shown to):
@@ -164,6 +166,10 @@ class AppSettings(BaseSettings):
     risk_max_total_pct: float = 60.0
     # Optional. When set (in your account currency), sizes also show an amount.
     risk_account_size: float = 0.0
+    # Broker fee per order (DNB: 0.12%, at least 59 NOK). Shown next to each
+    # pick, because at small sizes the minimum is a big share of the position.
+    broker_fee_min_nok: float = 59.0
+    broker_fee_pct: float = 0.12
     risk_corr_threshold: float = 0.7
     risk_corr_window: int = 60
     risk_corr_min_obs: int = 30
