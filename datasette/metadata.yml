@@ -119,11 +119,11 @@ databases:
           ORDER BY signal_session DESC
       sent_picks:
         title: 4. Picks sent to Slack/Telegram
-        description: Each pick the bot sent. "Waiting" means it was never scored; that is a known bug (issue #66).
+        description: Each pick the bot sent. Results are filled in every night at 03:30. "Waiting" means its 5 trading days are not over yet.
         sql: |-
           SELECT substr(published_at, 1, 10) AS "Sent on",
                  symbol AS "Stock",
-                 CASE WHEN outcome_json IS NULL THEN 'Waiting (bug #66)'
+                 CASE WHEN outcome_json IS NULL THEN 'Waiting (5-day hold not over)'
                       ELSE ROUND(json_extract(outcome_json, '$.net_return_pct'), 2) END AS "Result after fees %",
                  ROUND(json_extract(outcome_json, '$.excess_return_pct'), 2) AS "Better than index by %",
                  benchmark_symbol AS "Index compared with"
