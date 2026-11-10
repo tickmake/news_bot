@@ -92,6 +92,48 @@ class FillTests(unittest.TestCase):
         self.assertEqual(len(self._rows()), 1)
 
 
+class PortfolioTests(FillTests):
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(nb_config.SETTINGS, "risk_account_size", 50_000.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_average_cost_profit_and_cash(self):
+        day = (date.today() - timedelta(days=3)).isoformat()
+        fills.record_fill(f"BUY EQNR.OL 10 280 59 {day}")
+        fills.record_fill(f"BUY EQNR.OL 10 290 59 {day}")
+        fills.record_fill("SELL EQNR.OL 10 300 59")
+        fills.record_fill("BUY AAPL 10 200 59")
+        report = fills.build_portfolio_report()
+        # Cost 2,859 + 2,959 = 5,818 NOK; selling half the shares leaves 2,909 on 10 shares.
+        self.assertIn("<b>EQNR.OL</b> · 10 shares", report)
+        self.assertIn("bought at 285.00 NOK average, now 285.00 NOK", report)
+        self.assertIn("worth 2,850 NOK · profit -59 NOK (-2.0%) after fees", report)
+        # USD: 10 x 200 x 11 = 22,000 + 59 fee, valued at 22,000.
+        self.assertIn("worth 22,000 NOK · profit -59 NOK (-0.3%) after fees", report)
+        # Sold 10 at 300 = 3,000 - 59, against half the cost 2,909.
+        self.assertIn("Profit from shares already sold: +32 NOK", report)
+        self.assertIn("Fees paid so far: 236 NOK in 4 trades", report)
+        # 50,000 - 2,859 - 2,959 + 2,941 - 22,059 = 25,064
+        self.assertIn("Cash left: 25,064 NOK", report)
+        self.assertIn("Account total: 49,914 NOK, -86 NOK (-0.2%) since the start", report)
+
+    def test_sold_out_stock_disappears_and_no_price_is_said(self):
+        fills.record_fill("BUY EQNR.OL 10 285 59")
+        fills.record_fill("SELL EQNR.OL 10 285 59")
+        fills.record_fill("BUY SAP.DE 1 250 59")
+        self.prices.pop("SAP.DE")
+        report = fills.build_portfolio_report()
+        self.assertNotIn("EQNR.OL</b>", report)
+        self.assertIn("today's price not available", report)
+        self.assertIn("Not in the totals (no price today): SAP.DE", report)
+        self.assertNotIn("Account total", report)
+
+    def test_empty_log(self):
+        self.assertIn("No real trades saved yet", fills.build_portfolio_report())
+
+
 class FillCommandTests(unittest.TestCase):
     def setUp(self):
         for p in (
@@ -104,13 +146,15 @@ class FillCommandTests(unittest.TestCase):
     def test_replies_go_to_telegram_only(self):
         with patch.object(fills, "record_fill", return_value="SAVED") as record, \
                 patch.object(fills, "list_fills", return_value="LIST"), \
-                patch.object(fills, "delete_last_fill", return_value="GONE"):
+                patch.object(fills, "delete_last_fill", return_value="GONE"), \
+                patch.object(fills, "build_portfolio_report", return_value="HELD"):
             cmd._handle_command("/fill BUY EQNR.OL 1 285 59", "7")
             cmd._handle_command("/fills", "7")
             cmd._handle_command("/unfill", "7")
+            cmd._handle_command("/portfolio", "7")
         record.assert_called_once_with("BUY EQNR.OL 1 285 59")
         sent = [call.args[0] for call in nb_messaging.send_telegram_message.call_args_list]
-        self.assertEqual(sent, ["SAVED", "LIST", "GONE"])
+        self.assertEqual(sent, ["SAVED", "LIST", "GONE", "HELD"])
         nb_messaging._broadcast_message.assert_not_called()
 
     def test_edited_fill_is_not_run_again(self):

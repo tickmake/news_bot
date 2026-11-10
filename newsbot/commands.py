@@ -37,6 +37,7 @@ def _command_help_text() -> str:
         "/fill BUY|SELL TICKER SHARES PRICE FEE_NOK [YYYY-MM-DD] - Save a real trade (Telegram only)\n"
         "/fills - List the last 20 real trades\n"
         "/unfill - Delete the last real trade\n"
+        "/portfolio - What I hold now, its value today and profit or loss\n"
     )
 
 
@@ -85,6 +86,8 @@ def _handle_command(command: str, chat_id: str) -> None:
         messaging.send_telegram_message(fills.list_fills(), chat_id=chat_id)
     elif normalized == "/unfill":
         messaging.send_telegram_message(fills.delete_last_fill(), chat_id=chat_id)
+    elif normalized == "/portfolio":
+        messaging.send_telegram_message(fills.build_portfolio_report(), chat_id=chat_id)
     else:
         messaging._broadcast_message(_command_help_text(), chat_id=chat_id)
 

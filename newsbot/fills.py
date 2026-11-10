@@ -11,6 +11,7 @@ from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 
 from newsbot import market_data
+from newsbot.config import SETTINGS
 from newsbot.history_store import TRADE_HISTORY
 from newsbot.logsetup import APP_LOG, SYS_LOG
 from newsbot.state import TRADE_HISTORY_LOCK
@@ -204,3 +205,103 @@ def delete_last_fill() -> str:
             conn.execute("DELETE FROM real_trades WHERE id = ?", (last["id"],))
     SYS_LOG.warning("real_trade_deleted id=%s symbol=%s", last["id"], last["symbol"])
     return "Deleted:\n" + _describe(last)
+
+
+def _holdings(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], float, float]:
+    """Replay the trades in order, average-cost style.
+
+    Returns (open holdings, realised profit in NOK, cash change in NOK). A
+    sale removes its share of the average cost, fees included, so the
+    profit on what is left is not distorted by what was sold.
+    """
+    holdings: Dict[str, Dict[str, Any]] = {}
+    realised = cash = 0.0
+    for row in rows:
+        value_nok = row["shares"] * row["price"] * row["fx_to_nok"]
+        held = holdings.setdefault(row["symbol"], {
+            "shares": 0, "cost_nok": 0.0, "cost_local": 0.0, "currency": row["currency"]})
+        if row["side"] == "BUY":
+            held["shares"] += row["shares"]
+            held["cost_nok"] += value_nok + row["fee_nok"]
+            held["cost_local"] += row["shares"] * row["price"]
+            cash -= value_nok + row["fee_nok"]
+        else:
+            sold = min(row["shares"], held["shares"])
+            share = sold / held["shares"] if held["shares"] else 0.0
+            removed = held["cost_nok"] * share
+            held["cost_nok"] -= removed
+            held["cost_local"] -= held["cost_local"] * share
+            held["shares"] -= sold
+            realised += value_nok - row["fee_nok"] - removed
+            cash += value_nok - row["fee_nok"]
+    return {symbol: held for symbol, held in holdings.items() if held["shares"] > 0}, realised, cash
+
+
+def _latest_price(symbol: str) -> Optional[float]:
+    try:
+        return _close_on_or_before(symbol, date.today())
+    except Exception as exc:
+        SYS_LOG.warning("portfolio_price_failed symbol=%s detail=%s", symbol, exc)
+        return None
+
+
+def build_portfolio_report() -> str:
+    """What the /fill log says is held now, valued at the latest price."""
+    with TRADE_HISTORY_LOCK:
+        cursor = _connection().execute("SELECT * FROM real_trades ORDER BY trade_date, id")
+        columns = [column[0] for column in cursor.description]
+        rows = [dict(zip(columns, row, strict=True)) for row in cursor]
+    if not rows:
+        return "No real trades saved yet. Add one with /fill."
+    holdings, realised, cash_change = _holdings(rows)
+    lines = ["<b>My portfolio</b> (from the trades saved with /fill)", ""]
+    cost_total = value_total = 0.0
+    unpriced: List[str] = []
+    for symbol, held in sorted(holdings.items()):
+        currency = held["currency"]
+        price = _latest_price(symbol)
+        fx = 1.0 if currency == "NOK" else _latest_price(f"{currency}NOK=X")
+        average = held["cost_local"] / held["shares"]
+        lines.append(f"<b>{escape(symbol)}</b> · {held['shares']} shares")
+        if price is None or fx is None:
+            unpriced.append(symbol)
+            lines.append(f"    bought at {average:,.2f} {currency} average · today's price not available")
+            lines.append("")
+            continue
+        value = held["shares"] * price * fx
+        profit = value - held["cost_nok"]
+        cost_total += held["cost_nok"]
+        value_total += value
+        lines.append(f"    bought at {average:,.2f} {currency} average, now {price:,.2f} {currency}")
+        lines.append(
+            f"    worth {value:,.0f} NOK · profit {profit:+,.0f} NOK "
+            f"({profit / held['cost_nok'] * 100:+.1f}%) after fees"
+        )
+        lines.append("")
+    if not holdings:
+        lines.extend(["No shares held right now.", ""])
+    if holdings and cost_total:
+        unrealised = value_total - cost_total
+        lines.append(
+            f"Shares worth {value_total:,.0f} NOK · profit on them {unrealised:+,.0f} NOK "
+            f"({unrealised / cost_total * 100:+.1f}%)"
+        )
+    lines.append(f"Profit from shares already sold: {realised:+,.0f} NOK")
+    fees = sum(row["fee_nok"] for row in rows)
+    lines.append(f"Fees paid so far: {fees:,.0f} NOK in {len(rows)} trades")
+    if SETTINGS.risk_account_size > 0:
+        cash = SETTINGS.risk_account_size + cash_change
+        total = cash + value_total
+        lines.append(
+            f"Cash left: {cash:,.0f} NOK (start {SETTINGS.risk_account_size:,.0f} NOK minus buys, plus sells)"
+        )
+        if not unpriced:
+            change = total - SETTINGS.risk_account_size
+            lines.append(
+                f"<b>Account total: {total:,.0f} NOK, {change:+,.0f} NOK "
+                f"({change / SETTINGS.risk_account_size * 100:+.1f}%) since the start</b>"
+            )
+    if unpriced:
+        lines.append(f"<i>Not in the totals (no price today): {escape(', '.join(unpriced))}</i>")
+    lines.append("<i>Prices are the latest Yahoo has and may be delayed.</i>")
+    return "\n".join(lines)
