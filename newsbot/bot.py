@@ -19,6 +19,7 @@ from newsbot.commands import (
 from newsbot.config import SETTINGS, get_missing_required_config
 from newsbot.forward_test import job_settle_forward_test
 from newsbot.history_store import job_settle_published_picks
+from newsbot.holding_alerts import job_holding_alerts
 from newsbot.snapshots import job_save_snapshots
 
 
@@ -45,6 +46,8 @@ def main() -> None:
     )
     scheduler.add_job(job_scheduled_briefing, "cron", hour="7,19", minute=0)
     scheduler.add_job(job_health_ping, "cron", hour=12, minute=0)
+    # 22:30, weekdays: after the Oslo, European and US closes.
+    scheduler.add_job(job_holding_alerts, "cron", day_of_week="mon-fri", hour=22, minute=30)
     # 03:00: the last US session closed hours ago, so its bar is final and the
     # in-progress-bar guard will not discard it. Each run settles every row that
     # has become computable, not just yesterday's, so a night the Pi spends down

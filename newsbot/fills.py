@@ -207,6 +207,19 @@ def delete_last_fill() -> str:
     return "Deleted:\n" + _describe(last)
 
 
+def trade_rows() -> List[Dict[str, Any]]:
+    """Every saved trade, oldest first."""
+    with TRADE_HISTORY_LOCK:
+        cursor = _connection().execute("SELECT * FROM real_trades ORDER BY trade_date, id")
+        columns = [column[0] for column in cursor.description]
+        return [dict(zip(columns, row, strict=True)) for row in cursor]
+
+
+def current_holdings() -> Dict[str, Dict[str, Any]]:
+    """Shares held now per symbol, with their average cost."""
+    return _holdings(trade_rows())[0]
+
+
 def _holdings(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], float, float]:
     """Replay the trades in order, average-cost style.
 
@@ -247,10 +260,7 @@ def _latest_price(symbol: str) -> Optional[float]:
 
 def build_portfolio_report() -> str:
     """What the /fill log says is held now, valued at the latest price."""
-    with TRADE_HISTORY_LOCK:
-        cursor = _connection().execute("SELECT * FROM real_trades ORDER BY trade_date, id")
-        columns = [column[0] for column in cursor.description]
-        rows = [dict(zip(columns, row, strict=True)) for row in cursor]
+    rows = trade_rows()
     if not rows:
         return "No real trades saved yet. Add one with /fill."
     holdings, realised, cash_change = _holdings(rows)
