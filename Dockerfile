@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY news_bot.py .
 COPY newsbot/ newsbot/
-COPY evaluation_universe.csv .
+COPY evaluation_universe.csv stock_list.csv ./
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # "Running" is not "working": the process can stay up with a dead poller thread
