@@ -34,6 +34,11 @@ description_html: |-
     <li><a href="/trade_history/one_stock">Look up one stock</a>: its full history</li>
     <li><a href="/trade_history/collected_per_day">Data collected per day</a>: is the bot running every day?</li>
   </ol>
+  <h2>My real money</h2>
+  <ol start="7">
+    <li><a href="/trade_history/my_trades">My trades</a>: every trade you saved with /fill in Telegram</li>
+    <li><a href="/trade_history/my_holdings">What I hold</a>: shares held per stock, what you paid, and profit or loss on stocks you have sold</li>
+  </ol>
   <p><small>All numbers are percent unless the column says otherwise. "After fees"
   assumes 0.10% per buy and per sell. Real DNB fees are higher on small trades
   (59 NOK minimum), see issue #70.</small></p>
@@ -50,6 +55,12 @@ databases:
       trade_metrics_history:
         hidden: true
         description: Daily screen numbers. Only the last 14 days are kept.
+      real_trades:
+        hidden: true
+        description: Real trades saved with /fill. Prices are in the stock's own currency; fx_to_nok is that day's rate.
+      stock_snapshots:
+        hidden: true
+        description: Yahoo's analyst estimates and company numbers, one row per stock per night. Nothing reads it yet.
     queries:
       todays_screen:
         title: 1. Latest screen - picked or skipped, and why
@@ -162,3 +173,42 @@ databases:
           FROM signal_archive
           GROUP BY signal_session
           ORDER BY signal_session DESC
+
+      my_trades:
+        title: 7. My trades
+        description: >-
+          Every real trade saved with /fill, newest first. "Worth in NOK" uses that
+          day's exchange rate. To fix a wrong trade, send /unfill and then /fill again.
+        sql: |-
+          SELECT trade_date AS "Date",
+                 CASE side WHEN 'BUY' THEN 'Bought' ELSE 'Sold' END AS "Action",
+                 symbol AS "Stock",
+                 shares AS "Shares",
+                 printf('%.2f %s', price, currency) AS "Price",
+                 ROUND(shares * price * fx_to_nok) AS "Worth in NOK",
+                 ROUND(fee_nok) AS "Fee NOK",
+                 CASE WHEN currency = 'NOK' THEN '' ELSE printf('1 %s = %.2f NOK', currency, fx_to_nok) END AS "Exchange rate",
+                 CASE WHEN checks_skipped THEN 'yes (saved with !)' ELSE '' END AS "Checks skipped"
+          FROM real_trades
+          ORDER BY id DESC
+      my_holdings:
+        title: 8. What I hold
+        description: >-
+          One line per stock. "Paid" includes buy fees; "Got back" is after sell fees.
+          When all shares are sold, the last column shows the profit or loss in NOK.
+          Today's value of shares you still hold is not shown here.
+        sql: |-
+          SELECT symbol AS "Stock",
+                 SUM(CASE side WHEN 'BUY' THEN shares ELSE -shares END) AS "Shares held",
+                 printf('%.2f %s', SUM(CASE side WHEN 'BUY' THEN shares * price END)
+                        / SUM(CASE side WHEN 'BUY' THEN shares END), MAX(currency)) AS "Average buy price",
+                 ROUND(SUM(CASE side WHEN 'BUY' THEN shares * price * fx_to_nok + fee_nok ELSE 0 END)) AS "Paid NOK",
+                 ROUND(SUM(CASE side WHEN 'SELL' THEN shares * price * fx_to_nok - fee_nok ELSE 0 END)) AS "Got back NOK",
+                 ROUND(SUM(fee_nok)) AS "Fees NOK",
+                 CASE WHEN SUM(CASE side WHEN 'BUY' THEN shares ELSE -shares END) = 0
+                      THEN printf('closed: %+.0f NOK', SUM(CASE side WHEN 'SELL' THEN shares * price * fx_to_nok - fee_nok
+                                                            ELSE -(shares * price * fx_to_nok + fee_nok) END))
+                      ELSE 'still holding' END AS "Result"
+          FROM real_trades
+          GROUP BY symbol
+          ORDER BY MAX(trade_date) DESC
