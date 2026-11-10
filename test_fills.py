@@ -116,8 +116,8 @@ class PortfolioTests(FillTests):
         self.assertIn("Profit from shares already sold: +32 NOK", report)
         self.assertIn("Fees paid so far: 236 NOK in 4 trades", report)
         # 50,000 - 2,859 - 2,959 + 2,941 - 22,059 = 25,064
-        self.assertIn("Cash left: 25,064 NOK", report)
-        self.assertIn("Account total: 49,914 NOK, -86 NOK (-0.2%) since the start", report)
+        self.assertIn("Cash left: 25,064 NOK (money put in 50,000 NOK", report)
+        self.assertIn("Account total: 49,914 NOK, -86 NOK (-0.2%) on the money put in", report)
 
     def test_sold_out_stock_disappears_and_no_price_is_said(self):
         fills.record_fill("BUY EQNR.OL 10 285 59")
@@ -133,6 +133,25 @@ class PortfolioTests(FillTests):
     def test_empty_log(self):
         self.assertIn("No real trades saved yet", fills.build_portfolio_report())
 
+    def test_deposits_replace_the_account_size(self):
+        fills.record_fill("BUY EQNR.OL 10 285 59")
+        self.assertEqual(fills.deposits()[0][1], 50_000.0)
+        reply = fills.record_deposit("20000 2026-11-01")
+        self.assertIn("Deposit of 20,000 NOK on 2026-11-01", reply)
+        self.assertIn("only /deposit amounts count", reply)
+        self.assertIn("Withdrawal of 5,000 NOK", fills.record_deposit("-5000"))
+        self.assertEqual(sum(amount for _, amount in fills.deposits()), 15_000.0)
+        self.assertIn("Cash left: 12,091 NOK (money put in 15,000 NOK", fills.build_portfolio_report())
+
+    def test_bad_deposits_save_nothing(self):
+        self.assertIn("Usage", fills.record_deposit(""))
+        self.assertIn("Usage", fills.record_deposit("lots"))
+        self.assertIn("other than 0", fills.record_deposit("0"))
+        self.assertIn("2026-11-10", fills.record_deposit("100 1/11"))
+        self.assertIn("future", fills.record_deposit(f"100 {(date.today() + timedelta(days=1)).isoformat()}"))
+        with patch.object(nb_config.SETTINGS, "risk_account_size", 0.0):
+            self.assertEqual(fills.deposits(), [])
+
 
 class FillCommandTests(unittest.TestCase):
     def setUp(self):
@@ -147,14 +166,18 @@ class FillCommandTests(unittest.TestCase):
         with patch.object(fills, "record_fill", return_value="SAVED") as record, \
                 patch.object(fills, "list_fills", return_value="LIST"), \
                 patch.object(fills, "delete_last_fill", return_value="GONE"), \
-                patch.object(fills, "build_portfolio_report", return_value="HELD"):
+                patch.object(fills, "build_portfolio_report", return_value="HELD"), \
+                patch.object(fills, "record_deposit", return_value="IN"), \
+                patch("newsbot.scorecard.scorecard_reply", return_value="SCORE"):
             cmd._handle_command("/fill BUY EQNR.OL 1 285 59", "7")
             cmd._handle_command("/fills", "7")
             cmd._handle_command("/unfill", "7")
             cmd._handle_command("/portfolio", "7")
+            cmd._handle_command("/deposit 5000", "7")
+            cmd._handle_command("/scorecard", "7")
         record.assert_called_once_with("BUY EQNR.OL 1 285 59")
         sent = [call.args[0] for call in nb_messaging.send_telegram_message.call_args_list]
-        self.assertEqual(sent, ["SAVED", "LIST", "GONE", "HELD"])
+        self.assertEqual(sent, ["SAVED", "LIST", "GONE", "HELD", "IN", "SCORE"])
         nb_messaging._broadcast_message.assert_not_called()
 
     def test_edited_fill_is_not_run_again(self):
