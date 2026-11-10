@@ -18,9 +18,8 @@ from newsbot.commands import (
 )
 from newsbot.config import SETTINGS, get_missing_required_config
 from newsbot.forward_test import job_settle_forward_test
-from newsbot.company_numbers import job_load_company_numbers
 from newsbot.history_store import job_settle_published_picks
-from newsbot.price_store import job_load_prices
+from newsbot.data_checks import job_load_company_numbers_and_check, job_load_prices_and_check
 from newsbot.holding_alerts import job_holding_alerts
 from newsbot.scorecard import job_monthly_scorecard
 from newsbot.snapshots import job_save_snapshots
@@ -59,10 +58,10 @@ def main() -> None:
     scheduler.add_job(job_settle_forward_test, "cron", hour=3, minute=0)
     # 02:00 Tuesday to Saturday, after each weekday's sessions: our own copy of
     # daily prices for the stock list (#75). 20:00 in New York, so US is final.
-    scheduler.add_job(job_load_prices, "cron", day_of_week="tue-sat", hour=2, minute=0)
+    scheduler.add_job(job_load_prices_and_check, "cron", day_of_week="tue-sat", hour=2, minute=0)
     # Sunday 05:00: company numbers from annual reports change a few times a
     # year, so weekly is plenty, and it stays clear of the weekday jobs (#76).
-    scheduler.add_job(job_load_company_numbers, "cron", day_of_week="sun", hour=5, minute=0)
+    scheduler.add_job(job_load_company_numbers_and_check, "cron", day_of_week="sun", hour=5, minute=0)
     # 02:30: analyst estimates and company numbers, before the 04:00 backup.
     scheduler.add_job(job_save_snapshots, "cron", hour=2, minute=30)
     # Same idea for the picks actually sent to Slack/Telegram; half an hour
