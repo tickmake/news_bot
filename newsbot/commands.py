@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests.exceptions
 
-from newsbot import backtest_reports, charts, forward_test, history_store, market_data, messaging, news_feeds, reports, screener
+from newsbot import backtest_reports, charts, fills, forward_test, history_store, market_data, messaging, news_feeds, reports, screener
 from newsbot.briefing import _send_briefing
 from newsbot.config import SETTINGS
 from newsbot.history_store import _record_published_picks
@@ -34,6 +34,9 @@ def _command_help_text() -> str:
         "/pickperformance - Fixed-session outcomes of actually delivered picks\n"
         "/forwardtest - Out-of-sample results of every signal the bot recorded live\n"
         "/health - Send bot health report\n"
+        "/fill BUY|SELL TICKER SHARES PRICE FEE_NOK [YYYY-MM-DD] - Save a real trade (Telegram only)\n"
+        "/fills - List the last 20 real trades\n"
+        "/unfill - Delete the last real trade\n"
     )
 
 
@@ -75,6 +78,13 @@ def _handle_command(command: str, chat_id: str) -> None:
         messaging._broadcast_message(backtest_reports.build_trade_diagnostics_report(), chat_id=chat_id)
     elif normalized == "/health":
         messaging._broadcast_message(build_health_report(), chat_id=chat_id)
+    # Real trades are private: replies go to Telegram only, never Slack.
+    elif normalized == "/fill":
+        messaging.send_telegram_message(fills.record_fill(argument), chat_id=chat_id)
+    elif normalized == "/fills":
+        messaging.send_telegram_message(fills.list_fills(), chat_id=chat_id)
+    elif normalized == "/unfill":
+        messaging.send_telegram_message(fills.delete_last_fill(), chat_id=chat_id)
     else:
         messaging._broadcast_message(_command_help_text(), chat_id=chat_id)
 
@@ -87,6 +97,10 @@ def _authorized_chat_ids() -> set:
     """
     allowed = {SETTINGS.telegram_chat_id, SETTINGS.health_ping_chat_id}
     return {str(chat) for chat in allowed if chat}
+
+
+# Commands that change saved data, so an edited copy must not run them again.
+_WRITE_COMMANDS = {"/fill", "/unfill"}
 
 
 # Commands run off the poller thread so a multi-minute /performance cannot
@@ -202,6 +216,13 @@ def poll_telegram_commands(long_poll_timeout: int = 0) -> bool:
                             "command_rejected reason=unauthorized_chat chat_id=%s cmd=%s",
                             chat_id,
                             text.split()[0],
+                        )
+                    elif "message" not in update and text.split()[0].lower() in _WRITE_COMMANDS:
+                        # Editing a sent /fill must not save the trade twice.
+                        messaging.send_telegram_message(
+                            "Edited messages are ignored for /fill and /unfill. "
+                            "Use /unfill, then send /fill again.",
+                            chat_id=chat_id,
                         )
                     else:
                         APP_LOG.info(
