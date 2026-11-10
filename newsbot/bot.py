@@ -19,6 +19,7 @@ from newsbot.commands import (
 from newsbot.config import SETTINGS, get_missing_required_config
 from newsbot.forward_test import job_settle_forward_test
 from newsbot.history_store import job_settle_published_picks
+from newsbot.snapshots import job_save_snapshots
 
 
 def main() -> None:
@@ -49,6 +50,8 @@ def main() -> None:
     # has become computable, not just yesterday's, so a night the Pi spends down
     # costs nothing -- the backlog clears on the next run.
     scheduler.add_job(job_settle_forward_test, "cron", hour=3, minute=0)
+    # 02:30: analyst estimates and company numbers, before the 04:00 backup.
+    scheduler.add_job(job_save_snapshots, "cron", hour=2, minute=30)
     # Same idea for the picks actually sent to Slack/Telegram; half an hour
     # later so the two jobs do not hit the price provider at the same time.
     scheduler.add_job(job_settle_published_picks, "cron", hour=3, minute=30)
