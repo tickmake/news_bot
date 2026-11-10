@@ -1,0 +1,68 @@
+# Titles and ready-made reports for the data viewer (docker-compose `datasette`).
+# Every query here is read-only; the database is opened in read-only mode.
+title: news_bot data
+description: >-
+  Read-only view of what the bot records. trade_metrics_history keeps the
+  last 14 days of screens; signal_archive and published_picks are permanent.
+databases:
+  trade_history:
+    tables:
+      signal_archive:
+        description: Every screened stock, every day, picked or not. Results fill in after 5 trading days.
+        sort_desc: signal_session
+      published_picks:
+        description: Picks that were sent to Slack and Telegram.
+        sort_desc: published_at
+      trade_metrics_history:
+        description: Daily screen measurements. Only the last 14 days are kept.
+        sort_desc: session_date
+    queries:
+      collected_per_day:
+        title: Data collected per day
+        description: How many stocks were screened each day, how many passed, and how many have a result yet.
+        sql: |-
+          SELECT signal_session AS day,
+                 COUNT(*) AS screened,
+                 SUM(qualified) AS passed_filters,
+                 SUM(outcome_json IS NOT NULL) AS have_result
+          FROM signal_archive
+          GROUP BY signal_session
+          ORDER BY signal_session DESC
+      picks_vs_all_per_day:
+        title: Forward test - picks vs all screened stocks
+        description: Average return after fees, 5 trading days later. If picks are not above "all", the filters add nothing.
+        sql: |-
+          SELECT signal_session AS day,
+                 SUM(qualified) AS picks,
+                 ROUND(AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END), 2) AS picks_avg_net_pct,
+                 COUNT(*) AS all_stocks,
+                 ROUND(AVG(json_extract(outcome_json, '$.net_return_pct')), 2) AS all_avg_net_pct
+          FROM signal_archive
+          WHERE outcome_json IS NOT NULL
+          GROUP BY signal_session
+          ORDER BY signal_session DESC
+      published_pick_results:
+        title: Published picks and their results
+        description: Each pick sent to Slack and Telegram. An empty result means it was never scored (see issue #66).
+        sql: |-
+          SELECT published_at,
+                 symbol,
+                 signal_session,
+                 benchmark_symbol,
+                 ROUND(json_extract(outcome_json, '$.net_return_pct'), 2) AS net_return_pct,
+                 ROUND(json_extract(outcome_json, '$.excess_return_pct'), 2) AS vs_index_pct
+          FROM published_picks
+          ORDER BY published_at DESC
+      latest_screen:
+        title: Latest screen - why each stock passed or failed
+        description: The most recent day's screen, with the filter each stock failed.
+        sql: |-
+          SELECT symbol, qualified, failed_gate, last_close,
+                 ROUND(day_change_pct, 2) AS day_change_pct,
+                 ROUND(week_momentum_pct, 2) AS week_momentum_pct,
+                 ROUND(volume_ratio, 2) AS volume_ratio,
+                 ROUND(atr_pct, 2) AS atr_pct,
+                 ROUND(drawdown_pct, 2) AS drawdown_pct
+          FROM trade_metrics_history
+          WHERE session_date = (SELECT MAX(session_date) FROM trade_metrics_history)
+          ORDER BY qualified DESC, symbol
