@@ -98,19 +98,23 @@ databases:
           FROM days
       day_by_day:
         title: 3. Day by day - picks vs skipped stocks
-        description: Each row is one day's screen. Returns are after fees, 5 trading days later.
+        description: >-
+          Each row is one day's screen. Returns are after fees. A pick is bought at the
+          next morning's open and sold at the close 5 trading days later, so the newest
+          days are always "waiting": a day's result arrives about 7-8 calendar days later.
         sql: |-
           SELECT signal_session AS "Day picked",
                  SUM(qualified) AS "Picks",
                  ROUND(AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END), 2) AS "Picks: average %",
                  SUM(NOT qualified) AS "Skipped",
                  ROUND(AVG(CASE WHEN NOT qualified THEN json_extract(outcome_json, '$.net_return_pct') END), 2) AS "Skipped: average %",
-                 CASE WHEN SUM(qualified) = 0 THEN 'no picks'
+                 CASE WHEN SUM(outcome_json IS NOT NULL) = 0 THEN 'waiting for result'
+                      WHEN SUM(outcome_json IS NULL) > 0 THEN 'partly in, still waiting'
+                      WHEN SUM(qualified) = 0 THEN 'no picks'
                       WHEN AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END)
                          > AVG(CASE WHEN NOT qualified THEN json_extract(outcome_json, '$.net_return_pct') END)
                       THEN 'picks better' ELSE 'picks worse' END AS "Verdict"
           FROM signal_archive
-          WHERE outcome_json IS NOT NULL
           GROUP BY signal_session
           ORDER BY signal_session DESC
       sent_picks:
