@@ -170,6 +170,8 @@ class AppSettings(BaseSettings):
     # pick, because at small sizes the minimum is a big share of the position.
     broker_fee_min_nok: float = 59.0
     broker_fee_pct: float = 0.12
+    # Evening alert when a stock I own is this far below my average buy price.
+    holding_alert_drop_pct: float = 15.0
     risk_corr_threshold: float = 0.7
     risk_corr_window: int = 60
     risk_corr_min_obs: int = 30
