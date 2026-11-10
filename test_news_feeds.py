@@ -403,6 +403,25 @@ class CollectCandidatesTests(unittest.TestCase):
         self.assertEqual(len(self._collect(items, pool_size=3)), 3)
 
 
+class CollectCandidatesAgeTests(unittest.TestCase):
+    def _collect(self, scope, age_hours):
+        published = datetime.now(timezone.utc) - timedelta(hours=age_hours)
+        items = [("Story", "https://www.newsinenglish.no/story", published)]
+        with patch.object(nf, "_news_provider_priority", return_value=["rss"]), \
+             patch.object(nf, "_fetch_rss_from_feeds", return_value=items), \
+             patch.object(nb_config, "TRUSTED_DOMAINS", ["newsinenglish.no"]):
+            return nf._collect_candidates(scope, ["f"], 10)
+
+    def test_norway_scope_keeps_a_story_past_the_global_limit(self):
+        self.assertEqual(len(self._collect("norway", 48)), 1)
+
+    def test_global_scope_still_drops_that_story(self):
+        self.assertEqual(self._collect("global", 48), [])
+
+    def test_norway_scope_has_its_own_limit(self):
+        self.assertEqual(self._collect("norway", 120), [])
+
+
 class BuildNewsSectionTests(unittest.TestCase):
     def setUp(self):
         saved = dict(nb_state.RANKER_STATUS)

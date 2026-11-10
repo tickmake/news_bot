@@ -120,7 +120,7 @@ python news_bot.py
 - `FINNHUB_API_URL` - Finnhub base URL (default `https://finnhub.io/api/v1`)
 - `GLOBAL_NEWS_FEEDS` - comma-separated RSS feed URLs for global news
 - `BUSINESS_NEWS_FEEDS` - comma-separated RSS feed URLs for business news
-- `NORWAY_NEWS_FEEDS` - comma-separated RSS feed URLs for Norway-focused news
+- `NORWAY_NEWS_FEEDS` - comma-separated RSS feed URLs for Norway-focused news (English-language by default)
 - `STOCK_SCREENERS` - comma-separated Yahoo predefined screener IDs for equities
 - `FUND_SCREENERS` - comma-separated Yahoo predefined screener IDs for funds/ETFs
 - `SCREENER_QUOTE_LIMIT` - number of quotes to fetch per screener
@@ -250,6 +250,7 @@ each send, which is what makes cross-outlet deduplication possible.
 | `RANKER_NETWORK` | bundled net | Network carrying Ollama |
 | `RANKER_NETWORK_EXTERNAL` | `false` | Set `true` to reuse another project's network |
 | `NEWS_MAX_AGE_HOURS` | `30` | Freshness ceiling; undated items exempt |
+| `NORWAY_NEWS_MAX_AGE_HOURS` | `96` | Same, for the Norway section, whose English outlets publish less often |
 | `NEWS_CANDIDATE_POOL_SIZE` | `60` | Candidates ranked per section |
 | `NEWS_DEDUP_WINDOW_DAYS` | `7` | Cross-day suppression window (includes today) |
 | `NEWS_RECENT_TITLE_DAYS` | `3` | Recent titles sent to the ranker |

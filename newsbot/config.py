@@ -22,9 +22,8 @@ DEFAULT_BUSINESS_NEWS_FEEDS = (
     "https://feeds.marketwatch.com/marketwatch/topstories/"
 )
 DEFAULT_NORWAY_NEWS_FEEDS = (
-    "https://www.nrk.no/toppsaker.rss,"
-    "https://e24.no/rss,"
-    "https://www.aftenposten.no/rss"
+    "https://www.newsinenglish.no/feed/,"
+    "https://www.thelocal.no/feeds/rss.php"
 )
 DEFAULT_STOCK_SCREENERS = "day_gainers,most_actives"
 DEFAULT_FUND_SCREENERS = "conservative_foreign_funds,solid_large_growth_funds,high_yield_bond"
@@ -106,10 +105,14 @@ class AppSettings(BaseSettings):
         # BBC item.
         "reuters.com,bloomberg.com,cnbc.com,finance.yahoo.com,yahoo.com,ft.com,"
         "bbc.com,bbc.co.uk,theguardian.com,nrk.no,aftenposten.no,e24.no,"
-        "apnews.com,marketwatch.com,npr.org"
+        "apnews.com,marketwatch.com,npr.org,newsinenglish.no,thelocal.no"
     )
     blocked_news_domains: str = "news.google.com,pinterest.com,tiktok.com"
     news_max_age_hours: int = 30
+    # The English-language Norway outlets publish far less often than the
+    # global wires; newsinenglish.no routinely goes days between posts, so the
+    # global limit would leave the section empty.
+    norway_news_max_age_hours: int = 96
     news_candidate_pool_size: int = 60
     news_dedup_window_days: int = 7
     news_recent_title_days: int = 3
