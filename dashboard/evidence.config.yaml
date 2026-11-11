@@ -3,3 +3,9 @@ plugins:
     "@evidence-dev/core-components": {}
   datasources:
     "@evidence-dev/sqlite": {}
+
+# Light by day, dark at night: follow the device's setting, with a toggle in
+# the top-right menu to override it.
+appearance:
+  default: system
+  switcher: true

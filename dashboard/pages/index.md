@@ -1,5 +1,5 @@
 ---
-title: news_bot
+title: Fjord Signals
 ---
 
 Every weekday at 07:00 (Oslo time) the bot checks 20-40 stocks: your watch
@@ -80,8 +80,8 @@ order by day
   y=running_difference
   series=hold
   title="Picks minus skipped, added up day by day (%)"
-  yAxisTitle="%"
   markers=true
+  yFmt=num1
 />
 
 ## Pages
