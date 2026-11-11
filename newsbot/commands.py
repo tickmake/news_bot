@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests.exceptions
 
-from newsbot import backtest_reports, charts, fills, forward_test, scorecard, history_store, market_data, messaging, news_feeds, reports, screener
+from newsbot import backtest_reports, charts, fills, forward_test, scorecard, history_store, market_data, messaging, news_feeds, reports, screener, trade_check
 from newsbot.briefing import _send_briefing
 from newsbot.config import SETTINGS
 from newsbot.history_store import _record_published_picks
@@ -40,6 +40,7 @@ def _command_help_text() -> str:
         "/portfolio - What I hold now, its value today and profit or loss\n"
         "/deposit AMOUNT_NOK [YYYY-MM-DD] - Save money put in (minus for money taken out)\n"
         "/scorecard - My trades vs the index fund\n"
+        "/check TICKER AMOUNT_NOK - Fees, ASK, dates, overlap, risk and size before I buy (Telegram only)\n"
     )
 
 
@@ -94,6 +95,8 @@ def _handle_command(command: str, chat_id: str) -> None:
         messaging.send_telegram_message(fills.record_deposit(argument), chat_id=chat_id)
     elif normalized == "/scorecard":
         messaging.send_telegram_message(scorecard.scorecard_reply(), chat_id=chat_id)
+    elif normalized == "/check":
+        messaging.send_telegram_message(trade_check.build_check(argument), chat_id=chat_id)
     else:
         messaging._broadcast_message(_command_help_text(), chat_id=chat_id)
 
