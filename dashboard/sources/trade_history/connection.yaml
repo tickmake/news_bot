@@ -1,0 +1,8 @@
+# The connector resolves the file relative to this directory. Locally, put a
+# copy of the bot's DB here (scripts/pull_backups.sh fetches one). In the image
+# this path is a symlink to the snapshot refresh.mjs takes into tmpfs, so the
+# build never opens the bot's live file.
+name: trade_history
+type: sqlite
+options:
+  filename: trade_history.db

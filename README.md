@@ -46,6 +46,7 @@ The bot is built in Python and scheduled with APScheduler.
 - `requirements.txt` - Python dependencies
 - `Dockerfile` - container image definition
 - `docker-compose.yml` - service orchestration
+- `dashboard/` - the web dashboard ([Evidence](https://evidence.dev)): pages in `dashboard/pages`, queries in `dashboard/sources`
 
 ## Requirements
 
@@ -1037,6 +1038,40 @@ Install once on the receiving machine (`ssh raspberrypi5-02 true` must work):
 crontab -e
 30 5 * * * /path/to/news_bot/scripts/pull_backups.sh >> ~/news_bot_backups/pull.log 2>&1
 ```
+
+## Dashboard
+
+Charts and reports over the bot's database, at `http://raspberrypi5-02:8001`:
+the scorecard (picks vs skipped stocks), day by day, the latest screen, sent
+picks and their results, one stock's history, data collected per day, and your
+`/fill` trades and holdings. It replaced the Datasette viewer. There is no
+login, so keep the port on the home network / VPN.
+
+How it works: the site is built once, in the image, and holds no data. The
+`dashboard-data` service watches the bot's database (mounted read-only),
+and a minute or two after it changes takes a snapshot with SQLite's backup API
+and turns it into parquet files. Your browser runs the page queries on those
+files. `dashboard` is a plain nginx serving the result.
+
+**The image is built on the Mac, not the Pi.** The site build needs more than
+1 GB of RAM. After changing anything under `dashboard/`, run
+`scripts/ship_dashboard.sh` on the Mac (it builds and loads the image onto
+the Pi), then on the Pi `docker compose up -d dashboard-data dashboard`. A
+plain `docker compose up -d` fails on a host that has never had the image
+loaded, because compose will not pull or build it there.
+
+To work on the pages locally:
+
+```bash
+cd dashboard
+npm ci
+cp ~/news_bot_backups/<newest>.db sources/trade_history/trade_history.db
+npm run sources && npm run dev
+```
+
+Evidence page queries use DuckDB SQL, while the files in `dashboard/sources`
+run on SQLite. Column names ending in `_pct` are read as fractions by the chart
+axes, so name a percent-valued chart column something else.
 
 ## Message Sections
 
