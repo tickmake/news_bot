@@ -36,7 +36,7 @@ on "Picks", "Skipped" into name "group" value "average"
   series=group
   type=grouped
   title="Average result after fees, picks vs skipped (%)"
-  yAxisTitle="%"
+  yFmt=num1
 />
 
 <DataTable data={daily} rows=40>
