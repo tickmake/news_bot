@@ -35,6 +35,14 @@ class EsefTests(unittest.TestCase):
         self.assertEqual(values["net_profit"], (8.83e9, "USD"))
         self.assertNotIn("cash", values)
 
+    def test_shareholders_part_beats_the_total_with_minority_owners(self):
+        doc = {"facts": {**DOC["facts"],
+                         "g": _fact("ifrs-full:ProfitLossAttributableToOwnersOfParent", YEAR, 7.09e9),
+                         "h": _fact("ifrs-full:EquityAttributableToOwnersOfParent", "2025-01-01T00:00:00", 33.7e9)}}
+        values, _ = cn.esef_values(doc, "2024-12-31")
+        self.assertEqual(values["net_profit"], (7.09e9, "USD"))
+        self.assertEqual(values["equity"], (33.7e9, "USD"))
+
 
 class LoadTests(unittest.TestCase):
     def setUp(self):
@@ -47,6 +55,7 @@ class LoadTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.downloads = 0
+        self.shares = float("nan")
 
     def _get(self, url):
         if "gleif" in url:
@@ -62,7 +71,7 @@ class LoadTests(unittest.TestCase):
         ticker.info = {"financialCurrency": "USD"}
         column = pd.Timestamp("2024-12-31")
         ticker.income_stmt = pd.DataFrame({column: [1.0, 2.0, 3.0]}, index=["Total Revenue", "Operating Income", "Net Income"])
-        ticker.balance_sheet = pd.DataFrame({column: [30.1e9, float("nan")]}, index=["Total Debt", "Ordinary Shares Number"])
+        ticker.balance_sheet = pd.DataFrame({column: [30.1e9, self.shares]}, index=["Total Debt", "Ordinary Shares Number"])
         ticker.cashflow = pd.DataFrame()
         return ticker
 
@@ -82,6 +91,41 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(rows["operating_profit"], (2.0, "yahoo", "2025-04-30"))
         self.assertEqual(rows["total_debt"], (30.1e9, "yahoo", "2025-04-30"))
         self.assertNotIn("shares_outstanding", rows)
+
+    def test_share_counts_have_no_currency(self):
+        self.shares = 2.6e9
+        with patch.object(cn, "_get_json", side_effect=cn.NotInEsef("404")), \
+                patch.object(cn.yf, "Ticker", return_value=self._yahoo()):
+            cn.load_company_numbers([{"ticker": "IFX.DE", "isin": "DE1", "region": "EU"}])
+        row = self.store._connection().execute(
+            "SELECT value, currency FROM company_numbers WHERE item = 'shares_outstanding'").fetchone()
+        self.assertEqual(row, (2.6e9, None))
+        revenue = self.store._connection().execute(
+            "SELECT currency FROM company_numbers WHERE item = 'revenue'").fetchone()
+        self.assertEqual(revenue, ("USD",))
+
+    def test_version_2_redoes_profit_and_equity_once(self):
+        conn = self.store._connection()
+        for table in cn._TABLES[:2]:
+            conn.execute(table)
+        with conn:   # a version-1 database, before #111
+            conn.executemany("INSERT INTO company_numbers VALUES (?, '2024-12-31', ?, 1.0, ?, ?, '2025-03-06', 'x')", [
+                ("ACA.PA", "net_profit", "EUR", "esef"), ("ACA.PA", "equity", "EUR", "esef"),
+                ("ACA.PA", "revenue", "EUR", "esef"), ("IFX.DE", "net_profit", "EUR", "yahoo"),
+                ("IFX.DE", "shares_outstanding", "EUR", "yahoo")])
+            conn.execute("INSERT INTO esef_filings_read VALUES ('f1', 'ACA.PA')")
+        conn = cn._connection()
+        left = sorted(conn.execute("SELECT symbol, item, currency FROM company_numbers").fetchall())
+        self.assertEqual(left, [("ACA.PA", "revenue", "EUR"), ("IFX.DE", "net_profit", "EUR"),
+                                ("IFX.DE", "shares_outstanding", None)])
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM esef_filings_read").fetchone(), (0,))
+        # Once migrated, new rows are left alone.
+        with conn:
+            conn.execute("INSERT INTO company_numbers VALUES ('ACA.PA', '2024-12-31', 'equity', 2.0, 'EUR', 'esef', 'd', 'x')")
+            conn.execute("INSERT INTO esef_filings_read VALUES ('f1', 'ACA.PA')")
+        conn = cn._connection()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM company_numbers WHERE item = 'equity'").fetchone(), (1,))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM esef_filings_read").fetchone(), (1,))
 
     def test_us_stocks_skip_esef_and_failures_are_listed(self):
         with patch.object(cn, "_get_json", side_effect=AssertionError("no ESEF for US")), \
