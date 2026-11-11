@@ -273,7 +273,8 @@ class RenderingTests(SettingsCase):
         self.assertIn("volatility stop 96.00 (4.0% away)", lines[0])
         self.assertIn("size 12% of portfolio for 0.50% risk", lines[0])
         self.assertIn("fees: at least 118 NOK to buy and sell + currency exchange fee", lines[1])
-        self.assertIn("⚠️ earnings in 2 days", lines[2])
+        self.assertEqual("    ⛔ Not for ASK (US stock)", lines[2])
+        self.assertIn("⚠️ earnings in 2 days", lines[3])
 
     def test_capped_size_says_so_and_amount_is_shown(self):
         self.use(risk_account_size=50_000.0)
@@ -290,10 +291,11 @@ class RenderingTests(SettingsCase):
                       risk.fee_line("AAPL", 60_000.0))
         self.assertEqual(risk.fee_line("EQNR.OL", None), "    fees: at least 118 NOK to buy and sell")
 
-    def test_without_context_or_sizing_only_the_fee_shows(self):
-        self.assertEqual(risk.candidate_lines("AAA", None), ["    fees: at least 118 NOK to buy and sell + currency exchange fee"])
-        self.assertEqual(risk.candidate_lines("ZZZ", self._context()),
-                         ["    fees: at least 118 NOK to buy and sell + currency exchange fee"])
+    def test_without_context_or_sizing_only_the_fee_and_ask_show(self):
+        fee = "    fees: at least 118 NOK to buy and sell + currency exchange fee"
+        self.assertEqual(risk.candidate_lines("AAA", None), [fee, "    ⛔ Not for ASK (US stock)"])
+        self.assertEqual(risk.candidate_lines("ZZZ", self._context()), [fee, "    ⛔ Not for ASK (US stock)"])
+        self.assertEqual(risk.candidate_lines("EQNR.OL", None), ["    fees: at least 118 NOK to buy and sell"])
 
     def test_portfolio_section_totals_and_disclaimer(self):
         lines = risk.portfolio_lines(risk.assess([_m("AAA"), _m("BBB")], {}, [], TODAY))

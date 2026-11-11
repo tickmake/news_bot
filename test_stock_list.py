@@ -44,5 +44,18 @@ class StockListTests(unittest.TestCase):
         self.assertTrue(all(re.match(r"^[A-Z0-9.\-]+$", ticker) for ticker in stock_list.tickers()))
 
 
+    def test_ask_note_follows_the_list_then_the_suffix(self):
+        self.assertIsNone(stock_list.ask_note("eqnr.ol"))
+        self.assertEqual(stock_list.ask_note("AAPL"), "Not for ASK (US stock)")
+        self.assertEqual(stock_list.ask_note("HAFNI.OL"),
+                         "Not for ASK (company registered outside the EU/EEA, ISIN SG)")
+        self.assertEqual(stock_list.ask_note("TSLA"), "Not for ASK (US stock)")
+        self.assertEqual(stock_list.ask_note("XYZ.DE"), "ASK: check first (not in the stock list)")
+
+    def test_every_listed_stock_marked_no_gets_a_note(self):
+        for row in self.rows:
+            self.assertEqual(stock_list.ask_note(row["ticker"]) is None, row["ask_allowed"] == "yes", row["ticker"])
+
+
 if __name__ == "__main__":
     unittest.main()
