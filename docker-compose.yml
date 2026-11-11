@@ -282,6 +282,33 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Fjord Signals, Streamlit edition, on http://raspberrypi5-02:8002: the same
+  # pages as the Evidence dashboard plus a what-if tool for the screen's
+  # filters. A trial running next to `dashboard` so the two can be compared;
+  # keep one. Reads the DB volume read-only, with queries cached for a minute.
+  # Builds here on the Pi. No login: keep the port on the home network / VPN.
+  dashboard-streamlit:
+    build: ./streamlit
+    container_name: news_bot_dashboard_streamlit
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    volumes:
+      - news_bot_data:/bot-data:ro
+    ports:
+      - "${DASHBOARD_STREAMLIT_PORT:-8002}:8501"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   default:
   # Network carrying the Ollama the bot should talk to.
