@@ -4,7 +4,7 @@ from datetime import datetime
 from html import escape
 from typing import Any, List, Optional
 
-from newsbot import data_health, history_store, indicators, market_data, risk as risk_analytics
+from newsbot import data_health, history_store, indicators, market_data, risk_forecast, risk as risk_analytics
 from newsbot.config import SETTINGS
 from newsbot.market_data import _as_float
 from newsbot.screener import _entry_exit_sketch, _rsi_label
@@ -170,6 +170,10 @@ def build_ticker_analysis(raw_symbol: str) -> str:
             lines.append(f"Next earnings: {upcoming:%b %d, %Y}.")
         elif not upcoming and not (context and symbol in context.events):
             lines.append("Next earnings date: not available.")
+        forecast_lines = risk_forecast.lines(risk_forecast.build(symbol))
+        if forecast_lines:
+            lines.append("How much it can fall over a 2-4 week hold:")
+            lines.extend(forecast_lines)
         lines.append("")
 
     # 3. Valuation

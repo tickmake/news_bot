@@ -11,9 +11,10 @@ with `adj_close` beside them for splits and dividends.
 """
 
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import yfinance as yf
 
 from newsbot import stock_list
@@ -96,6 +97,18 @@ def save_prices(symbol: str, history: Any, currency: Optional[str]) -> int:
             conn.executemany(
                 "INSERT OR IGNORE INTO daily_prices VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
         return conn.total_changes - before
+
+
+def closes(symbol: str) -> Optional[Any]:
+    """Saved closes for one symbol by date, dividend-adjusted where Yahoo gave it; None if none."""
+    with TRADE_HISTORY_LOCK:
+        rows = _connection().execute(
+            "SELECT session_date, COALESCE(adj_close, close) FROM daily_prices"
+            " WHERE symbol = ? ORDER BY session_date", (symbol,)).fetchall()
+    if not rows:
+        return None
+    return pd.Series([value for _, value in rows],
+                     index=[date.fromisoformat(day) for day, _ in rows], dtype=float)
 
 
 def load_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
