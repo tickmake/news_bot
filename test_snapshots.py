@@ -29,6 +29,7 @@ class SnapshotTests(unittest.TestCase):
             patch.object(snapshots, "NORWAY_STOCK_UNIVERSE", {"Equinor": "EQNR.OL"}),
             patch.object(snapshots, "EU_STOCK_UNIVERSE", {"SAP": "SAP.DE"}),
             patch.object(snapshots, "USA_STOCK_UNIVERSE", {}),
+            patch.object(snapshots.stock_list, "tickers", return_value=[]),
         ):
             p.start()
             self.addCleanup(p.stop)
@@ -41,6 +42,16 @@ class SnapshotTests(unittest.TestCase):
         with patch.object(self.store, "recently_tracked_symbols", return_value=["AAPL", "EQNR.OL"]), \
                 patch.object(snapshots.SETTINGS, "snapshot_max_symbols", 3):
             self.assertEqual(snapshots.snapshot_symbols(), ["EQNR.OL", "SAP.DE", "AAPL"])
+
+    def test_the_stock_list_comes_first(self):
+        with patch.object(self.store, "recently_tracked_symbols", return_value=["AAPL"]), \
+                patch.object(snapshots.stock_list, "tickers", return_value=["NHY.OL", "EQNR.OL"]):
+            self.assertEqual(snapshots.snapshot_symbols(), ["NHY.OL", "EQNR.OL", "SAP.DE", "AAPL"])
+
+    def test_an_unreadable_stock_list_falls_back_to_the_watchlists(self):
+        with patch.object(self.store, "recently_tracked_symbols", return_value=[]), \
+                patch.object(snapshots.stock_list, "tickers", side_effect=FileNotFoundError("gone")):
+            self.assertEqual(snapshots.snapshot_symbols(), ["EQNR.OL", "SAP.DE"])
 
     def test_one_row_per_stock_nan_saved_as_null_and_failures_counted(self):
         info = {"EQNR.OL": {"targetMeanPrice": 408.4, "trailingPE": float("nan"), "junk": 1}, "SAP.DE": {}}

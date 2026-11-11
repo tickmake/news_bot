@@ -8,6 +8,10 @@ loaded; after that each night adds the new days.
 A bar, once saved, is never changed: if Yahoo later revises it, the saved
 row still shows what was known at the time (`fetched_at`). Prices are raw,
 with `adj_close` beside them for splits and dividends.
+
+After a ticker change, Yahoo starts the new ticker with no history. Stocks
+with a `previous_ticker` in the stock list get the old ticker's bars saved
+under the new ticker, once, while the new one is still short (#112).
 """
 
 import math
@@ -26,6 +30,8 @@ from newsbot.util import _with_retry
 
 FIRST_LOAD_PERIOD = "2y"
 CATCH_UP_PERIOD = "1mo"
+# Fewer saved sessions than this means the old ticker's history is still missing.
+SHORT_HISTORY_SESSIONS = 250
 
 _TABLE = """
     CREATE TABLE IF NOT EXISTS daily_prices (
@@ -111,6 +117,42 @@ def closes(symbol: str) -> Optional[Any]:
                      index=[date.fromisoformat(day) for day, _ in rows], dtype=float)
 
 
+def _session_counts() -> Dict[str, int]:
+    with TRADE_HISTORY_LOCK:
+        rows = _connection().execute("SELECT symbol, COUNT(*) FROM daily_prices GROUP BY symbol").fetchall()
+    return dict(rows)
+
+
+def load_previous_tickers(symbols: List[str]) -> int:
+    """Save each changed ticker's old history under its new ticker. Returns rows added.
+
+    Only bars before the new ticker's first own bar are taken, so the new
+    ticker's prices always win. A failure here never stops the nightly load.
+    """
+    previous = {symbol: old for symbol, old in stock_list.previous_tickers().items() if symbol in symbols}
+    if not previous:
+        return 0
+    counts = _session_counts()
+    added = 0
+    for symbol, old in previous.items():
+        if counts.get(symbol, 0) >= SHORT_HISTORY_SESSIONS:
+            continue
+        try:
+            history, currency = _fetch(old, FIRST_LOAD_PERIOD)
+            with TRADE_HISTORY_LOCK:
+                first = _connection().execute(
+                    "SELECT MIN(session_date) FROM daily_prices WHERE symbol = ?", (symbol,)).fetchone()[0]
+            if first is not None:
+                history = history[[stamp.strftime("%Y-%m-%d") < first for stamp in history.index]]
+            count = save_prices(symbol, history, currency)
+        except Exception as exc:
+            SYS_LOG.warning("previous_ticker_load_failed symbol=%s previous=%s detail=%s", symbol, old, exc)
+            continue
+        APP_LOG.info("previous_ticker_loaded symbol=%s previous=%s new_rows=%d", symbol, old, count)
+        added += count
+    return added
+
+
 def load_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     """Load every listed stock. Returns a summary the data check (#77) reads."""
     symbols = symbols if symbols is not None else stock_list.tickers()
@@ -127,6 +169,7 @@ def load_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
         summary["new_rows"] += added
         if added == 0:
             summary["no_new_price"].append(symbol)
+    summary["new_rows"] += load_previous_tickers(symbols)
     return summary
 
 
