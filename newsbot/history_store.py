@@ -680,10 +680,15 @@ def build_published_pick_report() -> str:
         except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as exc:
             SYS_LOG.warning("published_pick_evaluation_failed symbol=%s detail=%s", pick["symbol"], exc)
             unavailable += 1
+    # Picks judged over another hold length are a different test; keep them out of the averages.
+    horizon = SETTINGS.trade_outcome_lookback_days
+    other_horizon = sum(int(pick["horizon_sessions"]) != horizon for pick, _ in completed)
+    completed = [(pick, outcome) for pick, outcome in completed if int(pick["horizon_sessions"]) == horizon]
     lines.append(
         f"Latest {len(picks)} recorded signals (window capped at 100): "
         f"{len(completed)} completed · "
         f"{pending} pending · {unavailable} unavailable"
+        + (f" · {other_horizon} judged over another hold length (left out)" if other_horizon else "")
     )
     if completed:
         returns = [outcome["net_return_pct"] for _, outcome in completed]

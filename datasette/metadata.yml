@@ -89,17 +89,18 @@ databases:
           ORDER BY qualified DESC, week_momentum_pct DESC
       scorecard:
         title: 2. Scorecard - did the picks do better than the rest?
-        description: All days that have results so far. Returns are per stock, after fees, 5 trading days after the pick.
+        description: All days that have results so far, one row per hold length (5 trading days until 11 Nov 2026, 20 after). Returns are per stock, after fees, at the end of the hold.
         sql: |-
           WITH days AS (
-            SELECT signal_session,
+            SELECT signal_session, horizon_sessions,
                    AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END) AS picks,
                    AVG(CASE WHEN NOT qualified THEN json_extract(outcome_json, '$.net_return_pct') END) AS skipped
             FROM signal_archive
             WHERE outcome_json IS NOT NULL
-            GROUP BY signal_session
+            GROUP BY signal_session, horizon_sessions
           )
-          SELECT COUNT(*) AS "Days with results",
+          SELECT horizon_sessions AS "Hold (trading days)",
+                 COUNT(*) AS "Days with results",
                  ROUND(AVG(picks), 2) AS "Picks: average %",
                  ROUND(AVG(skipped), 2) AS "Skipped stocks: average %",
                  ROUND(AVG(picks) - AVG(skipped), 2) AS "Difference %",
@@ -107,14 +108,17 @@ databases:
                  CASE WHEN AVG(picks) > AVG(skipped) THEN 'Picks did better so far (too early to trust)'
                       ELSE 'Picks did NOT do better' END AS "In short"
           FROM days
+          GROUP BY horizon_sessions
+          ORDER BY horizon_sessions DESC
       day_by_day:
         title: 3. Day by day - picks vs skipped stocks
         description: >-
           Each row is one day's screen. Returns are after fees. A pick is bought at the
-          next morning's open and sold at the close 5 trading days later, so the newest
-          days are always "waiting": a day's result arrives about 7-8 calendar days later.
+          next morning's open and sold at the close at the end of the hold (5 trading days
+          until 11 Nov 2026, 20 after), so the newest days are always "waiting".
         sql: |-
           SELECT signal_session AS "Day picked",
+                 MAX(horizon_sessions) AS "Hold (trading days)",
                  SUM(qualified) AS "Picks",
                  ROUND(AVG(CASE WHEN qualified THEN json_extract(outcome_json, '$.net_return_pct') END), 2) AS "Picks: average %",
                  SUM(NOT qualified) AS "Skipped",
@@ -130,11 +134,12 @@ databases:
           ORDER BY signal_session DESC
       sent_picks:
         title: 4. Picks sent to Slack/Telegram
-        description: Each pick the bot sent. Results are filled in every night at 03:30. "Waiting" means its 5 trading days are not over yet.
+        description: Each pick the bot sent. Results are filled in every night at 03:30. "Waiting" means its hold is not over yet.
         sql: |-
           SELECT substr(published_at, 1, 10) AS "Sent on",
                  symbol AS "Stock",
-                 CASE WHEN outcome_json IS NULL THEN 'Waiting (5-day hold not over)'
+                 horizon_sessions AS "Hold (trading days)",
+                 CASE WHEN outcome_json IS NULL THEN 'Waiting (' || horizon_sessions || '-day hold not over)'
                       ELSE ROUND(json_extract(outcome_json, '$.net_return_pct'), 2) END AS "Result after fees %",
                  ROUND(json_extract(outcome_json, '$.excess_return_pct'), 2) AS "Better than index by %",
                  benchmark_symbol AS "Index compared with"
@@ -158,13 +163,14 @@ databases:
                  ROUND(last_close, 2) AS "Price",
                  ROUND(day_change_pct, 1) AS "Today %",
                  ROUND(week_momentum_pct, 1) AS "Last 5 days %",
-                 ROUND(json_extract(outcome_json, '$.net_return_pct'), 2) AS "5 days later, after fees %"
+                 horizon_sessions AS "Hold (trading days)",
+                 ROUND(json_extract(outcome_json, '$.net_return_pct'), 2) AS "At the end of the hold, after fees %"
           FROM signal_archive
           WHERE symbol = upper(:stock)
           ORDER BY signal_session DESC
       collected_per_day:
         title: 6. Data collected per day
-        description: A gap in the dates means the bot did not run that day (weekends and holidays are normal gaps). "With result" fills in 5 trading days later.
+        description: A gap in the dates means the bot did not run that day (weekends and holidays are normal gaps). "With result" fills in when the hold is over (5 trading days until 11 Nov 2026, 20 after).
         sql: |-
           SELECT signal_session AS "Day",
                  COUNT(*) AS "Stocks checked",

@@ -1749,6 +1749,10 @@ class PublishedPickTests(unittest.TestCase):
         replacement = patch.object(nb_history_store, "TRADE_HISTORY", self.store)
         replacement.start()
         self.addCleanup(replacement.stop)
+        # The report only counts picks judged over the current hold length.
+        horizon = patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 2)
+        horizon.start()
+        self.addCleanup(horizon.stop)
 
     def _publish(self, symbol="AAA"):
         at = datetime(2026, 8, 7, 19, 0, tzinfo=timezone.utc)
@@ -1952,6 +1956,14 @@ class PublishedPickTests(unittest.TestCase):
                  self.assertLogs("news_bot", level=level) as logs:
                 self.assertEqual(nb_history_store.job_settle_published_picks(), ok)
             self.assertIn(message, "\n".join(logs.output))
+
+    def test_picks_judged_over_another_hold_length_are_left_out(self):
+        self._publish()
+        with patch.object(nb_market_data, "_fetch_ticker_history", return_value=self._history()), \
+             patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 20):
+            report = nb_history_store.build_published_pick_report()
+        self.assertIn("0 completed", report)
+        self.assertIn("1 judged over another hold length (left out)", report)
 
     def test_empty_ledger_does_not_fetch(self):
         with patch.object(nb_market_data, "_fetch_ticker_history") as fetch:

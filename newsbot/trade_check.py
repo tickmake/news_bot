@@ -26,6 +26,8 @@ USAGE = (
 EVENT_DAYS = 28
 # From this round-trip fee on, mark it: a 20-session hold earned ~1.5% before fees (#122).
 FEE_WARN_PCT = 1.0
+# Above this, even the size the risk rule allows is too small for the 59 NOK minimum.
+SMALL_SIZE_FEE_PCT = 1.5
 
 
 def _parse(argument: str) -> Tuple[str, float]:
@@ -193,9 +195,16 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     if total:
         share = cost / total * 100
         text = f"    {share:.0f}% of your money ({total:,.0f} NOK)."
-        if sized is not None:
-            text += f" The risk rule suggests about {total * sized.weight_pct / 100:,.0f} NOK."
+        suggested = total * sized.weight_pct / 100 if sized is not None else None
+        if suggested:
+            text += f" The risk rule suggests about {suggested:,.0f} NOK."
         lines.append(text)
+        if suggested:
+            suggested_fee = 2 * max(SETTINGS.broker_fee_min_nok, suggested * SETTINGS.broker_fee_pct / 100.0)
+            if suggested_fee / suggested * 100 > SMALL_SIZE_FEE_PCT:
+                lines.append(
+                    f"    ⚠️ At that size the fee is {suggested_fee / suggested * 100:.1f}% round trip: "
+                    "this stock swings too much for a position the fee doesn't eat. A calmer stock fits better.")
         if SETTINGS.risk_max_position_pct > 0 and share > SETTINGS.risk_max_position_pct:
             lines.append(f"    ⚠️ More than the {SETTINGS.risk_max_position_pct:g}% limit for one stock.")
     else:

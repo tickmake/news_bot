@@ -102,6 +102,18 @@ class CheckTests(unittest.TestCase):
         fills.record_fill("BUY AKRBP.OL 10 250 59 2026-11-02 !")
         self.assertIn("⚠️ Same sector (Energy) as AKRBP.OL.", self.check("EQNR.OL 3000"))
 
+    def test_wild_stock_gets_a_too_small_for_the_fee_warning(self):
+        self.metrics["EQNR.OL"] = _m("EQNR.OL", 285.0, atr=6.0)    # suggests 50,000 * 0.5/12 = 2,083 NOK
+        text = self.check("EQNR.OL 12000")
+        self.assertIn("The risk rule suggests about 2,083 NOK.", text)
+        self.assertIn("⚠️ At that size the fee is 5.7% round trip", text)
+        # With 2% risk and a 25% cap (the Pi's settings) a calm stock gets 12,500 NOK: no warning.
+        with patch.object(nb_config.SETTINGS, "risk_per_trade_pct", 2.0), \
+             patch.object(nb_config.SETTINGS, "risk_max_position_pct", 25.0):
+            text = self.check("DNB.OL 12000")
+        self.assertIn("The risk rule suggests about 12,500 NOK.", text)
+        self.assertNotIn("At that size", text)
+
     def test_cash_and_unknown_account(self):
         fills.record_deposit("10000 2026-11-01")
         text = self.check("EQNR.OL 12000")

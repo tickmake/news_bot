@@ -173,7 +173,15 @@ class ReportTests(unittest.TestCase):
         with patch.object(nb_config.SETTINGS, "trade_max_atr_pct", 9.0), \
              patch("newsbot.market_data._fetch_ticker_history", return_value=None):
             report = nb_forward.build_forward_test_report(datetime(2026, 10, 3))
-        self.assertIn("recorded under earlier rules (excluded)", report)
+        self.assertIn("1 recorded under earlier rules or hold lengths (excluded)", report)
+
+    def test_other_hold_length_rows_are_excluded(self):
+        self.store.archive_signal(_metrics(), True, None)
+        with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 20), \
+             patch("newsbot.market_data._fetch_ticker_history", return_value=None):
+            report = nb_forward.build_forward_test_report(datetime(2026, 10, 3))
+        self.assertIn("0 archived signals", report)
+        self.assertIn("1 recorded under earlier rules or hold lengths (excluded)", report)
 
 
 class OutcomeGuardTests(unittest.TestCase):

@@ -238,7 +238,10 @@ def build_forward_test_report(today: Optional[datetime] = None) -> str:
         ])
 
     rule = history_store.TradeHistoryStore.current_rule_id()
-    current = [row for row in rows if row["rule_id"] == rule]
+    # A different hold length is a different test, so it is never averaged in either.
+    horizon = SETTINGS.trade_outcome_lookback_days
+    current = [row for row in rows
+               if row["rule_id"] == rule and int(row["horizon_sessions"]) == horizon]
     other_rules = len(rows) - len(current)
     done = []
     for row in current:
@@ -253,7 +256,7 @@ def build_forward_test_report(today: Optional[datetime] = None) -> str:
     lines.append(
         f"{len(done)} completed · {pending} pending"
         + (f" · {failed} unavailable" if failed else "")
-        + (f" · {other_rules} recorded under earlier rules (excluded)" if other_rules else "")
+        + (f" · {other_rules} recorded under earlier rules or hold lengths (excluded)" if other_rules else "")
         + (f" · {settled} settled just now" if settled else "")
     )
     lines.append("")
