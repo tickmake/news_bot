@@ -14,7 +14,12 @@ RUN npm ci --no-audit --no-fund
 COPY evidence.config.yaml svelte.config.js ./
 COPY sources ./sources
 COPY pages ./pages
-RUN VITE_EVIDENCE_SPA=true npm run build
+RUN VITE_EVIDENCE_SPA=true npm run build \
+    # nginx serves these .gz copies (gzip_static). DuckDB's 34 MB wasm is
+    # 7.6 MB gzipped, which over the Pi's Wi-Fi turns a ~40 s first visit
+    # into ~9 s.
+    && find build -type f \( -name '*.wasm' -o -name '*.js' -o -name '*.css' \
+        -o -name '*.json' -o -name '*.html' -o -name '*.svg' \) -exec gzip -9 -k {} +
 
 FROM node:22-bookworm-slim@sha256:18052396bf1d0c6e0a8c58181b5c1457da19409efbd5032a3f4d86974e74d13c
 
