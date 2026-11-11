@@ -29,13 +29,18 @@ ITEMS = ("revenue", "operating_profit", "net_profit", "total_debt", "cash", "equ
 
 # ESEF (IFRS) concept per item, first match wins. Debt and shares are rarely
 # tagged the same way twice, so they usually come from Yahoo.
+# Profit and equity are the shareholders' own part (#111): the plain totals
+# include minority owners of subsidiaries, which made Credit Agricole's profit
+# ~25% and Enel's equity ~45% too high for P/E, P/B and ROE. Yahoo's rows are
+# already the shareholders' part. A company without minority owners (ASML)
+# tags only the total, so that is the fallback.
 ESEF_CONCEPTS = {
     "revenue": ("ifrs-full:Revenue", "ifrs-full:RevenueFromContractsWithCustomers"),
     "operating_profit": ("ifrs-full:ProfitLossFromOperatingActivities",),
-    "net_profit": ("ifrs-full:ProfitLoss",),
+    "net_profit": ("ifrs-full:ProfitLossAttributableToOwnersOfParent", "ifrs-full:ProfitLoss"),
     "total_debt": ("ifrs-full:Borrowings",),
     "cash": ("ifrs-full:CashAndCashEquivalents",),
-    "equity": ("ifrs-full:Equity",),
+    "equity": ("ifrs-full:EquityAttributableToOwnersOfParent", "ifrs-full:Equity"),
     "operating_cash_flow": ("ifrs-full:CashFlowsFromUsedInOperatingActivities",),
     "shares_outstanding": ("ifrs-full:NumberOfSharesOutstanding",),
 }
@@ -70,13 +75,37 @@ _TABLES = (
     """,
     # ESEF filings already read, so the weekly run only downloads new ones.
     "CREATE TABLE IF NOT EXISTS esef_filings_read (filing_id TEXT PRIMARY KEY, symbol TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS company_numbers_version (version INTEGER NOT NULL)",
 )
+
+# Bump when saved rows were read wrongly, and say in _migrate what is redone.
+VERSION = 2
+
+
+def _migrate(conn) -> None:
+    """Redo rows an earlier version read wrongly. Callers hold TRADE_HISTORY_LOCK.
+
+    Version 2 (#111): ESEF profit and equity were the totals including minority
+    owners. Those rows go, and every filing is read again on the next run, which
+    only adds what is missing. Share counts from Yahoo had a currency by mistake.
+    """
+    row = conn.execute("SELECT MAX(version) FROM company_numbers_version").fetchone()
+    if row[0] is not None and row[0] >= VERSION:
+        return
+    with conn:
+        conn.execute("DELETE FROM company_numbers WHERE source = 'esef' AND item IN ('net_profit', 'equity')")
+        conn.execute("DELETE FROM esef_filings_read")
+        conn.execute("UPDATE company_numbers SET currency = NULL WHERE item = 'shares_outstanding'")
+        conn.execute("DELETE FROM company_numbers_version")
+        conn.execute("INSERT INTO company_numbers_version VALUES (?)", (VERSION,))
+    APP_LOG.info("company_numbers_migrated version=%d", VERSION)
 
 
 def _connection():
     conn = TRADE_HISTORY._connection()
     for table in _TABLES:
         conn.execute(table)
+    _migrate(conn)
     return conn
 
 
@@ -208,7 +237,7 @@ def load_yahoo(symbol: str) -> int:
             if number != number:  # NaN
                 continue
             year_end = column.strftime("%Y-%m-%d")
-            by_year.setdefault(year_end, {})[item] = (number, currency)
+            by_year.setdefault(year_end, {})[item] = (number, None if item == "shares_outstanding" else currency)
     saved = 0
     for year_end, values in by_year.items():
         known_from = (date.fromisoformat(year_end) + YAHOO_KNOWN_AFTER).isoformat()

@@ -185,7 +185,10 @@ def build_ticker_analysis(raw_symbol: str) -> str:
         f" · P/B {_fmt_num(info.get('priceToBook'))}"
         f" · EV/EBITDA {_fmt_num(info.get('enterpriseToEbitda'))}"
     )
-    lines.append(f"Dividend yield {_fmt_pct(info.get('dividendYield'))}")
+    # Unlike the margins above, yfinance gives dividendYield in percent already
+    # (5.55 for DNB at 5.55%), so it is not multiplied by 100 (#127).
+    dividend_yield = _as_float(info.get("dividendYield"))
+    lines.append(f"Dividend yield {'n/a' if dividend_yield is None else f'{dividend_yield:.1f}%'}")
     low_52 = _as_float(info.get("fiftyTwoWeekLow"))
     high_52 = _as_float(info.get("fiftyTwoWeekHigh"))
     if metrics and low_52 is not None and high_52 is not None and high_52 > low_52:

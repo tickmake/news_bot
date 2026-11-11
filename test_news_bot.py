@@ -3220,7 +3220,7 @@ class TickerAnalysisTests(unittest.TestCase):
             "longName": "Apple Inc.", "sector": "Technology", "industry": "Consumer Electronics",
             "country": "United States", "longBusinessSummary": "Makes phones and computers.",
             "trailingPE": 30.0, "forwardPE": 28.0, "priceToSalesTrailing12Months": 8.0,
-            "dividendYield": 0.005, "fiftyTwoWeekLow": 120.0, "fiftyTwoWeekHigh": 180.0,
+            "dividendYield": 0.45, "fiftyTwoWeekLow": 120.0, "fiftyTwoWeekHigh": 180.0,
             "grossMargins": 0.45, "operatingMargins": 0.3, "profitMargins": 0.25,
             "returnOnEquity": 1.5, "totalCash": 60_000_000_000, "totalDebt": 100_000_000_000,
             "debtToEquity": 180.0, "currentRatio": 1.0, "freeCashflow": 90_000_000_000,
@@ -3238,6 +3238,12 @@ class TickerAnalysisTests(unittest.TestCase):
         self.assertIn("Balance Sheet", report)
         self.assertIn("Cash Flow", report)
         self.assertIn("Risk", report)
+        # yfinance gives dividendYield in percent already (#127).
+        self.assertIn("Dividend yield 0.5%", report)
+        info["dividendYield"] = 5.55
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=self._metrics()), \
+             patch("newsbot.market_data._fetch_ticker_fundamentals", return_value=info):
+            self.assertIn("Dividend yield 5.5%", nb_reports.build_ticker_analysis("dnb.ol"))
         self.assertIn("Bull / Base / Bear", report)
         self.assertIn("Not available in this bot", report)
         self.assertIn("elevated debt/equity", report)
