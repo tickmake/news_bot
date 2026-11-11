@@ -211,6 +211,71 @@ volatility stop elsewhere, so one block showed two different stops), and
 since sizing otherwise treats every pick as an independent bet while
 `correlated_pairs` separately proves they are not.
 
+## 8. Hold length and sell rule after DNB fees (issue #122, November 2026)
+
+The question changed once real trading was set for January 2027 with DNB: a 59 NOK
+minimum fee each way on a ~12,000 NOK position is **0.49% per side, about 1% for a
+buy and a sell**, ten times the 10 bps used above. `research/hold_exit_study.py` asks
+which hold length and sell rule loses least once that is paid. No signal is involved:
+every stock of `stock_list.csv` (95 of 97 had history) is bought at the next open every
+5th session for ten years (2016-12 to 2026-10, 44,807 entries per row below) and sold
+by one of four rules: **time** (sell at the end of the hold), **stop** (also sell at
+entry - 2xATR, the stop the bot places), **wide** (the same at 3xATR) and **trail**
+(2xATR below the highest close since entry). A session that opens below the stop sells
+at that open.
+
+All years, net of fees (%, per trade):
+
+| Hold | Rule | Net mean | Net median | Worst 5% | Net > 0 | Stopped | Net per 20 sessions |
+|---|---|---|---|---|---|---|---|
+| 5 | time | -0.68 | -0.64 | -8.2 | 42% | - | **-2.70** |
+| 10 | time | -0.28 | -0.32 | -10.8 | 47% | - | -0.56 |
+| 20 | time | **+0.51** | +0.34 | -14.0 | 52% | - | **+0.51** |
+| 20 | stop (2xATR) | +0.09 | -2.38 | -9.6 | 43% | 46% | +0.09 |
+| 20 | wide (3xATR) | +0.31 | -0.25 | -11.9 | 49% | 29% | +0.31 |
+| 20 | trail | -0.10 | -2.09 | -8.6 | 37% | 73% | -0.10 |
+
+"Net per 20 sessions" fills the same four weeks with back-to-back trades of that length,
+so it compares hold lengths fairly.
+
+What holds in the first part (before Nov 2021), the check part (after), Oslo alone, and
+year by year:
+
+1. **Short holds lose to fees.** A 5-session trade earns +0.3% before fees and pays
+   ~1%. Filling four weeks with 5-session trades costs **-2.7%**; one 20-session trade
+   makes **+0.5%**. The 20-session hold beat the 5-session hold in every year from
+   2017 to 2026, in both halves (-2.84 vs +0.42 and -2.58 vs +0.60) and in Oslo alone
+   (-2.67 vs +0.61). This settles the owner's hold length: **2 to 4 weeks**.
+2. **The 2xATR stop costs more than it saves on a 4-week hold.** It is hit in 46% of
+   20-session trades, so a normal wobble sells the stock and the fee is paid for
+   nothing; the average falls from +0.51% to +0.09%. It does cut the worst 5% of
+   trades from -14.0% to -9.6%. The trailing stop is worse on average than any other
+   rule. 15% of stops gap through, as in section 7.
+3. **A 3xATR stop is the middle ground:** hit in 29% of trades, keeps +0.31% on
+   average, worst 5% at -11.9%. Without a stop the average was better in 9 of 11 years.
+   But this test can't see the companies that collapsed and left the list, which is
+   exactly where a stop helps most, so "no stop" is flattered here. The recommendation
+   is a **3xATR stop for 2-4 week holds**, treated as insurance that costs about
+   0.2 pp per trade, not as a way to earn more.
+
+Two consequences for the bot, not changed in this PR because they change the advice
+and sizing the owner sees:
+
+- With a 3xATR stop, the fixed 0.5%-risk sizing gives positions of about 8% of a
+  50,000 NOK account (~4,000 NOK) for a typical 2% daily-swing stock, and at that size
+  the 59 NOK minimum is nearly 3% round trip. Sizing and fees pull in opposite directions;
+  `/check` shows both so the owner can see it, and the settings
+  (`RISK_STOP_ATR_MULTIPLE`, `RISK_PER_TRADE_PCT`) are an owner decision.
+- `/forwardtest` and `/pickperformance` judge picks over 5 sessions
+  (`TRADE_OUTCOME_LOOKBACK_DAYS=5`), which this section shows is the hold that loses
+  most to fees. They should judge the hold the owner actually uses (about 20).
+
+Caveats: today's list only (failed companies are missing, which flatters every rule
+and "no stop" most); the levels include ten years of a rising market, so compare rules
+with each other, not with zero; entries 5 sessions apart overlap on 10- and 20-session
+holds, so there are fewer independent results than rows; currency exchange fees on
+non-NOK stocks are not included.
+
 ## Conclusions
 
 1. Daily price gates, classic factors and earnings surprises show **no reliable edge**
@@ -231,6 +296,10 @@ since sizing otherwise treats every pick as an independent bet while
    relative-strength lines in `/recommendations` and `/analyze` provide. Section 7 puts
    measured numbers behind two of its disclaimers: the stop gaps through about one time
    in seven, and correlated picks now have their combined loss stated rather than implied.
+4. With real DNB fees, **hold length matters more than any signal tested here**: a
+   5-session trade loses about 0.7% to fees on average, a 20-session trade makes about
+   +0.5% (section 8). A 2xATR stop is hit in almost half of 4-week holds; 3xATR is the
+   better trade-off.
 
 ## Caveats
 

@@ -180,6 +180,8 @@ class AppSettings(BaseSettings):
     risk_corr_min_obs: int = 30
     # Calendar days; 7 covers the default 5-session hold.
     risk_earnings_warn_days: int = 7
+    # How much a stock can fall over a 2-4 week hold, in /analyze and /check (#123).
+    risk_forecast_enabled: bool = True
     # Wall-clock allowance for the extra lookups; the screen never waits longer.
     risk_context_deadline_seconds: int = 12
     # Relative strength shown beside the risk lines: the stock's return over the

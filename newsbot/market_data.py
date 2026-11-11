@@ -464,6 +464,14 @@ def _next_earnings_date(symbol: str) -> Optional[date]:
     return min(upcoming) if upcoming else None
 
 
+def _next_ex_dividend_date(symbol: str) -> Optional[date]:
+    """The next ex-dividend date from yfinance's calendar, or None (also when past)."""
+    calendar = _with_retry(lambda: yf.Ticker(symbol).calendar, f"yf_calendar_{symbol}", retries=2)
+    value = calendar.get("Ex-Dividend Date") if isinstance(calendar, dict) else None
+    value = value.date() if isinstance(value, datetime) else value
+    return value if isinstance(value, date) and value >= datetime.now().date() else None
+
+
 def _fetch_event_profile(symbol: str) -> Dict[str, Any]:
     """Sector and next earnings date for one symbol, cached.
 

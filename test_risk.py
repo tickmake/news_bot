@@ -15,6 +15,7 @@ from newsbot import indicators as nb_indicators
 from newsbot import market_data as md
 from newsbot import reports as nb_reports
 from newsbot import risk
+from newsbot import risk_forecast as nb_risk_forecast
 from newsbot import screener as nb_screener
 from newsbot import state as nb_state
 
@@ -44,7 +45,7 @@ class SettingsCase(unittest.TestCase):
         # Relative strength fetches six months of history for the stock, its market
         # proxy and its sector ETF. These tests are about the other risk analytics
         # and must never reach yfinance; test_relative_strength.py covers that part.
-        self.use(relative_strength_enabled=False, catalysts_enabled=False)
+        self.use(relative_strength_enabled=False, catalysts_enabled=False, risk_forecast_enabled=False)
 
     def use(self, **values):
         for name, value in values.items():
@@ -273,7 +274,8 @@ class RenderingTests(SettingsCase):
         self.assertIn("volatility stop 96.00 (4.0% away)", lines[0])
         self.assertIn("size 12% of portfolio for 0.50% risk", lines[0])
         self.assertIn("fees: at least 118 NOK to buy and sell + currency exchange fee", lines[1])
-        self.assertIn("⚠️ earnings in 2 days", lines[2])
+        self.assertEqual("    ⛔ Not for ASK (US stock)", lines[2])
+        self.assertIn("⚠️ earnings in 2 days", lines[3])
 
     def test_capped_size_says_so_and_amount_is_shown(self):
         self.use(risk_account_size=50_000.0)
@@ -290,10 +292,11 @@ class RenderingTests(SettingsCase):
                       risk.fee_line("AAPL", 60_000.0))
         self.assertEqual(risk.fee_line("EQNR.OL", None), "    fees: at least 118 NOK to buy and sell")
 
-    def test_without_context_or_sizing_only_the_fee_shows(self):
-        self.assertEqual(risk.candidate_lines("AAA", None), ["    fees: at least 118 NOK to buy and sell + currency exchange fee"])
-        self.assertEqual(risk.candidate_lines("ZZZ", self._context()),
-                         ["    fees: at least 118 NOK to buy and sell + currency exchange fee"])
+    def test_without_context_or_sizing_only_the_fee_and_ask_show(self):
+        fee = "    fees: at least 118 NOK to buy and sell + currency exchange fee"
+        self.assertEqual(risk.candidate_lines("AAA", None), [fee, "    ⛔ Not for ASK (US stock)"])
+        self.assertEqual(risk.candidate_lines("ZZZ", self._context()), [fee, "    ⛔ Not for ASK (US stock)"])
+        self.assertEqual(risk.candidate_lines("EQNR.OL", None), ["    fees: at least 118 NOK to buy and sell"])
 
     def test_portfolio_section_totals_and_disclaimer(self):
         lines = risk.portfolio_lines(risk.assess([_m("AAA"), _m("BBB")], {}, [], TODAY))
@@ -444,6 +447,19 @@ class IntegrationTests(SettingsCase):
         self.assertIn("Risk &amp; Events", report)
         self.assertIn("volatility stop", report)
         self.assertIn("earnings in 3 days", report)
+
+    def test_analyze_shows_how_much_it_can_fall(self):
+        self.use(risk_analytics_enabled=True)
+        forecast = nb_risk_forecast.Forecast(
+            sessions=504, bad_moves=(("2 weeks", -6.2), ("4 weeks", -9.5)), max_drop_pct=-31.4,
+            drop_from=date(2025, 3, 3), drop_to=date(2025, 8, 1))
+        with patch("newsbot.indicators._compute_trade_metrics", return_value=_m("AAA")), \
+             patch.object(md, "_fetch_ticker_fundamentals", return_value={}), \
+             patch.object(md, "_fetch_event_profile", return_value={}), \
+             patch.object(nb_risk_forecast, "build", return_value=forecast):
+            report = nb_reports.build_ticker_analysis("AAA")
+        self.assertIn("How much it can fall over a 2-4 week hold:", report)
+        self.assertIn("a bad 4 weeks: -9.5%", report)
 
     def test_analyze_without_a_known_date_says_so(self):
         self.use(risk_analytics_enabled=True)

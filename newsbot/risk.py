@@ -17,7 +17,7 @@ from datetime import date, datetime
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from newsbot import catalysts, market_data, relative_strength
+from newsbot import catalysts, market_data, relative_strength, stock_list
 from newsbot.config import SETTINGS
 from newsbot.indicators import TradeMetrics, _drop_in_progress_bar
 from newsbot.benchmarks import _backtest_benchmark_for
@@ -345,11 +345,17 @@ def fee_line(symbol: str, amount: Optional[float]) -> str:
     )
 
 
+def ask_lines(symbol: str) -> List[str]:
+    """A warning line when the stock can't, or might not, go in an ASK (#107)."""
+    note = stock_list.ask_note(symbol)
+    return [f"    ⛔ {escape(note)}"] if note else []
+
+
 def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
     """Extra lines under one candidate: sizing, fees and any event flag."""
     if risk is None:
-        # The fee is known without any lookups, so it shows even then.
-        return [fee_line(symbol, None)]
+        # The fee and the ASK rule are known without any lookups, so they show even then.
+        return [fee_line(symbol, None), *ask_lines(symbol)]
     lines: List[str] = []
     sized = risk.sizing.get(symbol)
     if sized is not None:
@@ -365,6 +371,7 @@ def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
             text += f" ≈ {sized.amount:,.0f}"
         lines.append(text)
     lines.append(fee_line(symbol, sized.amount if sized is not None else None))
+    lines.extend(ask_lines(symbol))
     strength_line = relative_strength.render_line(risk.strength.get(symbol))
     if strength_line:
         lines.append(escape(strength_line, quote=False))

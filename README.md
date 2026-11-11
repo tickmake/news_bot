@@ -473,6 +473,7 @@ After sending `/start` to the bot, you can use:
 - `/diagnostics` - break down historical signal outcomes and compare ranking on matching dates
 - `/pickperformance` - evaluate fixed-session outcomes of successfully delivered stock picks
 - `/health` - send runtime health report
+- `/check TICKER AMOUNT_NOK` - before placing an order, e.g. `/check EQNR.OL 12000`: shares and cost in NOK, the DNB fee and the rise needed to cover it, whether it may go in an Aksjesparekonto, earnings and ex-dividend dates in the next 4 weeks, overlap (same sector or moving together) with what `/fill` says you hold, the volatility stop's loss in NOK, how much it can fall over 2 and 4 weeks, and its share of your money. Telegram only. Information, never a buy or sell verdict
 
 `/morning` and `/evening` (forcing the greeting/tone of the scheduled
 07:00/19:00 briefing on demand) have been removed in favor of the more
@@ -792,6 +793,13 @@ the holding period, so each candidate and `/analyze` now carry:
   (20%). Set `RISK_ACCOUNT_SIZE` to see an amount too. This stop is separate from
   the "invalidation" level in the sketch, which is the 20-session low. A gap through
   the stop loses more than planned.
+- **Whether it may go in an Aksjesparekonto** (#107): a `⛔ Not for ASK` line when
+  `stock_list.csv` says `ask_allowed=no`, for any US listing, and `ASK: check first`
+  for a stock outside the list.
+- **How much it can fall over a 2-4 week hold** (`/analyze` and `/check`, #123): the
+  1-in-20 bad 2 and 4 weeks over the last year, the biggest fall in 2 years, and the
+  average move on the last 8 report days. From the saved `daily_prices`; Yahoo only
+  for stocks outside the list. `RISK_FORECAST_ENABLED=false` turns it off.
 - **An earnings flag** when the next report is within `RISK_EARNINGS_WARN_DAYS`
   (7) calendar days, which covers the default 5-session hold. Dates come from
   yfinance's calendar, not `.info` (whose earnings timestamp is often the previous
