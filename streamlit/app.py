@@ -5,6 +5,7 @@ five filters. Reads the bot's SQLite DB straight from the volume, read-only,
 with short queries cached for a minute, so pages are at most a minute behind.
 """
 
+import json
 import os
 import sqlite3
 
@@ -191,23 +192,158 @@ def sent_picks() -> None:
         "excess_return_pct": "Better than index by %", "status": "Status"})
 
 
+RANGES = {"1M": 21, "3M": 63, "6M": 126, "YTD": None, "1Y": 252, "MAX": 0}
+YEARLY_CHARTS = [
+    ("Revenue", "revenue", "#5aa9e6"),
+    ("Operating profit", "operating_profit", "#f28c28"),
+    ("Net profit", "net_profit", "#f2c94c"),
+    ("Operating cash flow", "operating_cash_flow", "#eb5757"),
+    ("Earnings per share", "eps", "#4fd1c5"),
+]
+
+
+def _big(v: float | None) -> str:
+    if v is None or pd.isna(v):
+        return "–"
+    for div, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if abs(v) >= div:
+            return f"{v / div:.2f}{suffix}"
+    return f"{v:,.2f}"
+
+
+def _num(v, fmt="{:.2f}") -> str:
+    return "–" if v is None or pd.isna(v) else fmt.format(v)
+
+
+def _small_chart(df: pd.DataFrame, y, title: str, color=None):
+    fig = px.bar(df, x="year", y=y, title=title, barmode="group",
+                 color_discrete_sequence=[color] if color else None,
+                 labels={"value": "", "year": "", "variable": ""})
+    fig.update_yaxes(title=None)
+    fig.for_each_trace(lambda t: t.update(name=t.name.replace("total_debt", "debt")))
+    fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10), showlegend=not color,
+                      legend=dict(orientation="h", y=-0.2))
+    return fig
+
+
 def one_stock() -> None:
-    st.title("One stock")
-    df = signals()
-    symbols = sorted(df["symbol"].unique())
-    symbol = st.selectbox("Stock", symbols,
-                          index=symbols.index("EQNR.OL") if "EQNR.OL" in symbols else 0)
-    rows = df[df["symbol"] == symbol].sort_values("day")
-    st.plotly_chart(px.line(rows, x="day", y="last_close", markers=True, hover_data=["reason"],
-                            labels={"last_close": "Price", "day": ""},
-                            title="Price on each screen day"), use_container_width=True)
-    view = rows.sort_values("day", ascending=False)[
-        ["signal_session", "reason", "last_close", "day_change_pct", "week_momentum_pct",
-         "net_return_pct"]]
-    st.dataframe(view.round(2), hide_index=True, use_container_width=True, column_config={
-        "signal_session": "Day", "reason": "Result", "last_close": "Price",
-        "day_change_pct": "Today %", "week_momentum_pct": "Last 5 days %",
-        "net_return_pct": "At the end of the hold, after fees %"})
+    sig = signals()
+    symbols = sorted(set(sig["symbol"]) | set(query("SELECT DISTINCT symbol FROM daily_prices")["symbol"]))
+    recent = st.session_state.setdefault("recent_stocks", [])
+    default = recent[0] if recent else ("EQNR.OL" if "EQNR.OL" in symbols else symbols[0])
+
+    symbol = st.selectbox("Search stock", symbols, index=symbols.index(default),
+                          placeholder="Ticker, e.g. EQNR.OL", label_visibility="collapsed")
+    if symbol in recent:
+        recent.remove(symbol)
+    recent.insert(0, symbol)
+    del recent[6:]
+    if len(recent) > 1:
+        cols = st.columns(len(recent) - 1 + 4)
+        for col, s in zip(cols, recent[1:]):
+            # Clicking puts that stock first in the list; the rerun picks it up.
+            if col.button(s, key=f"recent_{s}", use_container_width=True):
+                recent.remove(s)
+                recent.insert(0, s)
+                st.rerun()
+
+    prices = query("SELECT session_date, close, currency FROM daily_prices WHERE symbol = ? "
+                   "ORDER BY session_date", (symbol,))
+    snap = query("SELECT data_json FROM stock_snapshots WHERE symbol = ? "
+                 "ORDER BY snapshot_date DESC LIMIT 1", (symbol,))
+    info = json.loads(snap["data_json"].iloc[0]).get("info", {}) if not snap.empty else {}
+    mine = sig[sig["symbol"] == symbol].sort_values("day")
+
+    left, right = st.columns([3, 1], gap="large")
+    with left:
+        rng = st.segmented_control("Range", list(RANGES), default="1Y",
+                                   label_visibility="collapsed") or "1Y"
+        p = prices.assign(day=pd.to_datetime(prices["session_date"]))
+        if rng == "YTD":
+            p = p[p["day"].dt.year == p["day"].max().year]
+        elif RANGES[rng]:
+            p = p.tail(RANGES[rng])
+        if p.empty:
+            st.info("No daily prices saved for this stock yet.")
+        else:
+            first, last = p["close"].iloc[0], p["close"].iloc[-1]
+            change = (last / first - 1) * 100
+            currency = p["currency"].dropna().iloc[-1] if p["currency"].notna().any() else ""
+            st.markdown(f"### {symbol} &nbsp; {last:,.2f} {currency} &nbsp; "
+                        f":{'green' if change >= 0 else 'red'}[{change:+.2f}% {rng}]")
+            fig = px.area(p, x="day", y="close", labels={"close": "", "day": ""})
+            line = "#3ecf8e" if change >= 0 else "#eb5757"
+            fig.update_traces(fill="tozeroy", line_color=line)
+            fig.update_yaxes(range=[p["close"].min() * 0.95, p["close"].max() * 1.02])
+            # The bot's picks on this stock, as markers on the price line.
+            picks = mine[(mine["qualified"] == 1) & (mine["day"] >= p["day"].min())]
+            if not picks.empty:
+                fig.add_scatter(x=picks["day"], y=picks["last_close"], mode="markers",
+                                name="Bot picked", marker=dict(symbol="triangle-up", size=11,
+                                                               color="#f2c94c"))
+            fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10),
+                              legend=dict(orientation="h", y=1.05))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        with st.container(border=True):
+            st.markdown("**Key numbers**")
+            fcf_yield = (info["freeCashflow"] / info["marketCap"] * 100
+                         if info.get("freeCashflow") and info.get("marketCap") else None)
+            rows = [
+                ("Sector", info.get("sector") or "–"),
+                ("Market cap", _big(info.get("marketCap"))),
+                ("P/E trailing / forward",
+                 f"{_num(info.get('trailingPE'))} / {_num(info.get('forwardPE'))}"),
+                ("Price to book", _num(info.get("priceToBook"))),
+                ("Free cash flow yield", _num(fcf_yield, "{:.2f}%")),
+                ("Dividend yield", _num(info.get("dividendYield"), "{:.2f}%")),
+                ("Analyst target", _num(info.get("targetMeanPrice"))),
+                ("Analysts' view", (info.get("recommendationKey") or "–").replace("_", " ")),
+            ]
+            st.markdown("\n".join(f"| {k} | **{v}** |" for k, v in rows).join(
+                ["| | |\n|:--|--:|\n", ""]))
+            if snap.empty:
+                st.caption("No analyst snapshot for this stock.")
+
+    tab_numbers, tab_bot = st.tabs(["Company numbers", "The bot and this stock"])
+    with tab_numbers:
+        nums = query("SELECT year_end, item, value, currency FROM company_numbers "
+                     "WHERE symbol = ? ORDER BY year_end", (symbol,))
+        if nums.empty:
+            st.info("No company numbers saved for this stock.")
+        else:
+            wide = nums.pivot_table(index="year_end", columns="item", values="value").reset_index()
+            wide["year"] = wide["year_end"].str[:7]
+            if {"net_profit", "shares_outstanding"} <= set(wide):
+                wide["eps"] = wide["net_profit"] / wide["shares_outstanding"]
+            charts = [(t, c, col) for t, c, col in YEARLY_CHARTS if c in wide]
+            if {"cash", "total_debt"} <= set(wide):
+                charts.append(("Cash and debt", ["cash", "total_debt"], None))
+            for row in range(0, len(charts), 3):
+                cols = st.columns(3)
+                for col, (title, y, color) in zip(cols, charts[row:row + 3]):
+                    with col, st.container(border=True):
+                        st.plotly_chart(_small_chart(wide, y, title, color),
+                                        use_container_width=True)
+            st.caption(f"Yearly figures in {nums['currency'].dropna().iloc[-1]}, by financial "
+                       "year end. Earnings per share = net profit / shares outstanding.")
+    with tab_bot:
+        done = mine.dropna(subset=["net_return_pct"])
+        cols = st.columns(4)
+        cols[0].metric("Days screened", len(mine))
+        cols[1].metric("Times picked", int(mine["qualified"].sum()))
+        cols[2].metric("Average result when picked %",
+                       _num(done.loc[done["qualified"] == 1, "net_return_pct"].mean()))
+        cols[3].metric("Average result when skipped %",
+                       _num(done.loc[done["qualified"] == 0, "net_return_pct"].mean()))
+        view = mine.sort_values("day", ascending=False)[
+            ["signal_session", "reason", "last_close", "day_change_pct", "week_momentum_pct",
+             "net_return_pct"]]
+        st.dataframe(view.round(2), hide_index=True, use_container_width=True, column_config={
+            "signal_session": "Day", "reason": "Result", "last_close": "Price",
+            "day_change_pct": "Today %", "week_momentum_pct": "Last 5 days %",
+            "net_return_pct": "At the end of the hold, after fees %"})
 
 
 def data_collected() -> None:
