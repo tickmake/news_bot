@@ -1,0 +1,27 @@
+{
+  "name": "news-bot-dashboard",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sources": "evidence sources",
+    "build": "evidence build",
+    "dev": "evidence dev --open /",
+    "preview": "evidence preview"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@evidence-dev/core-components": "5.4.2",
+    "@evidence-dev/evidence": "40.1.8",
+    "@evidence-dev/sqlite": "2.0.9"
+  },
+  "allowScripts": {
+    "sqlite3@5.1.6": true,
+    "esbuild@0.25.12": true,
+    "esbuild@0.21.5": true,
+    "@sveltejs/kit@2.8.4": true,
+    "svelte-preprocess": false
+  }
+}
