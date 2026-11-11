@@ -14,7 +14,15 @@ class StockListTests(unittest.TestCase):
         self.assertGreaterEqual(len(self.rows), 90)
         for row in self.rows:
             self.assertEqual(list(row), stock_list.COLUMNS)
-            self.assertTrue(all(value.strip() for value in row.values()), row)
+            self.assertTrue(all(row[column].strip() for column in stock_list.COLUMNS if column != "previous_ticker"), row)
+
+    def test_previous_tickers(self):
+        previous = stock_list.previous_tickers()
+        self.assertEqual(previous["CDLR.OL"], "CADLR.OL")
+        listed = set(stock_list.tickers())
+        for new, old in previous.items():
+            self.assertNotEqual(new, old)
+            self.assertNotIn(old, listed, "an old ticker must not still be listed as its own stock")
 
     def test_tickers_and_isins_are_unique_and_well_formed(self):
         self.assertEqual(len({row["ticker"] for row in self.rows}), len(self.rows))

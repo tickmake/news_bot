@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Tuple
 
 import yfinance as yf
 
-from newsbot import market_data
+from newsbot import market_data, stock_list
 from newsbot.config import EU_STOCK_UNIVERSE, NORWAY_STOCK_UNIVERSE, SETTINGS, USA_STOCK_UNIVERSE
 from newsbot.history_store import TRADE_HISTORY
 from newsbot.logsetup import APP_LOG, SYS_LOG
@@ -52,10 +52,15 @@ def _clean(value: Any) -> Any:
 
 
 def snapshot_symbols() -> List[str]:
-    """The configured stocks first, then whatever the screener looked at lately."""
+    """The stock list first (#114), then the configured watchlists, then whatever the screener looked at lately."""
+    try:
+        listed = stock_list.tickers()
+    except OSError as exc:
+        SYS_LOG.warning("snapshot_stock_list_unreadable detail=%s", exc)
+        listed = []
     configured = [*NORWAY_STOCK_UNIVERSE.values(), *EU_STOCK_UNIVERSE.values(), *USA_STOCK_UNIVERSE.values()]
     tracked = TRADE_HISTORY.recently_tracked_symbols(days=14)
-    symbols = list(dict.fromkeys(configured + tracked))
+    symbols = list(dict.fromkeys(listed + configured + tracked))
     return symbols[:max(0, SETTINGS.snapshot_max_symbols)]
 
 

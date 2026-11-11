@@ -68,5 +68,32 @@ class PriceStoreTests(unittest.TestCase):
             self.assertEqual(price_store.job_load_prices(), {})
 
 
+    def test_previous_ticker_fills_the_history_before_the_new_ticker(self):
+        old = _bars(["2026-11-04", "2026-11-05", "2026-11-10"], [58.0, 58.5, 999.0])
+        new = _bars(["2026-11-10", "2026-11-11"], [62.0, 63.0])
+        with patch.object(price_store.stock_list, "previous_tickers", return_value={"CDLR.OL": "CADLR.OL"}), \
+                self._fake_fetch({"CDLR.OL": new, "CADLR.OL": old}):
+            summary = price_store.load_prices(["CDLR.OL"])
+            self.assertEqual(summary["new_rows"], 4)
+            # The new ticker's own bar wins over the old ticker's on the same day.
+            self.assertEqual([(r[1], r[2]) for r in self._rows()], [
+                ("2026-11-04", 58.0), ("2026-11-05", 58.5), ("2026-11-10", 62.0), ("2026-11-11", 63.0)])
+            self.assertTrue(all(r[0] == "CDLR.OL" for r in self._rows()))
+
+    def test_previous_ticker_is_skipped_once_the_history_is_long(self):
+        with patch.object(price_store, "SHORT_HISTORY_SESSIONS", 2), \
+                patch.object(price_store.stock_list, "previous_tickers", return_value={"CDLR.OL": "CADLR.OL"}), \
+                self._fake_fetch({"CDLR.OL": _bars(["2026-11-10", "2026-11-11"], [62.0, 63.0])}):
+            price_store.load_prices(["CDLR.OL"])
+        self.assertNotIn(("CADLR.OL", "2y"), self.periods)
+
+    def test_a_missing_previous_ticker_does_not_fail_the_load(self):
+        with patch.object(price_store.stock_list, "previous_tickers", return_value={"CDLR.OL": "CADLR.OL"}), \
+                self._fake_fetch({"CDLR.OL": _bars(["2026-11-11"], [63.0])}):
+            summary = price_store.load_prices(["CDLR.OL", "EQNR.OL"])
+        self.assertEqual((summary["new_rows"], summary["failed"]), (1, ["EQNR.OL"]))
+        self.assertIn(("CADLR.OL", "2y"), self.periods)
+
+
 if __name__ == "__main__":
     unittest.main()

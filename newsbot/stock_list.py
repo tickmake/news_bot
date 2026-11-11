@@ -4,6 +4,8 @@
 exchanges' own lists and were checked against OpenFIGI; sector, country and
 currency come from Yahoo. `ask_allowed` is "yes" when the ISIN's country is
 in the EEA, the rule for an Aksjesparekonto (#82) -- a guide, not a promise.
+`previous_ticker` is the stock's old Yahoo ticker after a ticker change, so
+its older price history can be found (#112); empty for most stocks.
 """
 
 import csv
@@ -11,7 +13,7 @@ import os
 from functools import lru_cache
 from typing import Dict, List, Optional
 
-COLUMNS = ["ticker", "isin", "name", "exchange", "currency", "country", "sector", "region", "ask_allowed"]
+COLUMNS = ["ticker", "isin", "name", "exchange", "currency", "country", "sector", "region", "ask_allowed", "previous_ticker"]
 PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "stock_list.csv")
 
 
@@ -22,6 +24,11 @@ def load(path: str = PATH) -> List[Dict[str, str]]:
 
 def tickers(path: str = PATH) -> List[str]:
     return [row["ticker"] for row in load(path)]
+
+
+def previous_tickers(path: str = PATH) -> Dict[str, str]:
+    """New ticker -> old ticker, for stocks that changed ticker (#112)."""
+    return {row["ticker"]: row["previous_ticker"] for row in load(path) if row.get("previous_ticker")}
 
 
 @lru_cache(maxsize=4)
