@@ -312,6 +312,51 @@ To pass, a rule had to lift the worst 5% by at least 0.1 points at a cost of at 
 Caveats: today's stock list (survivors only), random entries rather than the bot's picks,
 and no currency fees.
 
+## 10. Do the four company scores pick better stocks? (Phase 3a, #79, November 2026)
+
+`research/score_backtest.py` reads the bot's own database after loading 10 years of
+prices and annual reports back to the 2020 accounts (PR #156). Every month end, the stocks
+are split into thirds by each score (0-100 within the sector, only from what was public
+that day). Each stock is bought at the next open and sold 20 sessions later, after
+DNB fees. The pass rules were written into the script before the first run:
+1. The top third beats all stocks in both the first and the check part.
+2. That difference has t >= 2 over all months.
+3. The top third beats the bottom third.
+
+| Score | Months | Top third vs all (per month) | t | Top vs bottom | Top beats all, % of months | Passes |
+|---|---|---|---|---|---|---|
+| Quality | 66 (2021-04 to 2026-09) | -0.31 | -1.3 | -0.43 | 35% | no, **backwards** |
+| Value | 42 (2023-04 on) | +0.32 (first part -0.03, check +0.67) | 1.6 | +0.82 | 62% | no |
+| Performance | 54 | -0.29 | -1.2 | -0.51 | 41% | no, backwards |
+| Momentum | 107 (2017-11 on) | +0.18 (+0.08, +0.27) | 1.0 | +0.32 | 51% | no |
+| All four averaged | 42 | -0.41 | -1.7 | -0.47 | 40% | no |
+
+1. **No score passes.** On today's ~97 stocks, no score picked a top third that beat
+   the average stock reliably.
+2. **Quality and performance point the wrong way.** Stocks that were profitable, low on
+   debt and growing did *worse* than average over the next month, most clearly in Oslo
+   (quality top vs all -0.66, t -2.0). Over one month, the market had already priced
+   good companies, and the cheap, weak ones bounced. This matches the usual finding that
+   quality pays, if at all, over years, not weeks.
+3. **Value is the only near-miss.** It was flat in the first half and strong in the
+   second (+0.67 a month, t 2.7), mostly in the EU (t 2.2). Half of one cycle is not
+   proof: it is the 2025-26 rotation into cheap stocks as much as a rule. It has only 42
+   months, because share counts come from Yahoo, which keeps 4 years.
+4. **Momentum is weakly positive everywhere** (Oslo, EU, US, both halves), as in the S&P
+   500 study in section 4, but the size (+0.2 a month) is far too small to pay for itself
+   on its own.
+
+Caveats: survivors only (Yahoo has no prices for Kahoot, Adevinta, XXL, REC Silicon,
+Golden Ocean, Schibsted and every other stock that left); ~30 stocks per third; one
+regime. The bias would flatter a quality score, since failed companies would have scored
+low, so quality's negative result is not caused by it.
+
+**What it means:** the scores stay in `/analyze` as descriptions of a company, not as
+signals. A high quality score says the business is sound, not that the share will beat
+others next month. The 6-month forward test (#79) is not worth running on the scores as
+they are. If anything is followed up, it is value in the EU, re-tested in 2027 with
+another year of data.
+
 ## Conclusions
 
 1. Daily price gates, classic factors and earnings surprises show **no reliable edge**

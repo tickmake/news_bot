@@ -243,7 +243,8 @@ def build_scores_section(symbol: str) -> List[str]:
                      "for the stocks on the list).")
         return lines
     lines.append(f"<i>0-100 against similar stocks, at the end of {result['month_end']}. "
-                 "100 means the best of the group. Information only: not tested yet (Phase 3).</i>")
+                 "100 means the best of the group. They describe the company. Tested on 2021-2026, "
+                 "none of them picked shares that did better over the next month.</i>")
     for area in AREAS:
         value = result[area]
         text = f"{value}/100" if value is not None else "not available"
