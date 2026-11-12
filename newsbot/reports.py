@@ -4,8 +4,9 @@ from datetime import datetime
 from html import escape
 from typing import Any, List, Optional
 
-from newsbot import data_health, history_store, indicators, market_data, risk_forecast, risk as risk_analytics
+from newsbot import data_health, history_store, indicators, market_data, report_card, risk_forecast, risk as risk_analytics
 from newsbot.config import SETTINGS
+from newsbot.logsetup import SYS_LOG
 from newsbot.market_data import _as_float
 from newsbot.screener import _entry_exit_sketch, _rsi_label
 from newsbot.state import RANKER_STATUS, STATE
@@ -281,6 +282,14 @@ def build_ticker_analysis(raw_symbol: str) -> str:
         "<i>Ranges implied by the last 20 sessions' price action, not predictions — they say "
         "nothing about fundamentals, macro, or news risk.</i>"
     )
+    lines.append("")
+
+    # 8b. Report card from the company numbers the bot saves (#124).
+    try:
+        lines.extend(report_card.build_report_card(symbol))
+    except Exception as exc:  # a bad row must not cost the rest of the report
+        SYS_LOG.warning("report_card_failed symbol=%s detail=%s", symbol, exc)
+        lines.append("<b>Report card</b>\nNot available right now.")
     lines.append("")
 
     # 9. Explicit gaps, per the framework's own rule against inventing numbers.

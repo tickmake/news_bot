@@ -25,7 +25,9 @@ from newsbot.logsetup import APP_LOG, SYS_LOG
 from newsbot.state import TRADE_HISTORY_LOCK
 
 ITEMS = ("revenue", "operating_profit", "net_profit", "total_debt", "cash", "equity",
-         "operating_cash_flow", "shares_outstanding")
+         "operating_cash_flow", "shares_outstanding",
+         # For the /analyze report card's health checks (#124).
+         "total_assets", "current_assets", "current_liabilities", "gross_profit")
 
 # ESEF (IFRS) concept per item, first match wins. Debt and shares are rarely
 # tagged the same way twice, so they usually come from Yahoo.
@@ -43,6 +45,10 @@ ESEF_CONCEPTS = {
     "equity": ("ifrs-full:EquityAttributableToOwnersOfParent", "ifrs-full:Equity"),
     "operating_cash_flow": ("ifrs-full:CashFlowsFromUsedInOperatingActivities",),
     "shares_outstanding": ("ifrs-full:NumberOfSharesOutstanding",),
+    "total_assets": ("ifrs-full:Assets",),
+    "current_assets": ("ifrs-full:CurrentAssets",),
+    "current_liabilities": ("ifrs-full:CurrentLiabilities",),
+    "gross_profit": ("ifrs-full:GrossProfit",),
 }
 YAHOO_ROWS = {
     "revenue": ("income_stmt", "Total Revenue"),
@@ -53,6 +59,10 @@ YAHOO_ROWS = {
     "equity": ("balance_sheet", "Stockholders Equity"),
     "operating_cash_flow": ("cashflow", "Operating Cash Flow"),
     "shares_outstanding": ("balance_sheet", "Ordinary Shares Number"),
+    "total_assets": ("balance_sheet", "Total Assets"),
+    "current_assets": ("balance_sheet", "Current Assets"),
+    "current_liabilities": ("balance_sheet", "Current Liabilities"),
+    "gross_profit": ("income_stmt", "Gross Profit"),
 }
 YAHOO_KNOWN_AFTER = timedelta(days=120)
 YEARS_WANTED = 4
