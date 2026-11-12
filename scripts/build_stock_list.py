@@ -83,8 +83,14 @@ def euronext_list(mic):
     return rows
 
 
-def median_turnover(tickers):
-    """Median daily price x volume over 3 months, per Yahoo ticker."""
+def median_turnover(tickers, short_ok=()):
+    """Median daily price x volume over 3 months, per Yahoo ticker.
+
+    A line with no trade in the last week has stopped trading (Cadeler's old
+    CADLR.OL line after the move to CDLR.OL) and is left out. A stock already
+    on the list may have a short history, as a new line does after a ticker
+    change (#112).
+    """
     bars = yf.download(tickers, period="3mo", interval="1d", auto_adjust=False,
                        group_by="ticker", progress=False, threads=True)
     out = {}
@@ -93,8 +99,10 @@ def median_turnover(tickers):
             frame = bars[ticker][["Close", "Volume"]].dropna()
         except KeyError:
             continue
+        if frame.empty or (bars.index[-1] - frame.index[-1]).days > 7:
+            continue
         values = (frame["Close"] * frame["Volume"]).tolist()
-        if len(values) >= 40:
+        if len(values) >= 40 or (values and ticker in short_ok):
             out[ticker] = statistics.median(values)
     return out
 
@@ -137,7 +145,8 @@ def pick(mics, count, saved, min_market_value=None):
         time.sleep(1)
     candidates.sort(key=lambda c: c["turnover"], reverse=True)
     candidates = candidates[:SHORTLIST]
-    turnover = median_turnover([c["ticker"] for c in candidates])
+    turnover = median_turnover([c["ticker"] for c in candidates],
+                               {c["ticker"] for c in candidates if c["isin"] in saved})
     ranked = sorted((c for c in candidates if c["ticker"] in turnover),
                     key=lambda c: turnover[c["ticker"]], reverse=True)
 
@@ -201,7 +210,7 @@ def main():
         sys.exit("Fewer stocks than wanted; stock_list.csv left unchanged.")
     if args.write:
         with open(LIST_PATH, "w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=COLUMNS, lineterminator="\n")
+            writer = csv.DictWriter(handle, fieldnames=COLUMNS)
             writer.writeheader()
             writer.writerows({key: row.get(key, "") for key in COLUMNS} for row in rows)
         print("Wrote", LIST_PATH)
