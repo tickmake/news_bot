@@ -51,24 +51,28 @@ def main() -> None:
     # 22:30, weekdays: after the Oslo, European and US closes.
     scheduler.add_job(job_holding_alerts, "cron", day_of_week="mon-fri", hour=22, minute=30)
     scheduler.add_job(job_monthly_scorecard, "cron", day=1, hour=8, minute=0)
-    # 03:00: the last US session closed hours ago, so its bar is final and the
-    # in-progress-bar guard will not discard it. Each run settles every row that
-    # has become computable, not just yesterday's, so a night the Pi spends down
-    # costs nothing -- the backlog clears on the next run.
-    scheduler.add_job(job_settle_forward_test, "cron", hour=3, minute=0)
-    # 02:00 Tuesday to Saturday, after each weekday's sessions: our own copy of
-    # daily prices for the stock list (#75). 20:00 in New York, so US is final.
-    scheduler.add_job(job_load_prices_and_check, "cron", day_of_week="tue-sat", hour=2, minute=0)
+    # 06:30 and 18:30 (#89). In the small hours Yahoo often has no finished bar
+    # yet for the day before: at 02:00-03:00 US results stayed pending although
+    # the session had closed, and European ones failed on empty bars that were
+    # fine by afternoon. By 06:30 (00:30 in New York) the bars are in; the 18:30
+    # run retries whatever was still missing. Each run settles every row that
+    # has become computable, so a missed run costs nothing.
+    scheduler.add_job(job_settle_forward_test, "cron", hour="6,18", minute=30)
+    # 06:00 Tuesday to Saturday, after each weekday's sessions: our own copy of
+    # daily prices for the stock list (#75). Midnight in New York; at 02:00 the
+    # US bar for the day was often still missing (#89).
+    scheduler.add_job(job_load_prices_and_check, "cron", day_of_week="tue-sat", hour=6, minute=0)
     # Sunday 05:00: company numbers from annual reports change a few times a
     # year, so weekly is plenty, and it stays clear of the weekday jobs (#76).
     scheduler.add_job(job_load_company_numbers_and_check, "cron", day_of_week="sun", hour=5, minute=0)
     # 02:30: analyst estimates and company numbers, before the 04:00 backup.
     scheduler.add_job(job_save_snapshots, "cron", hour=2, minute=30)
-    # Same idea for the picks actually sent to Slack/Telegram; half an hour
-    # later so the two jobs do not hit the price provider at the same time.
-    scheduler.add_job(job_settle_published_picks, "cron", hour=3, minute=30)
-    # 04:00: after both settle jobs, so the snapshot carries that night's
-    # outcomes. Separate jobs rather than one chained call because a settle
+    # Same idea for the picks actually sent to Slack/Telegram; a quarter of an
+    # hour later so the two jobs do not hit the price provider at the same time.
+    scheduler.add_job(job_settle_published_picks, "cron", hour="6,18", minute=45)
+    # 04:00, before the host copies backups to the NAS at 04:30. Outcomes the
+    # morning settle adds are in the next night's copy; they can be worked out
+    # again anyway. Separate jobs rather than one chained call because a settle
     # that fails should still be followed by a backup -- the rows already in
     # the archive are what is irreplaceable.
     scheduler.add_job(job_backup_trade_history, "cron", hour=4, minute=0)
