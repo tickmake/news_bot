@@ -114,6 +114,9 @@ def home() -> None:
     st.plotly_chart(fig, width="stretch")
     st.caption('"After fees" assumes 0.10% per buy and per sell. Real DNB fees are higher '
                "on small trades (59 NOK minimum). Data is at most a minute old.")
+    st.subheader("The data behind it")
+    for page in DATA_PAGES:
+        st.page_link(page)
 
 
 def latest_screen() -> None:
@@ -441,6 +444,90 @@ def what_if() -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+NUMBER_LABELS = {
+    "revenue": "Revenue", "operating_profit": "Operating profit", "net_profit": "Net profit",
+    "equity": "Equity", "total_debt": "Debt", "cash": "Cash", "total_assets": "Total assets",
+    "operating_cash_flow": "Operating cash flow", "gross_profit": "Gross profit",
+    "current_assets": "Current assets", "current_liabilities": "Current liabilities",
+    "shares_outstanding": "Shares outstanding",
+}
+SOURCE_LABELS = {"esef": "Annual report (ESEF filing)", "yahoo": "Yahoo Finance"}
+
+
+def prices_kept() -> None:
+    st.title("Prices we keep")
+    st.write("One line per stock. Every stock should end on the last trading day; one that "
+             "stops earlier means the nightly price load is failing for it.")
+    df = query("SELECT symbol, MIN(session_date) AS first_day, MAX(session_date) AS last_day, "
+               "COUNT(*) AS days FROM daily_prices GROUP BY symbol ORDER BY symbol")
+    if df.empty:
+        st.info("No daily prices saved yet.")
+        return
+    # The day most stocks end on is the last trading day loaded. Not the newest
+    # day: one stock on an exchange that traded a day later would put all others
+    # "behind".
+    newest = pd.to_datetime(df["last_day"]).mode().max()
+    behind = (newest - pd.to_datetime(df["last_day"])).dt.days.clip(lower=0)
+    df["status"] = behind.map(lambda d: "Up to date" if d == 0 else f"{d} days behind")
+    cols = st.columns(3)
+    cols[0].metric("Stocks", len(df))
+    cols[1].metric("Last trading day loaded", newest.strftime("%Y-%m-%d"))
+    cols[2].metric("Stocks behind", int((behind > 0).sum()))
+    st.dataframe(df.sort_values(["last_day", "symbol"]), hide_index=True, width="stretch",
+                 column_config={"symbol": "Stock", "first_day": "First day",
+                                "last_day": "Last day", "days": "Trading days",
+                                "status": "Status"})
+
+
+def company_numbers_page() -> None:
+    st.title("Company numbers")
+    st.write("Yearly numbers from annual reports, in billions. Each number shows where it "
+             "came from and the day it became public, which is the first day the bot may use it.")
+    symbols = query("SELECT DISTINCT symbol FROM company_numbers ORDER BY symbol")["symbol"].tolist()
+    if not symbols:
+        st.info("No company numbers saved yet.")
+        return
+    symbol = st.selectbox("Stock", symbols,
+                          index=symbols.index("EQNR.OL") if "EQNR.OL" in symbols else 0)
+    df = query("SELECT year_end, item, value, currency, source, known_from FROM company_numbers "
+               "WHERE symbol = ? ORDER BY year_end DESC", (symbol,))
+    money = df[df["item"] != "shares_outstanding"]
+    wide = (money.assign(value=money["value"] / 1e9)
+            .pivot_table(index="year_end", columns="item", values="value")
+            .sort_index(ascending=False))
+    order = [k for k in NUMBER_LABELS if k in wide]
+    st.dataframe(wide[order].rename(columns=NUMBER_LABELS).round(2), width="stretch")
+    currency = df["currency"].dropna().iloc[0] if df["currency"].notna().any() else ""
+    st.caption(f"Billions of {currency}, by financial year end.")
+    st.subheader("Where each number came from")
+    detail = df.assign(item=df["item"].map(NUMBER_LABELS).fillna(df["item"]),
+                       source=df["source"].map(SOURCE_LABELS).fillna(df["source"]),
+                       value=df.apply(lambda r: _big(r["value"]), axis=1))
+    detail = detail.sort_values(["year_end", "item"], ascending=[False, True])
+    st.dataframe(detail[["year_end", "item", "value", "source", "known_from"]], hide_index=True,
+                 width="stretch", column_config={"year_end": "Year end", "item": "Number",
+                                                 "value": "Value", "source": "Source",
+                                                 "known_from": "Public from"})
+
+
+def money_put_in() -> None:
+    st.title("Money put in")
+    df = query("SELECT deposit_date, amount_nok FROM deposits ORDER BY deposit_date DESC, id DESC")
+    if df.empty:
+        st.info("No deposits saved yet. Send /deposit in Telegram when you add money.")
+        return
+    cols = st.columns(2)
+    cols[0].metric("Total put in", f"{df['amount_nok'].sum():,.0f} NOK")
+    cols[1].metric("Deposits", len(df))
+    st.dataframe(df.round(0), hide_index=True, width="stretch",
+                 column_config={"deposit_date": "Day", "amount_nok": "Amount (NOK)"})
+
+
+DATA_PAGES = [
+    st.Page(prices_kept, title="Prices we keep", icon="🗓️", url_path="prices-kept"),
+    st.Page(company_numbers_page, title="Company numbers", icon="🧾", url_path="company-numbers"),
+    st.Page(money_put_in, title="Money put in", icon="🏦", url_path="money-put-in"),
+]
 pages = [
     st.Page(home, title="Home", icon="🏠", default=True),
     st.Page(latest_screen, title="Latest screen", icon="🔎", url_path="latest-screen"),
@@ -450,5 +537,6 @@ pages = [
     st.Page(data_collected, title="Data collected", icon="🗂️", url_path="data-collected"),
     st.Page(my_money, title="My money", icon="💰", url_path="my-money"),
     st.Page(what_if, title="What-if filters", icon="🎛️", url_path="what-if"),
+    *DATA_PAGES,
 ]
 st.navigation(pages).run()
