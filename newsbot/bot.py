@@ -18,7 +18,7 @@ from newsbot.commands import (
 )
 from newsbot.config import SETTINGS, get_missing_required_config
 from newsbot.forward_test import job_settle_forward_test
-from newsbot.score_inputs import job_build_score_inputs
+from newsbot.scores import job_build_scores
 from newsbot.history_store import job_settle_published_picks
 from newsbot.data_checks import job_load_company_numbers_and_check, job_load_prices_and_check
 from newsbot.holding_alerts import job_holding_alerts
@@ -66,9 +66,9 @@ def main() -> None:
     # Sunday 05:00: company numbers from annual reports change a few times a
     # year, so weekly is plenty, and it stays clear of the weekday jobs (#76).
     scheduler.add_job(job_load_company_numbers_and_check, "cron", day_of_week="sun", hour=5, minute=0)
-    # Sunday 07:30: score inputs per month end (#145), after that morning's
-    # company numbers (05:00) and prices (06:00 on weekdays, so Saturday's).
-    scheduler.add_job(job_build_score_inputs, "cron", day_of_week="sun", hour=7, minute=30)
+    # Sunday 07:30: score inputs per month end (#145), then the four company
+    # scores (#146-#150), after that morning's company numbers (05:00).
+    scheduler.add_job(job_build_scores, "cron", day_of_week="sun", hour=7, minute=30)
     # 02:30: analyst estimates and company numbers, before the 04:00 backup.
     scheduler.add_job(job_save_snapshots, "cron", hour=2, minute=30)
     # Same idea for the picks actually sent to Slack/Telegram; a quarter of an

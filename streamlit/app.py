@@ -308,6 +308,24 @@ def one_stock() -> None:
                 ["| | |\n|:--|--:|\n", ""]))
             if snap.empty:
                 st.caption("No analyst snapshot for this stock.")
+        with st.container(border=True):
+            st.markdown("**Scores** (0-100 vs similar stocks)")
+            try:
+                sc = query("SELECT month_end, quality, value, performance, momentum "
+                           "FROM company_scores WHERE symbol = ? ORDER BY month_end DESC LIMIT 1",
+                           (symbol,))
+            except Exception:  # the table is made by the bot's first Sunday run
+                sc = pd.DataFrame()
+            if sc.empty:
+                st.caption("No scores for this stock yet.")
+            else:
+                r = sc.iloc[0]
+                st.markdown("| | |\n|:--|--:|\n" + "\n".join(
+                    f"| {label} | **{_num(r[col], '{:.0f}')}** |" for label, col in (
+                        ("Quality", "quality"), ("Value", "value"),
+                        ("Company performance", "performance"), ("Momentum", "momentum"))))
+                st.caption(f"End of {r['month_end']}. 100 = best of the group. Information only, "
+                           "not tested yet.")
 
     tab_numbers, tab_bot = st.tabs(["Company numbers", "The bot and this stock"])
     with tab_numbers:
