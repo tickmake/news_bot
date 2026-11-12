@@ -16,5 +16,5 @@ __pycache__/
 .venv_test/
 .ruff_cache/
 docs/
-test_*.py
+tests/
 *.md

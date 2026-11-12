@@ -41,7 +41,7 @@ The bot is built in Python and scheduled with APScheduler.
   - `indicators`, `ranking`, `benchmarks`, `history_store`, `screener`, `charts` - the trade screener
   - `backtest`, `backtest_reports` - the walk-forward engine and the `/performance` and `/diagnostics` reports
   - `reports`, `briefing`, `commands`, `bot` - weekly picks and analysis, the briefing and scheduled jobs, command routing and polling, startup
-- `test_news_bot.py` - unit tests
+- `tests/` - unit tests (`python -m unittest`)
 - `evaluation_universe.csv` - the fixed `broad-v1` evaluation basket
 - `requirements.txt` - Python dependencies
 - `Dockerfile` - container image definition
