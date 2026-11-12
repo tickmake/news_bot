@@ -28,7 +28,10 @@ from newsbot.logsetup import APP_LOG, SYS_LOG
 from newsbot.state import TRADE_HISTORY_LOCK
 from newsbot.util import _with_retry
 
-FIRST_LOAD_PERIOD = "2y"
+FIRST_LOAD_PERIOD = "10y"
+# Stocks first loaded with the old 2-year period get the rest once (testing
+# the scores on history needs it); the table remembers who has had it.
+_BACKFILL_TABLE = "CREATE TABLE IF NOT EXISTS price_backfill_done (symbol TEXT PRIMARY KEY, period TEXT NOT NULL)"
 CATCH_UP_PERIOD = "1mo"
 # Fewer saved sessions than this means the old ticker's history is still missing.
 SHORT_HISTORY_SESSIONS = 250
@@ -153,11 +156,47 @@ def load_previous_tickers(symbols: List[str]) -> int:
     return added
 
 
+def _mark_backfilled(symbols: List[str]) -> None:
+    with TRADE_HISTORY_LOCK:
+        conn = _connection()
+        conn.execute(_BACKFILL_TABLE)
+        with conn:
+            conn.executemany("INSERT OR REPLACE INTO price_backfill_done VALUES (?, ?)",
+                             [(symbol, FIRST_LOAD_PERIOD) for symbol in symbols])
+
+
+def backfill(symbols: List[str]) -> int:
+    """Load FIRST_LOAD_PERIOD of history once for every stock that has not had it. Returns rows added.
+
+    Saved bars are kept (INSERT OR IGNORE); only older days are added.
+    """
+    with TRADE_HISTORY_LOCK:
+        conn = _connection()
+        conn.execute(_BACKFILL_TABLE)
+        done = {row[0] for row in conn.execute(
+            "SELECT symbol FROM price_backfill_done WHERE period = ?", (FIRST_LOAD_PERIOD,))}
+    added = 0
+    for symbol in symbols:
+        if symbol in done:
+            continue
+        try:
+            history, currency = _fetch(symbol, FIRST_LOAD_PERIOD)
+            count = save_prices(symbol, history, currency)
+        except Exception as exc:
+            SYS_LOG.warning("price_backfill_failed symbol=%s detail=%s", symbol, exc)
+            continue
+        _mark_backfilled([symbol])
+        APP_LOG.info("price_backfill symbol=%s new_rows=%d", symbol, count)
+        added += count
+    return added
+
+
 def load_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     """Load every listed stock. Returns a summary the data check (#77) reads."""
     symbols = symbols if symbols is not None else stock_list.tickers()
     known = latest_dates()
     summary: Dict[str, Any] = {"new_rows": 0, "failed": [], "no_new_price": []}
+    first_loads = []
     for symbol in symbols:
         try:
             history, currency = _fetch(symbol, CATCH_UP_PERIOD if symbol in known else FIRST_LOAD_PERIOD)
@@ -166,10 +205,14 @@ def load_prices(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
             SYS_LOG.warning("price_load_failed symbol=%s detail=%s", symbol, exc)
             summary["failed"].append(symbol)
             continue
+        if symbol not in known:
+            first_loads.append(symbol)
         summary["new_rows"] += added
         if added == 0:
             summary["no_new_price"].append(symbol)
     summary["new_rows"] += load_previous_tickers(symbols)
+    _mark_backfilled(first_loads)   # a first load already took the full period
+    summary["new_rows"] += backfill([s for s in symbols if s not in summary["failed"]])
     return summary
 
 

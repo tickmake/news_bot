@@ -38,11 +38,11 @@ class PriceStoreTests(unittest.TestCase):
         return self.store._connection().execute(
             "SELECT symbol, session_date, close, adj_close, currency FROM daily_prices ORDER BY 1, 2").fetchall()
 
-    def test_first_load_takes_two_years_then_only_catches_up(self):
+    def test_first_load_takes_ten_years_then_only_catches_up(self):
         with self._fake_fetch({"EQNR.OL": _bars(["2026-11-09", "2026-11-10"], [380.0, 382.0])}):
             summary = price_store.load_prices(["EQNR.OL"])
         self.assertEqual(summary["new_rows"], 2)
-        self.assertEqual(self.periods, [("EQNR.OL", "2y")])
+        self.assertEqual(self.periods, [("EQNR.OL", "10y")])
         with self._fake_fetch({"EQNR.OL": _bars(["2026-11-10", "2026-11-11"], [999.0, 385.0])}):
             summary = price_store.load_prices(["EQNR.OL"])
         self.assertEqual(self.periods[-1], ("EQNR.OL", "1mo"))
@@ -92,7 +92,20 @@ class PriceStoreTests(unittest.TestCase):
                 self._fake_fetch({"CDLR.OL": _bars(["2026-11-11"], [63.0])}):
             summary = price_store.load_prices(["CDLR.OL", "EQNR.OL"])
         self.assertEqual((summary["new_rows"], summary["failed"]), (1, ["EQNR.OL"]))
-        self.assertIn(("CADLR.OL", "2y"), self.periods)
+        self.assertIn(("CADLR.OL", "10y"), self.periods)
+
+    def test_stocks_loaded_before_get_ten_years_once(self):
+        with self._fake_fetch({"EQNR.OL": _bars(["2026-11-10"], [380.0])}):
+            price_store.load_prices(["EQNR.OL"])
+        with price_store.TRADE_HISTORY_LOCK:   # as on the Pi: loaded with 2 years, never backfilled
+            price_store._connection().execute("DELETE FROM price_backfill_done")
+        old = _bars(["2017-01-02", "2026-11-10", "2026-11-11"], [100.0, 999.0, 385.0])
+        with self._fake_fetch({"EQNR.OL": old}):
+            first = price_store.load_prices(["EQNR.OL"])
+            second = price_store.load_prices(["EQNR.OL"])
+        self.assertEqual(self.periods[-3:], [("EQNR.OL", "1mo"), ("EQNR.OL", "10y"), ("EQNR.OL", "1mo")])
+        self.assertEqual((first["new_rows"], second["new_rows"]), (2, 0))
+        self.assertEqual(self._rows()[1][2], 380.0)   # the saved 2026-11-10 bar is kept
 
 
 if __name__ == "__main__":
