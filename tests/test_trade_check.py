@@ -81,8 +81,9 @@ class CheckTests(unittest.TestCase):
         with patch.object(trade_check.market_data, "_next_ex_dividend_date",
                           return_value=TODAY + timedelta(days=3)):
             text = self.check("EQNR.OL 12000")
-        self.assertIn("⚠️ Earnings report in 9 days (Nov 20), inside a 2-4 week hold. "
+        self.assertIn("Earnings report in 9 days (Nov 20), inside a 2-4 week hold. "
                       "Its report days moved ±4.5% on average.", text)
+        self.assertNotIn("⚠️ Earnings", text)   # tested, did not help (#125)
         self.assertIn("Ex-dividend in 3 days (Nov 14)", text)
 
     def test_overlap_with_holdings(self):
@@ -92,7 +93,8 @@ class CheckTests(unittest.TestCase):
                           return_value=[("HAFNI.OL", "EQNR.OL", 0.81, 60)]):
             text = self.check("HAFNI.OL 6000")
         self.assertIn("⛔ Not for ASK (company registered outside the EU/EEA, ISIN SG)", text)
-        self.assertIn("⚠️ Moves together with EQNR.OL (correlation 0.81): close to one bet.", text)
+        self.assertIn("Moves together with EQNR.OL (correlation 0.81).", text)
+        self.assertNotIn("⚠️ Moves together", text)
         self.assertNotIn("Same sector", text)
         text = self.check("EQNR.OL 3000")
         self.assertIn("You already hold 10 shares of EQNR.OL.", text)

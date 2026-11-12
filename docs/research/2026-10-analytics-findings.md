@@ -276,6 +276,42 @@ with each other, not with zero; entries 5 sessions apart overlap on 10- and 20-s
 holds, so there are fewer independent results than rows; currency exchange fees on
 non-NOK stocks are not included.
 
+## 9. Portfolio rules for 4 stocks held at once (issue #125, November 2026)
+
+`research/portfolio_rules_study.py` asks whether three simple rules cut the bad months
+of a 4-stock portfolio. No signal is involved, as in section 8. Every 20 sessions from 2017
+to 2026-09 (125 periods), 4 random stocks from `stock_list.csv` (96 with history) are held
+for 20 sessions, net of the 59 NOK fee each way. That's 400 random draws per period. Each
+rule picks from the same random order, skipping what it forbids, so the comparison is
+paired.
+
+| Rule | Net mean | Worst 5% of months | Months below -5% | vs random: mean | vs random: worst 5% |
+|---|---|---|---|---|---|
+| random 4 | +0.54 | -9.27 | 15.8% | - | - |
+| one per sector | +0.51 | -9.04 | 15.5% | -0.03 | **+0.24** |
+| no report in the first 7 days | +0.53 | -9.33 | 15.9% | -0.01 | -0.05 |
+| no pair correlated > 0.7 | +0.54 | -9.24 | 15.7% | -0.00 | +0.03 |
+| all three | +0.48 | -9.07 | 15.5% | -0.05 | +0.21 |
+
+To pass, a rule had to lift the worst 5% by at least 0.1 points at a cost of at most
+0.1 points of mean, in both the first part (before 2021-11) and the check part.
+
+1. **One stock per sector passes, just.** The worst 5% of months is +0.28 points better
+   in the first part and +0.20 in the check part, at a cost of +0.03 and -0.09 points of
+   mean. It changes the portfolio in 57% of draws. It stays a warning in `/check`.
+2. **Avoiding earnings weeks does not help.** The tail is slightly worse in both parts
+   (-0.05, -0.02). A report moves a stock both ways, so skipping it removes good surprises
+   as often as bad ones. `/check` now shows the date as information, not a warning.
+3. **The correlation rule almost never matters.** Fewer than 1% of stock pairs correlated
+   above 0.7 over 60 sessions, so it changed only 10% of portfolios, and the effect is
+   noise (+0.01 / +0.05). `/check` still shows a high correlation, without a warning.
+4. **Sizes are small.** Even the sector rule moves the worst month by about a quarter of
+   a point out of -9%. With 4 stocks, a bad month is mostly the market, and no
+   diversification rule removes that.
+
+Caveats: today's stock list (survivors only), random entries rather than the bot's picks,
+and no currency fees.
+
 ## Conclusions
 
 1. Daily price gates, classic factors and earnings surprises show **no reliable edge**
