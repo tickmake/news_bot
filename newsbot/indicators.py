@@ -168,8 +168,8 @@ def _drop_unfinished_bar(history: Any, now: Optional[datetime] = None) -> Any:
     """Drop the final row only while that exchange's day is still running.
 
     For scoring results, not for the screen. `_drop_in_progress_bar` drops
-    every bar dated today on purpose; the nightly settle jobs run at 03:00
-    Oslo time, when it is still the previous evening in New York, so that
+    every bar dated today on purpose; the settle jobs run in the early
+    morning Oslo time, when it is still the previous evening in New York, so that
     rule threw away a finished US session and every US result came a night
     late (#89).
     """
