@@ -4,7 +4,7 @@ from datetime import datetime
 from html import escape
 from typing import Any, List, Optional
 
-from newsbot import data_health, history_store, indicators, market_data, report_card, risk_forecast, risk as risk_analytics
+from newsbot import data_health, history_store, indicators, market_data, report_card, risk_forecast, scores, risk as risk_analytics
 from newsbot.config import SETTINGS
 from newsbot.logsetup import SYS_LOG
 from newsbot.market_data import _as_float
@@ -290,6 +290,14 @@ def build_ticker_analysis(raw_symbol: str) -> str:
     except Exception as exc:  # a bad row must not cost the rest of the report
         SYS_LOG.warning("report_card_failed symbol=%s detail=%s", symbol, exc)
         lines.append("<b>Report card</b>\nNot available right now.")
+    lines.append("")
+
+    # 8c. The four company scores (#151).
+    try:
+        lines.extend(scores.build_scores_section(symbol))
+    except Exception as exc:
+        SYS_LOG.warning("scores_failed symbol=%s detail=%s", symbol, exc)
+        lines.append("<b>Scores</b>\nNot available right now.")
     lines.append("")
 
     # 9. Explicit gaps, per the framework's own rule against inventing numbers.
