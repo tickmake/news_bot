@@ -51,7 +51,17 @@ git log --oneline "$old..origin/main" | sed 's/^/  /'
 say "1/5 Tag rollback image"
 stamp=$(date +%Y%m%d-%H%M)
 rollback="$image_repo:rollback-$stamp-$old"
-docker tag "$(docker inspect -f '{{.Image}}' "$container")" "$rollback"
+running_id=$(docker inspect -f '{{.Image}}' "$container")
+if docker image inspect "$running_id" >/dev/null 2>&1; then
+    docker tag "$running_id" "$rollback"
+else
+    # The running container's image can be gone from the store (an image
+    # prune removes it once it is untagged, even while it runs). The newest
+    # build is the closest thing left to roll back to.
+    echo "WARNING: the running image ${running_id#sha256:} is no longer stored;"
+    echo "         tagging the newest build ($image:latest) as the rollback instead."
+    docker tag "$image:latest" "$rollback"
+fi
 echo "Rollback image: $rollback"
 
 # --- 2. .env copy and database backup -----------------------------------------
