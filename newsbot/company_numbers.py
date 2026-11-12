@@ -2,7 +2,9 @@
 
 Source order, per #73:
 1. The EU annual-report database (ESEF, filings.xbrl.org). Free, official,
-   and has the date each report was added, which becomes `known_from`.
+   and has the date each report was added to it. That is often months after
+   the report came out, so `known_from` is that date or the legal deadline
+   for publishing (4 months after the year end), whichever is earlier.
 2. Yahoo's yearly financials for what ESEF lacks (German companies, items a
    company tags its own way, US stocks). Yahoo has no publication date, so
    `known_from` is set to 4 months after the year end, a conservative guess.
@@ -65,6 +67,10 @@ YAHOO_ROWS = {
     "gross_profit": ("income_stmt", "Gross Profit"),
 }
 YAHOO_KNOWN_AFTER = timedelta(days=120)
+# EU listed companies must publish the annual report within 4 months of the
+# year end (Transparency Directive, art. 4). filings.xbrl.org often adds it
+# months later, which would hold a number back long after it was public.
+ESEF_KNOWN_BY = timedelta(days=120)
 YEARS_WANTED = 4
 _HEADERS = {"User-Agent": "news-bot (github.com/tickmake/news_bot)", "Accept": "application/json"}
 _TIMEOUT = 60
@@ -89,7 +95,7 @@ _TABLES = (
 )
 
 # Bump when saved rows were read wrongly, and say in _migrate what is redone.
-VERSION = 2
+VERSION = 3
 
 
 def _migrate(conn) -> None:
@@ -98,14 +104,18 @@ def _migrate(conn) -> None:
     Version 2 (#111): ESEF profit and equity were the totals including minority
     owners. Those rows go, and every filing is read again on the next run, which
     only adds what is missing. Share counts from Yahoo had a currency by mistake.
+    Version 3: ESEF `known_from` is capped at the 4-month publishing deadline.
     """
     row = conn.execute("SELECT MAX(version) FROM company_numbers_version").fetchone()
     if row[0] is not None and row[0] >= VERSION:
         return
     with conn:
-        conn.execute("DELETE FROM company_numbers WHERE source = 'esef' AND item IN ('net_profit', 'equity')")
-        conn.execute("DELETE FROM esef_filings_read")
-        conn.execute("UPDATE company_numbers SET currency = NULL WHERE item = 'shares_outstanding'")
+        if row[0] is None or row[0] < 2:
+            conn.execute("DELETE FROM company_numbers WHERE source = 'esef' AND item IN ('net_profit', 'equity')")
+            conn.execute("DELETE FROM esef_filings_read")
+            conn.execute("UPDATE company_numbers SET currency = NULL WHERE item = 'shares_outstanding'")
+        conn.execute("UPDATE company_numbers SET known_from = MIN(known_from, DATE(year_end, ?)) "
+                     "WHERE source = 'esef'", (f"+{ESEF_KNOWN_BY.days} days",))
         conn.execute("DELETE FROM company_numbers_version")
         conn.execute("INSERT INTO company_numbers_version VALUES (?)", (VERSION,))
     APP_LOG.info("company_numbers_migrated version=%d", VERSION)
@@ -220,7 +230,9 @@ def load_esef(symbol: str, isin: str) -> int:
             continue
         doc = _get_json("https://filings.xbrl.org" + attrs["json_url"])
         values, year_end = esef_values(doc, attrs["period_end"])
-        known_from = (attrs.get("date_added") or attrs.get("processed") or "")[:10] or year_end
+        added = (attrs.get("date_added") or attrs.get("processed") or "")[:10]
+        deadline = (date.fromisoformat(year_end) + ESEF_KNOWN_BY).isoformat()
+        known_from = min(added, deadline) if added else deadline
         saved += _save(symbol, year_end, values, "esef", known_from)
         with TRADE_HISTORY_LOCK:
             conn = _connection()

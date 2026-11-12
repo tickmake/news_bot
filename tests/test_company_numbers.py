@@ -87,7 +87,8 @@ class LoadTests(unittest.TestCase):
             cn.load_company_numbers([row])
         self.assertEqual(self.downloads, 1)
         rows = self._rows()
-        self.assertEqual(rows["revenue"], (103.77e9, "esef", "2025-05-08"))
+        # Added 2025-05-08, but it had to be public by 2025-04-30.
+        self.assertEqual(rows["revenue"], (103.77e9, "esef", "2025-04-30"))
         self.assertEqual(rows["operating_profit"], (2.0, "yahoo", "2025-04-30"))
         self.assertEqual(rows["total_debt"], (30.1e9, "yahoo", "2025-04-30"))
         self.assertNotIn("shares_outstanding", rows)
@@ -125,6 +126,23 @@ class LoadTests(unittest.TestCase):
             conn.execute("INSERT INTO esef_filings_read VALUES ('f1', 'ACA.PA')")
         conn = cn._connection()
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM company_numbers WHERE item = 'equity'").fetchone(), (1,))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM esef_filings_read").fetchone(), (1,))
+
+    def test_version_3_caps_esef_dates_at_the_deadline_and_keeps_the_rest(self):
+        conn = self.store._connection()
+        for table in cn._TABLES:
+            conn.execute(table)
+        with conn:   # a version-2 database
+            conn.execute("INSERT INTO company_numbers_version VALUES (2)")
+            conn.executemany("INSERT INTO company_numbers VALUES (?, '2024-12-31', ?, 1.0, 'EUR', ?, ?, 'x')", [
+                ("ACA.PA", "net_profit", "esef", "2025-10-21"), ("ACA.PA", "revenue", "esef", "2025-03-06"),
+                ("IFX.DE", "net_profit", "yahoo", "2025-04-30")])
+            conn.execute("INSERT INTO esef_filings_read VALUES ('f1', 'ACA.PA')")
+        conn = cn._connection()
+        self.assertEqual(sorted(conn.execute("SELECT symbol, item, known_from FROM company_numbers")), [
+            ("ACA.PA", "net_profit", "2025-04-30"), ("ACA.PA", "revenue", "2025-03-06"),
+            ("IFX.DE", "net_profit", "2025-04-30")])
+        # Version 2's redo does not run again: the filing stays read.
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM esef_filings_read").fetchone(), (1,))
 
     def test_us_stocks_skip_esef_and_failures_are_listed(self):
