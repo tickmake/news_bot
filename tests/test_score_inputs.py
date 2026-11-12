@@ -75,12 +75,14 @@ class ScoreInputTests(unittest.TestCase):
 
     def test_build_writes_every_finished_month_and_can_run_again(self):
         today = date(2025, 3, 15)
-        self.assertEqual(si.build(["EQNR.OL"], today, self.fx), 4)  # Nov, Dec, Jan, Feb
-        self.assertEqual(si.build(["EQNR.OL"], today, self.fx), 4)
+        # From the first month anything was known (the 2022 report, public
+        # 2023-04-30) to the last finished month; months with nothing are skipped.
+        self.assertEqual(si.build(["EQNR.OL"], today, self.fx), 23)
+        self.assertEqual(si.build(["EQNR.OL"], today, self.fx), 23)
         with price_store.TRADE_HISTORY_LOCK:
             rows = si._connection().execute(
                 "SELECT month_end, year_end, numbers_json FROM score_inputs ORDER BY month_end").fetchall()
-        self.assertEqual([r[0] for r in rows], ["2024-11-30", "2024-12-31", "2025-01-31", "2025-02-28"])
+        self.assertEqual((rows[0][0], rows[-1][0]), ("2023-04-30", "2025-02-28"))
         self.assertEqual(json.loads(rows[-1][2])["net_profit"], 12.0)
 
     def test_an_old_exchange_rate_is_not_used(self):

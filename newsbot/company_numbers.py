@@ -71,7 +71,8 @@ YAHOO_KNOWN_AFTER = timedelta(days=120)
 # year end (Transparency Directive, art. 4). filings.xbrl.org often adds it
 # months later, which would hold a number back long after it was public.
 ESEF_KNOWN_BY = timedelta(days=120)
-YEARS_WANTED = 4
+# ESEF filing started with the 2020 accounts; earlier years are not there.
+YEARS_WANTED = 7
 _HEADERS = {"User-Agent": "news-bot (github.com/tickmake/news_bot)", "Accept": "application/json"}
 _TIMEOUT = 60
 

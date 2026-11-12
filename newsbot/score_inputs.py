@@ -21,8 +21,9 @@ from newsbot import company_numbers, price_store, report_card, stock_list
 from newsbot.logsetup import APP_LOG, SYS_LOG
 from newsbot.state import TRADE_HISTORY_LOCK
 
-# Our own prices start here (#75); there is nothing to score before it.
-FIRST_MONTH_END = date(2024, 11, 30)
+# Ten years of prices are kept (backfilled in November 2026); momentum needs
+# a year of them, and annual-report numbers start with the 2020 accounts.
+FIRST_MONTH_END = date(2017, 1, 31)
 
 _TABLE = """
     CREATE TABLE IF NOT EXISTS score_inputs (
