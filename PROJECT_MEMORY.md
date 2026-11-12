@@ -9,7 +9,7 @@ is a thin entry point; the application lives in the `newsbot/` package, one
 module per concern: config, state, logging, messaging, news and market data, the
 screener, risk analytics and relative strength, backtest and reports, briefing,
 commands and startup. Settings are validated with Pydantic Settings. Tests are
-`unittest` files named `test_*.py`. Docker Compose is the deployment path, with
+`unittest` files named `tests/test_*.py`. Docker Compose is the deployment path, with
 SQLite trade history and bot state on the `news_bot_data` volume.
 
 An optional one-way Slack mirror sends text through an incoming webhook; chart
@@ -63,7 +63,7 @@ than ranked 1-5.
   and 3.14 with `ResourceWarning` as an error (floor in `.coveragerc`), and a docker job.
   Dependabot proposes dependency, Docker and Actions updates.
 - Tests must never reach the network; features that call yfinance are switched off
-  in `test_news_bot.py` and mocked in their own tests.
+  in `tests/test_news_bot.py` and mocked in their own tests.
 
 ## Useful project commands and files
 

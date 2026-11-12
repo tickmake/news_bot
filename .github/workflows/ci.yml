@@ -30,7 +30,7 @@ jobs:
       - name: Lint (rules in ruff.toml)
         run: |
           pip install ruff
-          ruff check news_bot.py newsbot test_*.py
+          ruff check news_bot.py newsbot tests
 
       - name: Audit pinned dependencies
         run: |
