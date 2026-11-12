@@ -71,7 +71,9 @@ def _event_lines(symbol: str, profile: Dict[str, Any], forecast: Optional[risk_f
     if days is not None and 0 <= days <= EVENT_DAYS:
         moved = (f" Its report days moved ±{forecast.earnings_move_pct:.1f}% on average."
                  if forecast is not None and forecast.earnings_move_pct is not None else "")
-        lines.append(f"    ⚠️ Earnings report in {days} days ({earnings:%b %d}), inside a 2-4 week hold.{moved}")
+        # Information, not a warning: skipping stocks with a report in the
+        # first week of the hold did not cut the bad months (#125).
+        lines.append(f"    Earnings report in {days} days ({earnings:%b %d}), inside a 2-4 week hold.{moved}")
     elif days is not None:
         lines.append(f"    Next earnings report: {earnings:%b %d, %Y}, after a 4-week hold.")
     else:
@@ -98,7 +100,9 @@ def _overlap_lines(symbol: str, sector: Optional[str], holdings: Dict[str, Dict[
     others = [held for held in sorted(holdings) if held != symbol]
     same = [held for held in others if sector and _sector(held, _profile(held)) == sector]
     if same:
-        lines.append(f"    ⚠️ Same sector ({escape(sector)}) as {escape(', '.join(same))}.")
+        # The one portfolio rule that held up in testing (#125).
+        lines.append(f"    ⚠️ Same sector ({escape(sector)}) as {escape(', '.join(same))}. One stock per "
+                     "sector made the worst months a little less bad in ten years of tests.")
     try:
         pairs = risk.correlated_pairs([symbol, *others]) if others else []
     except Exception as exc:
@@ -107,7 +111,9 @@ def _overlap_lines(symbol: str, sector: Optional[str], holdings: Dict[str, Dict[
     for first, second, value, _sessions in pairs:
         if symbol in (first, second):
             other = second if first == symbol else first
-            lines.append(f"    ⚠️ Moves together with {escape(other)} (correlation {value:.2f}): close to one bet.")
+            # Information, not a warning: avoiding such pairs did not cut the
+            # bad months (#125); fewer than 1 in 100 pairs move this closely.
+            lines.append(f"    Moves together with {escape(other)} (correlation {value:.2f}).")
     if not lines:
         lines.append(f"    No overlap with what you hold ({escape(', '.join(others))}).")
     return lines

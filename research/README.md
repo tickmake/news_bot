@@ -29,6 +29,9 @@ python research/gap_risk.py /tmp/basket.pkl                                # how
 # 5. Hold length and sell rule after DNB fees (issue #122)
 python research/fetch_stock_list.py /tmp/stock_list_10y.pkl                # stock_list.csv, ten years
 python research/hold_exit_study.py /tmp/stock_list_10y.pkl                 # 5/10/20 sessions x time/stop/wide/trail
+
+# 6. Portfolio rules for 4 stocks held at once (issue #125)
+python research/portfolio_rules_study.py /tmp/stock_list_10y.pkl /tmp/earnings_dates.pkl   # sector / earnings / correlation
 ```
 
 `pit_coverage.py` needs the current-members page saved alongside the snapshots
