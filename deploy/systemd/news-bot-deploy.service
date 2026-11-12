@@ -1,0 +1,12 @@
+# Runs scripts/deploy.sh once. Started by news-bot-deploy.timer.
+# Installed by scripts/install_autodeploy.sh as a systemd *user* unit.
+[Unit]
+Description=Deploy news_bot when main has moved
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/news_bot
+ExecStart=%h/news_bot/scripts/deploy.sh
+# A build on the Pi can take several minutes.
+TimeoutStartSec=30min
