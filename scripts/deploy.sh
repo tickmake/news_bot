@@ -57,7 +57,10 @@ flock -n 9 || { echo "Another deploy is running; skipping."; exit 0; }
 [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || die "checkout is not on main"
 if ! git diff --quiet || ! git diff --cached --quiet; then die "tracked files have local changes (git status)"; fi
 git fetch -q origin main
-old=$(git rev-parse --short HEAD)
+# Compare with what was last deployed, not with HEAD: a manual `git pull` moves
+# HEAD without rebuilding, and the timer would then never deploy that change.
+marker=.git/news_bot_deployed
+old=$(git rev-parse --short "$(cat "$marker" 2>/dev/null || echo HEAD)")
 new=$(git rev-parse --short origin/main)
 if [ "$old" = "$new" ] && [ "${FORCE:-0}" != 1 ]; then
     echo "Already at origin/main ($old). Nothing to deploy; FORCE=1 to rebuild anyway."
@@ -142,4 +145,5 @@ EOF
 [ "$status" = healthy ] || die "bot is $status after deploying $new. Roll back on the Pi: git checkout -q $old && cp -p $env_copy .env && docker tag $rollback $image && docker compose up -d --no-build --force-recreate $SERVICE"
 echo
 echo "Deployed $new."
+git rev-parse HEAD >"$marker"
 notify "news_bot deployed $new ($(git log -1 --format=%s)). Bot healthy after ${waited}s.$([ -n "$errors" ] && echo ' Errors in the log, check it.')"
