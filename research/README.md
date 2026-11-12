@@ -30,6 +30,10 @@ python research/gap_risk.py /tmp/basket.pkl                                # how
 python research/fetch_stock_list.py /tmp/stock_list_10y.pkl                # stock_list.csv, ten years
 python research/hold_exit_study.py /tmp/stock_list_10y.pkl                 # 5/10/20 sessions x time/stop/wide/trail
 
+# 7. The four company scores on history (Phase 3a, #79). Needs a copy of the bot's database
+#    with 10 years of prices (PR #156): see "Backups off the Pi" in the main README.
+python research/score_backtest.py /tmp/news_bot.db                          # top third vs all vs bottom third
+
 # 6. Portfolio rules for 4 stocks held at once (issue #125)
 python research/portfolio_rules_study.py /tmp/stock_list_10y.pkl /tmp/earnings_dates.pkl   # sector / earnings / correlation
 ```

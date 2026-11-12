@@ -324,8 +324,9 @@ def one_stock() -> None:
                     f"| {label} | **{_num(r[col], '{:.0f}')}** |" for label, col in (
                         ("Quality", "quality"), ("Value", "value"),
                         ("Company performance", "performance"), ("Momentum", "momentum"))))
-                st.caption(f"End of {r['month_end']}. 100 = best of the group. Information only, "
-                           "not tested yet.")
+                st.caption(f"End of {r['month_end']}. 100 = best of the group. They describe the "
+                           "company: tested on 2021-2026, none picked shares that did better "
+                           "over the next month.")
 
     tab_numbers, tab_bot = st.tabs(["Company numbers", "The bot and this stock"])
     with tab_numbers:
