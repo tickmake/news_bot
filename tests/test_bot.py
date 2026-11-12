@@ -97,6 +97,9 @@ class SchedulerWiringTests(_MainHarness):
         numbers = jobs["job_load_company_numbers_and_check"]
         self.assertEqual((numbers.args[1], numbers.kwargs),
                          ("cron", {"day_of_week": "sun", "hour": 5, "minute": 0}))
+        inputs = jobs["job_build_score_inputs"]
+        self.assertEqual((inputs.args[1], inputs.kwargs),
+                         ("cron", {"day_of_week": "sun", "hour": 7, "minute": 30}))
         estimates = jobs["job_save_snapshots"]
         self.assertEqual((estimates.args[1], estimates.kwargs), ("cron", {"hour": 2, "minute": 30}))
         picks = jobs["job_settle_published_picks"]
