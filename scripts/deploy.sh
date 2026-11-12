@@ -9,8 +9,12 @@
 #   4. wait until the bot is healthy, then show the new commit and log errors,
 #   5. print the command that rolls back.
 #
+# The systemd timer in deploy/systemd runs this every few minutes, so a merge to
+# main deploys itself; scripts/install_autodeploy.sh sets that up. A deploy that
+# fails, or one that succeeds, is reported on Telegram.
+#
 # Settings (environment): FORCE=1 deploys even when there is nothing new to
-# pull; HEALTH_TIMEOUT (seconds, default 240).
+# pull; HEALTH_TIMEOUT (seconds, default 240); NOTIFY=0 sends no Telegram.
 set -eu
 
 SERVICE=news-notifier
@@ -18,7 +22,21 @@ DASHBOARD=dashboard-streamlit
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
 
 say() { printf '\n== %s\n' "$*"; }
-die() { printf '\nDEPLOY STOPPED: %s\n' "$*" >&2; exit 1; }
+# Telegram, with the bot's own token from .env. Best effort: a failed message
+# must not fail the deploy.
+notify() {
+    [ "${NOTIFY:-1}" = 1 ] && [ -f .env ] || return 0
+    token=$(sed -n 's/^TELEGRAM_TOKEN=//p' .env | tail -1)
+    chat=$(sed -n 's/^TELEGRAM_CHAT_ID=//p' .env | tail -1)
+    [ -n "$token" ] && [ -n "$chat" ] || return 0
+    curl -s -m 20 -o /dev/null "https://api.telegram.org/bot$token/sendMessage" \
+        --data-urlencode "chat_id=$chat" --data-urlencode "text=$1" || true
+}
+die() {
+    printf '\nDEPLOY STOPPED: %s\n' "$*" >&2
+    notify "news_bot deploy STOPPED: $*"
+    exit 1
+}
 
 # `git pull` below may rewrite this very file, and sh reads a script as it
 # runs it. Run from a private copy instead, remembering where the checkout is.
@@ -29,6 +47,11 @@ if [ -z "${DEPLOY_REPO:-}" ]; then
     DEPLOY_REPO="$DEPLOY_REPO" exec sh "$copy" "$@"
 fi
 cd "$DEPLOY_REPO"
+
+# One deploy at a time: the timer must not start a second run while a slow
+# build is still going.
+exec 9>"${TMPDIR:-/tmp}/news_bot_deploy.lock"
+flock -n 9 || { echo "Another deploy is running; skipping."; exit 0; }
 
 # --- 0. preflight -------------------------------------------------------------
 [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || die "checkout is not on main"
@@ -116,6 +139,7 @@ cat <<EOF
   (then 'git checkout main' once the fix is merged)
 EOF
 
-[ "$status" = healthy ] || die "bot is $status; consider rolling back with the command above"
+[ "$status" = healthy ] || die "bot is $status after deploying $new. Roll back on the Pi: git checkout -q $old && cp -p $env_copy .env && docker tag $rollback $image && docker compose up -d --no-build --force-recreate $SERVICE"
 echo
 echo "Deployed $new."
+notify "news_bot deployed $new ($(git log -1 --format=%s)). Bot healthy after ${waited}s.$([ -n "$errors" ] && echo ' Errors in the log, check it.')"
