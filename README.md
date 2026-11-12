@@ -1024,6 +1024,24 @@ the three the entrypoint needs (which are gone once it has dropped to `app`), an
 sets `no-new-privileges`. If you add a feature that writes elsewhere, give it a
 path under `/app/data` rather than loosening `read_only`.
 
+## Deploying to the Pi
+
+On the Pi, from the checkout, one command:
+
+```bash
+cd ~/news_bot && scripts/deploy.sh
+```
+
+It stops at the first failure. In order, it:
+
+1. tags the running bot image as `rollback-<date>-<commit>`;
+2. copies `.env` and takes a checked database backup (as the app user);
+3. runs `git pull --ff-only` and rebuilds the bot and the dashboard;
+4. waits for the bot to be healthy, then shows the new commit and any log errors;
+5. prints the one command that rolls back.
+
+With nothing new on `main` it does nothing; `FORCE=1` rebuilds anyway.
+
 ## Backups off the Pi
 
 The bot saves a checked copy of its database every night at 04:00 into
