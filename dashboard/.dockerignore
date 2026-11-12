@@ -1,5 +1,0 @@
-# Patterns match from the context root; **/ reaches into sources/.
-**/node_modules
-build
-.evidence
-**/*.db
