@@ -46,7 +46,7 @@ The bot is built in Python and scheduled with APScheduler.
 - `requirements.txt` - Python dependencies
 - `Dockerfile` - container image definition
 - `docker-compose.yml` - service orchestration
-- `dashboard/` - the web dashboard ([Evidence](https://evidence.dev)): pages in `dashboard/pages`, queries in `dashboard/sources`
+- `streamlit/` - the web dashboard, Fjord Signals (Streamlit + Plotly): every page is in `streamlit/app.py`
 
 ## Requirements
 
@@ -1041,37 +1041,23 @@ crontab -e
 
 ## Dashboard
 
-Charts and reports over the bot's database, at `http://raspberrypi5-02:8001`:
-the scorecard (picks vs skipped stocks), day by day, the latest screen, sent
-picks and their results, one stock's history, data collected per day, and your
-`/fill` trades and holdings. It replaced the Datasette viewer. There is no
-login, so keep the port on the home network / VPN.
+Fjord Signals, at `http://raspberrypi5-02:8002`: the scorecard (picks vs
+skipped stocks), day by day, the latest screen, sent picks, a research page
+per stock (price, key numbers, yearly company numbers, the bot's history with
+it), data collected per day, your `/fill` trades and holdings, and a what-if
+tool for the screen's filters. Built with Streamlit + Plotly; every page is in
+`streamlit/app.py`. It reads the bot's database read-only, with queries cached
+for a minute. No login, so keep the port on the home network / VPN.
 
-How it works: the site is built once, in the image, and holds no data. The
-`dashboard-data` service watches the bot's database (mounted read-only),
-and a minute or two after it changes takes a snapshot with SQLite's backup API
-and turns it into parquet files. Your browser runs the page queries on those
-files. `dashboard` is a plain nginx serving the result.
+Deploy on the Pi: `git pull && docker compose up -d --build dashboard-streamlit`.
 
-**The image is built on the Mac, not the Pi.** The site build needs more than
-1 GB of RAM. After changing anything under `dashboard/`, run
-`scripts/ship_dashboard.sh` on the Mac (it builds and loads the image onto
-the Pi), then on the Pi `docker compose up -d dashboard-data dashboard`. A
-plain `docker compose up -d` fails on a host that has never had the image
-loaded, because compose will not pull or build it there.
-
-To work on the pages locally:
+To work on it locally, copy a backup DB next to the app and point the app at it:
 
 ```bash
-cd dashboard
-npm ci
-cp ~/news_bot_backups/<newest>.db sources/trade_history/trade_history.db
-npm run sources && npm run dev
+cd streamlit
+pip install -r requirements.txt
+DASHBOARD_DB_FILE=~/news_bot_backups/<newest>.db streamlit run app.py
 ```
-
-Evidence page queries use DuckDB SQL, while the files in `dashboard/sources`
-run on SQLite. Column names ending in `_pct` are read as fractions by the chart
-axes, so name a percent-valued chart column something else.
 
 ## Message Sections
 

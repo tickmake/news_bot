@@ -111,7 +111,7 @@ def home() -> None:
     fig = px.line(both, x="day", y="running", color="hold", markers=True,
                   labels={"running": "%", "day": ""},
                   title="Picks minus skipped, added up day by day (%)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.caption('"After fees" assumes 0.10% per buy and per sell. Real DNB fees are higher '
                "on small trades (59 NOK minimum). Data is at most a minute old.")
 
@@ -130,11 +130,11 @@ def latest_screen() -> None:
     counts = df["reason"].value_counts().reset_index()
     st.plotly_chart(px.bar(counts, x="count", y="reason", orientation="h",
                            labels={"count": "Stocks", "reason": ""},
-                           title="Picked or skipped, and why"), use_container_width=True)
+                           title="Picked or skipped, and why"), width="stretch")
     view = df.sort_values(["qualified", "week_momentum_pct"], ascending=False)[
         ["symbol", "reason", "last_close", "day_change_pct", "week_momentum_pct",
          "atr_pct", "drawdown_pct", "volume_ratio"]]
-    st.dataframe(view.round(2), hide_index=True, use_container_width=True, column_config={
+    st.dataframe(view.round(2), hide_index=True, width="stretch", column_config={
         "symbol": "Stock", "reason": "Result", "last_close": "Price",
         "day_change_pct": "Today %", "week_momentum_pct": "Last 5 days %",
         "atr_pct": "Normal daily swing %", "drawdown_pct": "Below 20-day high %",
@@ -152,13 +152,13 @@ def day_by_day() -> None:
     st.plotly_chart(px.bar(long, x="day", y="average", color="group", barmode="group",
                            labels={"average": "%", "day": ""},
                            title="Average result after fees, picks vs skipped (%)"),
-                    use_container_width=True)
+                    width="stretch")
     counts = df.groupby("day").agg(picks=("qualified", "sum"), checked=("symbol", "count"),
                                    with_result=("net_return_pct", "count"))
     table = counts.join(days.set_index("day")[["picks", "skipped"]].rename(
         columns={"picks": "picks_avg", "skipped": "skipped_avg"})).sort_index(ascending=False)
     table.index = table.index.date
-    st.dataframe(table.round(2), use_container_width=True, column_config={
+    st.dataframe(table.round(2), width="stretch", column_config={
         "picks": "Picks", "checked": "Stocks checked", "with_result": "With result",
         "picks_avg": "Picks: average %", "skipped_avg": "Skipped: average %"})
 
@@ -184,9 +184,9 @@ def sent_picks() -> None:
     st.plotly_chart(px.histogram(done, x="net_return_pct", nbins=40,
                                  labels={"net_return_pct": "Result after fees %"},
                                  title="How the finished picks did"),
-                    use_container_width=True)
+                    width="stretch")
     df["status"] = df["net_return_pct"].map(lambda v: "done" if pd.notna(v) else "waiting")
-    st.dataframe(df.round(2), hide_index=True, use_container_width=True, column_config={
+    st.dataframe(df.round(2), hide_index=True, width="stretch", column_config={
         "sent_on": "Sent on", "symbol": "Stock", "horizon_sessions": "Hold (days)",
         "benchmark_symbol": "Index", "net_return_pct": "Result after fees %",
         "excess_return_pct": "Better than index by %", "status": "Status"})
@@ -242,7 +242,7 @@ def one_stock() -> None:
         cols = st.columns(len(recent) - 1 + 4)
         for col, s in zip(cols, recent[1:]):
             # Clicking puts that stock first in the list; the rerun picks it up.
-            if col.button(s, key=f"recent_{s}", use_container_width=True):
+            if col.button(s, key=f"recent_{s}", width="stretch"):
                 recent.remove(s)
                 recent.insert(0, s)
                 st.rerun()
@@ -283,7 +283,7 @@ def one_stock() -> None:
                                                                color="#f2c94c"))
             fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10),
                               legend=dict(orientation="h", y=1.05))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     with right:
         with st.container(border=True):
@@ -325,7 +325,7 @@ def one_stock() -> None:
                 for col, (title, y, color) in zip(cols, charts[row:row + 3]):
                     with col, st.container(border=True):
                         st.plotly_chart(_small_chart(wide, y, title, color),
-                                        use_container_width=True)
+                                        width="stretch")
             st.caption(f"Yearly figures in {nums['currency'].dropna().iloc[-1]}, by financial "
                        "year end. Earnings per share = net profit / shares outstanding.")
     with tab_bot:
@@ -340,7 +340,7 @@ def one_stock() -> None:
         view = mine.sort_values("day", ascending=False)[
             ["signal_session", "reason", "last_close", "day_change_pct", "week_momentum_pct",
              "net_return_pct"]]
-        st.dataframe(view.round(2), hide_index=True, use_container_width=True, column_config={
+        st.dataframe(view.round(2), hide_index=True, width="stretch", column_config={
             "signal_session": "Day", "reason": "Result", "last_close": "Price",
             "day_change_pct": "Today %", "week_momentum_pct": "Last 5 days %",
             "net_return_pct": "At the end of the hold, after fees %"})
@@ -358,8 +358,8 @@ def data_collected() -> None:
     st.plotly_chart(px.bar(df, x="day", y=["checked", "picked"], barmode="group",
                            labels={"value": "Stocks", "day": "", "variable": ""},
                            title="Stocks checked and picked per day"),
-                    use_container_width=True)
-    st.dataframe(df, hide_index=True, use_container_width=True)
+                    width="stretch")
+    st.dataframe(df, hide_index=True, width="stretch")
 
 
 def my_money() -> None:
@@ -378,10 +378,10 @@ def my_money() -> None:
     hold["result"] = (hold["got_back_nok"] - hold["paid_nok"]).map(
         lambda v: f"closed: {v:+.0f} NOK").where(hold["shares_held"] == 0, "still holding")
     st.subheader("What I hold")
-    st.dataframe(hold.round(0), use_container_width=True)
+    st.dataframe(hold.round(0), width="stretch")
     st.subheader("My trades")
     st.dataframe(trades[["trade_date", "side", "symbol", "shares", "price", "currency",
-                         "fx_to_nok", "fee_nok"]], hide_index=True, use_container_width=True)
+                         "fx_to_nok", "fee_nok"]], hide_index=True, width="stretch")
 
 
 def what_if() -> None:
@@ -438,7 +438,7 @@ def what_if() -> None:
     fig = px.line(pd.concat(lines), x="day", y="running", color="set", markers=True,
                   labels={"running": "%", "day": "", "set": ""},
                   title="Picks minus skipped, added up day by day (%)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 pages = [
