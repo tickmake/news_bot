@@ -224,11 +224,19 @@ services:
   # + Plotly): scorecard, screens, picks, one-stock research page, your /fill
   # trades and a what-if tool for the screen's filters. Pages live in
   # streamlit/app.py. Reads the DB volume read-only, queries cached a minute.
-  # Builds here on the Pi. No login: keep the port on the home network / VPN.
+  # Builds here on the Pi. Password login (streamlit/auth.py), but plain HTTP:
+  # keep the port on the home network / VPN.
   dashboard-streamlit:
     build: ./streamlit
     container_name: news_bot_dashboard_streamlit
     restart: unless-stopped
+    environment:
+      # Without a hash every page answers 503 (only the health check works).
+      # Make one with `python3 streamlit/auth.py hash`, the session key with
+      # `python3 streamlit/auth.py secret`. No key: each restart logs you out.
+      - DASHBOARD_PASSWORD_HASH=${DASHBOARD_PASSWORD_HASH:-}
+      - DASHBOARD_SESSION_SECRET=${DASHBOARD_SESSION_SECRET:-}
+      - DASHBOARD_SESSION_HOURS=${DASHBOARD_SESSION_HOURS:-12}
     read_only: true
     tmpfs:
       - /tmp
