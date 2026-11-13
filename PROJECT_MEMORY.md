@@ -46,9 +46,11 @@ than ranked 1-5.
   same stop, not to the 20-day low. Correlated picks also get a combined
   stopped-out-together figure.
 - One risk calculation (`risk.trade_risk`, #161) feeds `/recommendations`, `/analyze`,
-  `/check` and the dashboard: position, loss at the stop, gap estimate, fee. The gap
-  numbers come from `risk.GAP_STUDIES`, one row per stop that `research/gap_risk.py`
-  measured; any other multiple prints "not measured". A published pick saves its risk
+  `/check` and the dashboard: position, loss at the stop, gap estimate, fee, all modelled
+  as if bought at the signal close (the buy price is not known, and the text says so). The
+  gap sale is the stop price less a shortfall measured in percent of the stop price, from
+  `risk.GAP_STUDIES`: one row per stop that `research/gap_risk.py` measured, checked by a
+  test against `docs/research/data/`; any other multiple prints "not measured". A published pick saves its risk
   lines in `published_picks.snapshot_json` under `risk`; older picks have none and are
   never given one.
 - Relative strength and beta versus the market and, for US stocks, the sector ETF

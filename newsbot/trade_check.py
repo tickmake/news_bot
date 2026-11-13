@@ -194,7 +194,7 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     sized = risk.size_position(metrics)
     if trade is not None:
         lines.append(risk.stop_line(trade, currency))
-        lines.append(risk.loss_line(trade, "your money"))
+        lines.extend(risk.loss_lines(trade, "your money"))
         lines.extend(risk.warning_lines(trade))
     else:
         lines.append("    No stop: the stock's daily swing (ATR) isn't available.")
@@ -222,8 +222,9 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     if cash is not None and cost > cash:
         lines.append(f"    ⚠️ More than your cash ({cash:,.0f} NOK).")
     lines.append("")
-    lines.append(f"<i>The stop is measured from the {escape(metrics.session)} close, not from your buy "
-                 f"price. {risk.gap_note()} Fees are estimates; spread, slippage and currency "
-                 "exchange cost are not included.</i>")
+    lines.append(f"<i>The stop and the losses are worked out from the {escape(metrics.session)} close, "
+                 "not from your buy price, which isn't known yet. Paying more than that close makes "
+                 f"the actual loss larger. {risk.gap_note()} Fees are estimates; spread, slippage and "
+                 "currency exchange cost are not included.</i>")
     lines.append("<i>Information only, not a buy or sell signal. Prices may be delayed.</i>")
     return "\n".join(lines)

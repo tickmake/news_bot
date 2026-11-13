@@ -798,11 +798,14 @@ the holding period, so each candidate and `/analyze` now carry:
 - **Four separate risk numbers per pick**, worked out once in `risk.trade_risk` and
   shown the same way in `/recommendations`, `/analyze`, `/check` and on the dashboard:
   the **position** (money in the trade), the **loss at the stop** before costs, the
-  **loss if the stop gaps** (an estimate, never a maximum: the stop distance plus the
-  extra loss nine of ten measured gaps stayed under, from `research/gap_risk.py`; a
-  stop multiple that was never measured says "not measured" instead of borrowing
-  numbers), and the **fee** to buy and sell from the broker's table, also as a share of
-  the account. Spread, slippage and currency exchange cost are not included.
+  **loss if the stop gaps** (an estimate, never a maximum: the sale is put at the stop
+  price less the shortfall nine of ten measured gaps stayed under, from
+  `research/gap_risk.py`; a stop multiple that was never measured says "not measured"
+  instead of borrowing numbers), and the **fee** to buy and sell from the broker's table,
+  also as a share of the account. The losses are modelled as if bought at the signal
+  close and say so: nobody has bought yet, so the actual risk of a position is not known,
+  and paying more than that close makes it larger. Spread, slippage and currency exchange
+  cost are not included.
 - **A thin-trading warning** when the stock traded fewer shares a day over the last 20
   sessions than `TRADE_BACKTEST_MIN_AVG_VOLUME` (100,000), or has no volume data. It is
   a warning only: no gate and no size reads it.

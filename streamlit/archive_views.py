@@ -221,22 +221,28 @@ PICK_RISK_SQL = """
     SELECT substr(published_at, 1, 10) AS sent_on, symbol, signal_session, snapshot_json
     FROM published_picks ORDER BY published_at DESC, symbol
 """
+# The record layout this page knows (risk.RISK_MODEL_VERSION; a test keeps the
+# two equal). A record of any other version is listed but its numbers are not
+# shown, since its fields may mean something else.
+RISK_MODEL_VERSION = 2
 RISK_RECORDED = "recorded when sent"
 RISK_NOT_RECORDED = "not recorded"
+# Nobody has bought when a pick is sent, so no record carries a buy price.
+ACTUAL_RISK_UNKNOWN = "not known: no buy price is linked to a sent pick"
 RISK_FIELDS = [
     "reference_price", "stop_price", "stop_distance_price", "stop_distance_pct", "atr_pct",
     "atr_multiple", "exposure_nok", "exposure_pct", "stop_loss_nok", "stop_loss_pct",
-    "gap_loss_nok", "gap_loss_pct", "fee_nok", "fee_pct",
+    "gap_fill_price", "gap_loss_nok", "gap_loss_pct", "fee_nok", "fee_pct",
 ]
 # The record column comes early: a row of blanks must say why before anyone scrolls.
-RISK_COLUMNS = ["sent_on", "symbol", "record", "signal_session", *RISK_FIELDS, "gap", "costs",
-                "warnings"]
+RISK_COLUMNS = ["sent_on", "symbol", "record", "signal_session", *RISK_FIELDS, "gap", "actual",
+                "costs", "warnings"]
 
 
 def _gap_label(risk: dict) -> str:
     if not risk.get("gap_measured"):
         return f"not measured for {risk.get('atr_multiple'):g}×ATR"
-    return f"estimate: stop + {risk.get('gap_overshoot_pp'):.2f} pp"
+    return f"estimate: sold {risk.get('gap_below_stop_pct'):.2f}% below the stop (nine in ten did better)"
 
 
 def _costs_label(risk: dict) -> str:
@@ -247,7 +253,7 @@ def _costs_label(risk: dict) -> str:
 
 
 def pick_risk(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per sent pick with the risk record it was sent with, or "not recorded"."""
+    """One row per sent pick with the risk record it was sent with, or why there is none."""
     rows = []
     for row in df.itertuples(index=False):
         try:
@@ -255,11 +261,14 @@ def pick_risk(df: pd.DataFrame) -> pd.DataFrame:
         except (TypeError, ValueError, AttributeError):
             risk = None
         out = {"sent_on": row.sent_on, "symbol": row.symbol, "signal_session": row.signal_session}
-        if isinstance(risk, dict):
+        if not isinstance(risk, dict):
+            out.update(record=RISK_NOT_RECORDED)
+        elif risk.get("model_version") != RISK_MODEL_VERSION:
+            out.update(record=f"risk model v{risk.get('model_version')}: not shown")
+        else:
             out.update({name: risk.get(name) for name in RISK_FIELDS})
             out.update(gap=_gap_label(risk), costs=_costs_label(risk),
+                       actual=ACTUAL_RISK_UNKNOWN if risk.get("entry_price") is None else None,
                        warnings=" ".join(risk.get("warnings") or []), record=RISK_RECORDED)
-        else:
-            out.update(record=RISK_NOT_RECORDED)
         rows.append(out)
     return pd.DataFrame(rows, columns=RISK_COLUMNS)

@@ -1,0 +1,17 @@
+$ python research/fetch_basket.py basket.pkl   # run 2026-11-13; Yahoo, auto_adjust=True, period=10y
+$ python research/gap_risk.py basket.pkl 2.0 signal-close
+stop 2xATR below the signal-close; volume gate off; EMA20 seeded 63 sessions back; hold 20
+basket: 44 symbols, last session 2026-11-13
+qualifying entries      : 26407 (plus 42 that opened at or below the stop: not traded)
+stopped out             : 12157 (46.0%)
+  of those, gapped through: 1741 (14.3% of stops, 6.6% of entries)
+
+when it gapped, the sale was below the stop price by (percent of the stop price):
+  mean 0.99%  median 0.56%  90th 2.36%  worst 12.04%
+the same in points of the buy price (section 7's measure; depends on the buy price):
+  mean 0.94  median 0.54  90th 2.24  worst 11.22
+
+all stops: loss at the stop from the buy price, mean 4.01% -> realised mean 4.15%
+stop distance from the signal-close: mean 4.13%; from the buy price: mean 4.20% (wider from the buy price in 57% of entries)
+
+GapStudy(multiple=2.0, anchor='signal_close', entries=26407, stopped_pct=46.0, gapped_of_stops_pct=14.3, gap_below_stop_mean_pct=0.99, gap_below_stop_p90_pct=2.36, gap_below_stop_worst_pct=12.04)

@@ -24,8 +24,8 @@ python research/pit_coverage.py /tmp/pit_members.pkl sp500_wiki.html docs/resear
 # 4. Are the gate thresholds worth anything, and does the stop hold? (issue #47)
 # Both read the same basket pickle as step 1.
 python research/gate_sweep.py /tmp/basket.pkl /tmp/gate_sweep.pkl          # 3,456 threshold combinations x 3 hold lengths
-python research/gap_risk.py /tmp/basket.pkl                                # how often a 2xATR stop gaps through
-python research/gap_risk.py /tmp/basket.pkl 3.0 signal-close               # the same for the stop the bot places (section 11)
+python research/gap_risk.py /tmp/basket.pkl 2.0 entry-open --full-history-ema  # how often a 2xATR stop gaps through (section 7)
+python research/gap_risk.py /tmp/basket.pkl 3.0 signal-close               # the stop the bot places (section 11; output in docs/research/data/)
 
 # 5. Hold length and sell rule after DNB fees (issue #122)
 python research/fetch_stock_list.py /tmp/stock_list_10y.pkl                # stock_list.csv, ten years

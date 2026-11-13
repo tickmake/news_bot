@@ -1,28 +1,35 @@
 """How often does an N x ATR stop actually lose more than it says?
 
-Issue #47 part 3. `risk.portfolio_lines` warns that "a gap can lose more" than
-the volatility stop without saying how much more, which is a disclaimer the
-reader cannot act on. This measures it on the evaluation basket: for every
-session where a symbol qualified under the shipped gates, place the same stop
-`size_position` would place, walk forward the usual hold, and compare the loss
-actually taken with the loss the stop implies.
+Issue #47 part 3, redone for #161. `risk.portfolio_lines` warns that a gap can
+lose more than the volatility stop; this measures how much more on the
+evaluation basket: for every session where a symbol passed the live screen's
+gates, place the stop, buy at the next open, walk the hold forward the way a
+stop order is hit, and record where the stop actually sold.
 
     python research/fetch_basket.py /tmp/basket.pkl
-    python research/gap_risk.py /tmp/basket.pkl                      # 2xATR from the entry open (section 7)
-    python research/gap_risk.py /tmp/basket.pkl 3.0 signal-close     # the stop the bot places (section 11)
-    python research/gap_risk.py /tmp/basket.pkl 3.0 signal-close --volume-gate
+    python research/gap_risk.py /tmp/basket.pkl 3.0 signal-close     # the stop the bot places
+    python research/gap_risk.py /tmp/basket.pkl 2.0 entry-open --full-history-ema   # section 7
 
-The stop multiple and its anchor are arguments (#161). `signal-close` places the
-stop below the close the signal was formed on, which is how `risk.size_position`
-places it; `entry-open` places it below the next open, i.e. the buy price.
+Arguments: the stop multiple; the anchor (`signal-close` places the stop below
+the close the signal was formed on, as `risk.size_position` does; `entry-open`
+places it below the buy price); and flags:
 
-The live screen admits on five gates and volume is not one of them
-(`indicators._failed_gates`); volume only decides which picks are listed first.
-So the run without `--volume-gate` is the one that matches what qualifies.
-`--volume-gate` keeps only sessions with last volume / prior 20-session mean
->= 1.2, the "confirmed by volume" group, as a check that the answer holds there.
+  --volume-gate         also require last volume / prior 20-session mean >= 1.2.
+                        Not a live gate (volume only orders the list), so only a
+                        check on the "confirmed by volume" subset.
+  --full-history-ema    seed EMA20 at the start of the ten years, as section 7 did.
+                        By default it is seeded where the live screen seeds it: at
+                        the start of the 3 months of bars it fetches.
 
-The last line printed is the row to paste into `risk.GAP_STUDIES`.
+What is measured, and in which units (#161 review): when a stop gaps, the sale
+is at the open, below the stop price. That shortfall is recorded in percent of
+the **stop price**: `(1 - sale / stop) * 100`. Unlike a loss measured from the
+buy price, it does not depend on what anyone paid, so the bot can apply it
+before a buy (`risk.trade_risk`). The old measure, points of the buy price
+beyond the stop, is still printed for comparison with section 7.
+
+The last line printed is the row for `risk.GAP_STUDIES`. Keep the full output in
+docs/research/data/ (tests/test_risk_reporting.py checks the two agree).
 """
 import pickle
 import sys
@@ -30,82 +37,118 @@ import sys
 import numpy as np
 import pandas as pd
 
-HOLD = 20                    # SETTINGS.trade_outcome_lookback_days
+HOLD = 20                    # SETTINGS.trade_outcome_lookback_days on the Pi
 GATES = {"week": 1.0, "day": 0.0, "atr": 4.5, "dd": 8.0, "volume": 1.2}
 ANCHORS = ("entry-open", "signal-close")
+# indicators._compute_trade_metrics: market_data._fetch_ticker_history's default
+# period is "3mo", about 63 sessions, and a symbol needs 30 closes to be measured.
+SCREEN_SESSIONS = 63
+MIN_CLOSES = 30
 
 
-def main(basket_path, multiple="2.0", anchor="entry-open", *flags):
-    STOP_ATR_MULTIPLE = float(multiple)
+def screen_ema20(close, window=SCREEN_SESSIONS):
+    """EMA20 (adjust=False) seeded at the first of the last `window` closes, at every session.
+
+    That is what the live screen computes: `ewm(span=20, adjust=False)` over the
+    3 months it fetched. The weights below are that recursion written out.
+    """
+    alpha = 2.0 / 21.0
+    values = close.to_numpy(dtype=float)
+    weights = alpha * (1.0 - alpha) ** np.arange(window)
+    weights[-1] = (1.0 - alpha) ** (window - 1)
+    ema = np.convolve(values, weights)[: len(values)]
+    # Fewer bars than the window: seeded at the first bar, like a short history.
+    head = close.iloc[: window - 1].ewm(span=20, adjust=False).mean().to_numpy()
+    ema[: len(head)] = head
+    return pd.Series(ema, index=close.index)
+
+
+def qualifying(bars, volume_gate=False, full_history_ema=False):
+    """(passes the five live gates, ATR %) for every session of one symbol's bars."""
+    close, high, low = bars["Close"], bars["High"], bars["Low"]
+    ema20 = (close.ewm(span=20, adjust=False).mean() if full_history_ema
+             else screen_ema20(close))
+    true_range = pd.concat([high - low, (high - close.shift(1)).abs(),
+                            (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr_pct = true_range.rolling(14).mean() / close * 100
+    rolling_high = close.rolling(20).max()
+    drawdown = (rolling_high - close) / rolling_high * 100
+    week = (close / close.shift(5) - 1) * 100
+    day = close.pct_change(fill_method=None) * 100
+
+    passes = ((close > ema20) & (week >= GATES["week"]) & (day > GATES["day"])
+              & (atr_pct <= GATES["atr"]) & (drawdown <= GATES["dd"])).fillna(False)
+    passes &= np.arange(len(close)) >= MIN_CLOSES - 1
+    if volume_gate:
+        volume_ratio = bars["Volume"] / bars["Volume"].shift(1).rolling(20).mean()
+        passes &= (volume_ratio >= GATES["volume"]).fillna(False)
+    return passes, atr_pct
+
+
+def simulate(signal_close, atr_pct, multiple, anchor, opens, lows, closes):
+    """One entry: buy at opens[0], hold len(opens) sessions behind the stop.
+
+    None when the first open is already at or below the stop: there is nothing
+    to buy above it, so it is counted as no trade.
+    """
+    entry = opens[0]
+    stop_pct = multiple * atr_pct
+    reference = entry if anchor == "entry-open" else signal_close
+    stop = reference * (1 - stop_pct / 100)
+    if entry <= stop:
+        return None
+    exit_price, stopped, gapped = closes[-1], False, False
+    for session_open, session_low in zip(opens, lows, strict=True):
+        if session_open <= stop:
+            # Opened below the stop: the sale is at the open, not at the stop.
+            exit_price, stopped, gapped = session_open, True, True
+            break
+        if session_low <= stop:
+            exit_price, stopped = stop, True
+            break
+    return {
+        "stopped": stopped, "gapped": gapped,
+        "stop_from_reference_pct": stop_pct,
+        "stop_from_entry_pct": (1 - stop / entry) * 100,
+        "realised_pct": (exit_price / entry - 1) * 100,
+        "below_stop_pct": (1 - exit_price / stop) * 100 if gapped else 0.0,
+        "overshoot_from_entry_pp": (stop - exit_price) / entry * 100 if gapped else 0.0,
+    }
+
+
+def main(basket_path, multiple="3.0", anchor="signal-close", *flags):
+    stop_multiple = float(multiple)
     if anchor not in ANCHORS:
         raise SystemExit(f"anchor must be one of {ANCHORS}")
     volume_gate = "--volume-gate" in flags
-    print(f"stop {STOP_ATR_MULTIPLE:g}xATR below the {anchor}, volume gate {'on' if volume_gate else 'off'}, hold {HOLD}")
+    full_history_ema = "--full-history-ema" in flags
+    seeded = "at the start of the history" if full_history_ema else f"{SCREEN_SESSIONS} sessions back"
+    print(f"stop {stop_multiple:g}xATR below the {anchor}; volume gate {'on' if volume_gate else 'off'};"
+          f" EMA20 seeded {seeded}; hold {HOLD}")
     with open(basket_path, "rb") as handle:
         data, _meta = pickle.load(handle)  # noqa: S301 - written by fetch_basket.py
     symbols = [s for s in data if s != "SPY"]
+    last_day = max(data[s].index[-1] for s in symbols)
+    print(f"basket: {len(symbols)} symbols, last session {last_day:%Y-%m-%d}")
 
     rows, no_trade = [], 0
     for symbol in symbols:
         bars = data[symbol].copy()
         bars.index = pd.to_datetime(bars.index.strftime("%Y-%m-%d"))
         bars = bars[~bars.index.duplicated()]
-        close, high, low = bars["Close"], bars["High"], bars["Low"]
-
-        ema20 = close.ewm(span=20, adjust=False).mean()
-        true_range = pd.concat([high - low, (high - close.shift(1)).abs(),
-                                (low - close.shift(1)).abs()], axis=1).max(axis=1)
-        atr_pct = true_range.rolling(14).mean() / close * 100
-        rolling_high = close.rolling(20).max()
-        drawdown = (rolling_high - close) / rolling_high * 100
-        week = (close / close.shift(5) - 1) * 100
-        day = close.pct_change(fill_method=None) * 100
-
-        qualifies = ((close > ema20) & (week >= GATES["week"]) & (day > GATES["day"])
-                     & (atr_pct <= GATES["atr"]) & (drawdown <= GATES["dd"])).fillna(False)
-        if volume_gate:
-            volume_ratio = bars["Volume"] / bars["Volume"].shift(1).rolling(20).mean()
-            qualifies &= (volume_ratio >= GATES["volume"]).fillna(False)
-
-        values = bars.values
-        columns = {name: i for i, name in enumerate(bars.columns)}
-        for position in np.flatnonzero(qualifies.values):
+        passes, atr_pct = qualifying(bars, volume_gate, full_history_ema)
+        opens, lows, closes = (bars[name].to_numpy(dtype=float) for name in ("Open", "Low", "Close"))
+        for position in np.flatnonzero(passes.to_numpy()):
             entry = position + 1
             if entry + HOLD >= len(bars) or not np.isfinite(atr_pct.iloc[position]):
                 continue
-            entry_price = values[entry, columns["Open"]]
-            stop_pct = STOP_ATR_MULTIPLE * atr_pct.iloc[position]
-            reference = entry_price if anchor == "entry-open" else values[position, columns["Close"]]
-            stop_price = reference * (1 - stop_pct / 100)
-            if entry_price <= stop_price:
-                # Only with a signal-close anchor: the stock opened at or below the
-                # stop, so there is nothing to buy above it. Counted, not traded.
+            window = slice(entry, entry + HOLD)
+            trade = simulate(closes[position], atr_pct.iloc[position], stop_multiple, anchor,
+                             opens[window], lows[window], closes[window])
+            if trade is None:
                 no_trade += 1
                 continue
-
-            # Walk the hold session by session, the way a stop order would be hit.
-            exit_price, stopped, gapped = None, False, False
-            for step in range(entry, entry + HOLD):
-                session_open = values[step, columns["Open"]]
-                session_low = values[step, columns["Low"]]
-                if session_open <= stop_price:
-                    # Opened below the stop: the fill is the open, not the stop.
-                    exit_price, stopped, gapped = session_open, True, True
-                    break
-                if session_low <= stop_price:
-                    exit_price, stopped = stop_price, True
-                    break
-            if exit_price is None:
-                exit_price = values[entry + HOLD - 1, columns["Close"]]
-
-            # The loss the stop implies from the buy price. With a signal-close anchor
-            # the buy (next open) can sit above or below that close, so this differs
-            # from stop_pct. The overshoot below is the loss beyond that, in percent
-            # of the buy price.
-            rows.append({"symbol": symbol, "stopped": stopped, "gapped": gapped,
-                         "intended_loss_pct": (1 - stop_price / entry_price) * 100,
-                         "stop_from_close_pct": stop_pct,
-                         "realised_pct": (exit_price / entry_price - 1) * 100})
+            rows.append({"symbol": symbol, **trade})
 
     trades = pd.DataFrame(rows)
     stopped = trades[trades.stopped]
@@ -116,29 +159,28 @@ def main(basket_path, multiple="2.0", anchor="entry-open", *flags):
     print(f"  of those, gapped through: {len(gapped)} "
           f"({100 * len(gapped) / max(len(stopped), 1):.1f}% of stops, "
           f"{100 * len(gapped) / len(trades):.1f}% of entries)")
-    if not gapped.empty:
-        overshoot = -gapped.realised_pct - gapped.intended_loss_pct
-        print("\nwhen it gapped through the stop, the extra loss beyond the stop:")
-        print(f"  mean   {overshoot.mean():.2f} pp")
-        print(f"  median {overshoot.median():.2f} pp")
-        print(f"  90th   {overshoot.quantile(0.90):.2f} pp")
-        print(f"  worst  {overshoot.max():.2f} pp")
-        print(f"\n  intended loss at the stop, mean {gapped.intended_loss_pct.mean():.2f}%"
-              f" -> realised mean {-gapped.realised_pct.mean():.2f}%"
-              f" ({-gapped.realised_pct.mean() / gapped.intended_loss_pct.mean():.2f}x)")
-    print(f"\nall stops: intended mean {stopped.intended_loss_pct.mean():.2f}%"
+    if gapped.empty:
+        return
+    below = gapped.below_stop_pct
+    print("\nwhen it gapped, the sale was below the stop price by (percent of the stop price):")
+    print(f"  mean {below.mean():.2f}%  median {below.median():.2f}%  90th {below.quantile(0.90):.2f}%"
+          f"  worst {below.max():.2f}%")
+    old = gapped.overshoot_from_entry_pp
+    print("the same in points of the buy price (section 7's measure; depends on the buy price):")
+    print(f"  mean {old.mean():.2f}  median {old.median():.2f}  90th {old.quantile(0.90):.2f}"
+          f"  worst {old.max():.2f}")
+    print(f"\nall stops: loss at the stop from the buy price, mean {stopped.stop_from_entry_pct.mean():.2f}%"
           f" -> realised mean {-stopped.realised_pct.mean():.2f}%")
-    print(f"stop distance from the signal close: mean {trades.stop_from_close_pct.mean():.2f}%;"
-          f" from the buy price: mean {trades.intended_loss_pct.mean():.2f}%"
-          f" (wider than stated in {100 * (trades.intended_loss_pct > trades.stop_from_close_pct).mean():.0f}%"
-          " of entries)")
-    if not gapped.empty:
-        print(f"\nGapStudy(multiple={STOP_ATR_MULTIPLE:g}, anchor={anchor.replace('-', '_')!r},"
-              f" volume_gate={volume_gate}, entries={len(trades)},"
-              f" stopped_pct={100 * len(stopped) / len(trades):.1f},"
-              f" gapped_of_stops_pct={100 * len(gapped) / len(stopped):.1f},"
-              f" overshoot_mean_pp={overshoot.mean():.2f}, overshoot_p90_pp={overshoot.quantile(0.90):.2f},"
-              f" overshoot_worst_pp={overshoot.max():.2f})")
+    wider = (trades.stop_from_entry_pct > trades.stop_from_reference_pct).mean()
+    print(f"stop distance from the {anchor}: mean {trades.stop_from_reference_pct.mean():.2f}%;"
+          f" from the buy price: mean {trades.stop_from_entry_pct.mean():.2f}%"
+          f" (wider from the buy price in {100 * wider:.0f}% of entries)")
+    print(f"\nGapStudy(multiple={stop_multiple:.1f}, anchor={anchor.replace('-', '_')!r},"
+          f" entries={len(trades)}, stopped_pct={100 * len(stopped) / len(trades):.1f},"
+          f" gapped_of_stops_pct={100 * len(gapped) / len(stopped):.1f},"
+          f" gap_below_stop_mean_pct={below.mean():.2f},"
+          f" gap_below_stop_p90_pct={below.quantile(0.90):.2f},"
+          f" gap_below_stop_worst_pct={below.max():.2f})")
 
 
 if __name__ == "__main__":
