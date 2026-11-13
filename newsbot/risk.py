@@ -12,7 +12,7 @@ cheaply, and every one of them degrades to "unknown" rather than raising.
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -24,18 +24,65 @@ from newsbot.benchmarks import _backtest_benchmark_for
 from newsbot.logsetup import SYS_LOG
 
 
+# Where the stop is placed: below the close the signal was formed on, not below
+# the buy price (#172). Every number here is worked out from that close.
+STOP_ANCHOR = "signal_close"
+# Version of the per-pick risk record saved with a published pick. Raise it when
+# a field changes meaning, so an old record is never read as a new one.
+RISK_MODEL_VERSION = 1
+
+
+@dataclass(frozen=True)
+class GapStudy:
+    """What `research/gap_risk.py` measured for one stop: N x ATR below `anchor`."""
+
+    multiple: float
+    anchor: str
+    entries: int
+    stopped_pct: float            # of entries, over a 20-session hold
+    gapped_of_stops_pct: float    # stops that opened below the stop price
+    overshoot_mean_pp: float      # loss beyond the stop when it gapped, percent of the buy price
+    overshoot_p90_pp: float
+    overshoot_worst_pp: float
+
+
 # Measured, not asserted: `research/gap_risk.py` over the 44-stock evaluation
-# basket, 2016-2026, placing this same stop on all 26,645 sessions where a
-# symbol passed the shipped gates. 46% of those entries were stopped out, and
-# 13.9% of the stops gapped through rather than filling at the stop -- 6.4% of
-# all entries. The overshoot beyond the stop averaged 0.93 pp on a ~4% stop
-# (1.23x the intended loss), with a 90th percentile of 2.3 pp and a worst case
-# of 10.8 pp. Restate the numbers if the study is rerun.
-GAP_RISK_NOTE = (
-    "About one stop in seven gaps through instead of filling at the stop, "
-    "costing roughly a quarter more than planned on average and several times "
-    "that at worst."
+# basket, 2016-2026, placing the stop on every session where a symbol passed the
+# five shipped gates (docs/research, section 11). One row per stop that was
+# measured; a stop that is not here gets "not measured", never a borrowed row.
+# Paste the script's last line when the study is rerun.
+GAP_STUDIES: Tuple[GapStudy, ...] = (
+    GapStudy(multiple=2.0, anchor="signal_close", entries=26541, stopped_pct=45.9,
+             gapped_of_stops_pct=14.3, overshoot_mean_pp=0.95, overshoot_p90_pp=2.25,
+             overshoot_worst_pp=11.22),
+    GapStudy(multiple=3.0, anchor="signal_close", entries=26572, stopped_pct=28.9,
+             gapped_of_stops_pct=13.7, overshoot_mean_pp=1.02, overshoot_p90_pp=2.55,
+             overshoot_worst_pp=11.94),
 )
+
+
+def gap_study(multiple: Optional[float] = None) -> Optional[GapStudy]:
+    """The measurement for the stop in use, or None when that stop was never measured."""
+    wanted = SETTINGS.risk_stop_atr_multiple if multiple is None else multiple
+    for study in GAP_STUDIES:
+        if study.anchor == STOP_ANCHOR and math.isclose(study.multiple, wanted, abs_tol=1e-9):
+            return study
+    return None
+
+
+def gap_note() -> str:
+    """One sentence on gap risk for the stop in use. Never quotes another stop's numbers."""
+    study = gap_study()
+    if study is None:
+        return (f"Gap risk has not been measured for a {SETTINGS.risk_stop_atr_multiple:g}×ATR stop, "
+                "so no gap estimate is shown.")
+    return (
+        f"In ten years of tests on 44 large stocks about 1 stop in "
+        f"{round(100 / study.gapped_of_stops_pct)} opened below its price, losing "
+        f"{study.overshoot_mean_pp:.1f} percentage points more than planned on average, under "
+        f"{study.overshoot_p90_pp:.1f} in nine of ten and {study.overshoot_worst_pp:.1f} at worst; "
+        "the gap estimate uses the nine-in-ten case and is not a maximum."
+    )
 
 
 @dataclass(frozen=True)
@@ -48,6 +95,18 @@ class PositionSizing:
     amount: Optional[float] = None  # only when RISK_ACCOUNT_SIZE is set
 
 
+def _stop_pct(metrics: TradeMetrics) -> Optional[float]:
+    """Distance from the signal close to the stop, percent. None when there is no usable ATR."""
+    atr = metrics.atr_pct
+    if atr is None or not math.isfinite(atr) or atr <= 0:
+        return None
+    if not math.isfinite(metrics.last_close) or metrics.last_close <= 0:
+        return None
+    if SETTINGS.risk_stop_atr_multiple <= 0:
+        return None
+    return SETTINGS.risk_stop_atr_multiple * atr
+
+
 def size_position(metrics: TradeMetrics) -> Optional[PositionSizing]:
     """Fixed-fractional sizing from a volatility stop.
 
@@ -55,12 +114,9 @@ def size_position(metrics: TradeMetrics) -> Optional[PositionSizing]:
     position and a wilder one a smaller one, each losing the same fraction of
     the portfolio if the stop is hit. Gaps can still lose more than the stop.
     """
-    atr = metrics.atr_pct
-    if atr is None or not math.isfinite(atr) or atr <= 0:
+    stop_pct = _stop_pct(metrics)
+    if stop_pct is None or SETTINGS.risk_per_trade_pct <= 0:
         return None
-    if SETTINGS.risk_per_trade_pct <= 0 or SETTINGS.risk_stop_atr_multiple <= 0:
-        return None
-    stop_pct = SETTINGS.risk_stop_atr_multiple * atr
     raw_weight = SETTINGS.risk_per_trade_pct / stop_pct * 100.0
     cap = SETTINGS.risk_max_position_pct
     weight = min(raw_weight, cap) if cap > 0 else raw_weight
@@ -73,6 +129,142 @@ def size_position(metrics: TradeMetrics) -> Optional[PositionSizing]:
         capped=weight < raw_weight,
         amount=amount,
     )
+
+
+@dataclass(frozen=True)
+class TradeRisk:
+    """Everything the risk lines say about one position, worked out once.
+
+    Telegram renders it (`risk_lines`), a published pick saves it (`snapshot`)
+    and the dashboard shows the saved copy, so the three cannot disagree.
+    Prices are in the stock's currency; money is in NOK. A field is None when
+    it cannot be worked out, never a guess.
+    """
+
+    symbol: str
+    session: str                         # the close every number is from
+    reference_price: float               # that close: the stop anchor
+    atr_pct: float
+    atr_price: float
+    atr_multiple: float
+    stop_price: float
+    stop_distance_pct: float
+    stop_distance_price: float
+    exposure_nok: Optional[float]        # money in the position
+    exposure_pct: Optional[float]        # ... as a share of the account
+    account_nok: Optional[float]
+    capped: bool
+    # Theoretical stop risk: the position sold exactly at the stop, before costs.
+    stop_loss_nok: Optional[float]
+    stop_loss_pct: Optional[float]       # of the account
+    # Gap-adjusted estimate: the stop fills below its price, at the nine-in-ten
+    # overshoot measured for this stop. None when this stop was never measured.
+    gap_measured: bool
+    gap_overshoot_pp: Optional[float]
+    gap_loss_nok: Optional[float]
+    gap_loss_pct: Optional[float]        # of the account
+    # Estimated broker fee to buy and sell. Spread and slippage are not modelled.
+    fee_nok: Optional[float]
+    fee_pct: Optional[float]             # of the account
+    fx_cost_included: Optional[bool]     # None: no currency exchange is needed
+    warnings: Tuple[str, ...] = ()
+
+
+def round_trip_fee(amount: float) -> float:
+    """Estimated broker fee to buy and later sell a position of `amount` NOK."""
+    return 2 * max(SETTINGS.broker_fee_min_nok, amount * SETTINGS.broker_fee_pct / 100.0)
+
+
+def liquidity_warnings(metrics: TradeMetrics) -> Tuple[str, ...]:
+    """Reasons a stop might fill worse than shown, from the volume the bot already reads.
+
+    No gate reads these and sizing ignores them. The floor is the one the
+    backtest already applies (`TRADE_BACKTEST_MIN_AVG_VOLUME`).
+    """
+    if metrics.volume_ratio is None and metrics.avg_volume_20 is None:
+        return ("No volume data: how easily this stock trades was not checked.",)
+    floor = SETTINGS.trade_backtest_min_avg_volume
+    average = metrics.avg_volume_20
+    if average is not None and math.isfinite(average) and floor > 0 and average < floor:
+        return (f"Thin trading: about {average:,.0f} shares a day, under the {floor:,.0f} the "
+                "backtest requires. A stop can fill well below its price.",)
+    return ()
+
+
+def trade_risk(metrics: TradeMetrics, exposure_nok: Optional[float] = None,
+               account_nok: Optional[float] = None, weight_pct: Optional[float] = None,
+               capped: bool = False) -> Optional[TradeRisk]:
+    """The risk of holding `exposure_nok` of this stock with the configured stop. Pure.
+
+    `weight_pct` gives the account shares when only the weight is known (no
+    account size set). Long positions only: the bot has no short trades.
+    """
+    stop_pct = _stop_pct(metrics)
+    if stop_pct is None:
+        return None
+    if exposure_nok is not None and (not math.isfinite(exposure_nok) or exposure_nok <= 0):
+        exposure_nok = None
+    if account_nok is not None and (not math.isfinite(account_nok) or account_nok <= 0):
+        account_nok = None
+    if exposure_nok is not None and account_nok is not None:
+        exposure_pct: Optional[float] = exposure_nok / account_nok * 100.0
+    else:
+        exposure_pct = weight_pct
+
+    def share(loss_pct_of_position: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+        if loss_pct_of_position is None:
+            return None, None
+        return (exposure_nok * loss_pct_of_position / 100.0 if exposure_nok is not None else None,
+                exposure_pct * loss_pct_of_position / 100.0 if exposure_pct is not None else None)
+
+    study = gap_study()
+    stop_loss_nok, stop_loss_pct = share(stop_pct)
+    gap_loss_nok, gap_loss_pct = share(stop_pct + study.overshoot_p90_pp if study else None)
+    fee_nok = round_trip_fee(exposure_nok) if exposure_nok is not None else None
+    close = metrics.last_close
+    return TradeRisk(
+        symbol=metrics.symbol,
+        session=metrics.session,
+        reference_price=close,
+        atr_pct=metrics.atr_pct,
+        atr_price=close * metrics.atr_pct / 100.0,
+        atr_multiple=SETTINGS.risk_stop_atr_multiple,
+        stop_price=close * (1.0 - stop_pct / 100.0),
+        stop_distance_pct=stop_pct,
+        stop_distance_price=close * stop_pct / 100.0,
+        exposure_nok=exposure_nok,
+        exposure_pct=exposure_pct,
+        account_nok=account_nok,
+        capped=capped,
+        stop_loss_nok=stop_loss_nok,
+        stop_loss_pct=stop_loss_pct,
+        gap_measured=study is not None,
+        gap_overshoot_pp=study.overshoot_p90_pp if study else None,
+        gap_loss_nok=gap_loss_nok,
+        gap_loss_pct=gap_loss_pct,
+        fee_nok=fee_nok,
+        fee_pct=fee_nok / account_nok * 100.0 if fee_nok is not None and account_nok else None,
+        fx_cost_included=None if metrics.symbol.upper().endswith(".OL") else False,
+        warnings=liquidity_warnings(metrics),
+    )
+
+
+def pick_risk(metrics: TradeMetrics) -> Optional[TradeRisk]:
+    """The risk of a pick at the size the risk rule suggests: what /recommendations shows."""
+    sized = size_position(metrics)
+    if sized is None:
+        return None
+    account = SETTINGS.risk_account_size if SETTINGS.risk_account_size > 0 else None
+    return trade_risk(metrics, exposure_nok=sized.amount, account_nok=account,
+                      weight_pct=sized.weight_pct, capped=sized.capped)
+
+
+def snapshot(risk: Optional[TradeRisk]) -> Optional[Dict[str, Any]]:
+    """The record saved with a published pick, and read back by the dashboard."""
+    if risk is None:
+        return None
+    return {"model_version": RISK_MODEL_VERSION, "stop_anchor": STOP_ANCHOR,
+            **asdict(risk), "warnings": list(risk.warnings)}
 
 
 @dataclass(frozen=True)
@@ -182,6 +374,7 @@ def correlated_clusters(
 @dataclass
 class PortfolioRisk:
     sizing: Dict[str, PositionSizing] = field(default_factory=dict)
+    trades: Dict[str, TradeRisk] = field(default_factory=dict)
     profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     events: Dict[str, EventFlag] = field(default_factory=dict)
     pairs: List[Tuple[str, str, float, int]] = field(default_factory=list)
@@ -205,6 +398,9 @@ def assess(picks: Sequence[TradeMetrics], profiles: Dict[str, Dict[str, Any]],
         sized = size_position(metrics)
         if sized is not None:
             risk.sizing[metrics.symbol] = sized
+            trade = pick_risk(metrics)
+            if trade is not None:
+                risk.trades[metrics.symbol] = trade
         flag = earnings_flag(profiles.get(metrics.symbol), today)
         if flag is not None:
             risk.events[metrics.symbol] = flag
@@ -331,18 +527,68 @@ def _relative_strength(
     return result
 
 
-def fee_line(symbol: str, amount: Optional[float]) -> str:
-    """What buying and later selling would cost at the broker, in NOK."""
+def fee_line(symbol: str, amount: Optional[float], account: Optional[float] = None) -> str:
+    """What buying and later selling would cost at the broker, in NOK. An estimate
+    from the fee table; the currency exchange cost is not known, so it is named, not added."""
     minimum = 2 * SETTINGS.broker_fee_min_nok
     fx_note = "" if symbol.upper().endswith(".OL") else " + currency exchange fee"
     if amount is None or amount <= 0:
         return f"    fees: at least {minimum:,.0f} NOK to buy and sell{fx_note}"
-    per_side = max(SETTINGS.broker_fee_min_nok, amount * SETTINGS.broker_fee_pct / 100.0)
-    round_trip = 2 * per_side
+    round_trip = round_trip_fee(amount)
+    of_account = f", {round_trip / account * 100:.2f}% of {account:,.0f} NOK" if account else ""
     return (
         f"    fees: {round_trip:,.0f} NOK to buy and sell"
-        f" ({round_trip / amount * 100:.1f}% of {amount:,.0f} NOK){fx_note}"
+        f" ({round_trip / amount * 100:.1f}% of {amount:,.0f} NOK{of_account}){fx_note}"
     )
+
+
+def _money(pct: Optional[float], nok: Optional[float], whole: str) -> Optional[str]:
+    """"1.50% of the portfolio ≈ 750 NOK", with whichever half is known."""
+    parts = []
+    if pct is not None:
+        parts.append(f"{pct:.2f}% of {whole}")
+    if nok is not None:
+        parts.append(f"{nok:,.0f} NOK")
+    return " ≈ ".join(parts) or None
+
+
+def stop_line(trade: TradeRisk, currency: str = "") -> str:
+    """Where the stop is, what it is measured from, and how far away it is."""
+    unit = f" {currency}" if currency else ""
+    return (
+        f"    risk: volatility stop {trade.stop_price:,.2f}{unit}, {trade.atr_multiple:g}×ATR below the "
+        f"{trade.reference_price:,.2f} close: {trade.stop_distance_price:,.2f} "
+        f"({trade.stop_distance_pct:.1f}%) away · ATR {trade.atr_price:,.2f} ({trade.atr_pct:.1f}%)"
+    )
+
+
+def size_line(trade: TradeRisk, whole: str = "the portfolio") -> Optional[str]:
+    """Money in the position, kept apart from the money at risk."""
+    if trade.exposure_pct is None:
+        return None
+    text = f"    size: {trade.exposure_pct:.0f}% of {whole}"
+    if trade.exposure_nok is not None:
+        text += f" ≈ {trade.exposure_nok:,.0f} NOK"
+    if trade.capped:
+        text += f" (capped at {SETTINGS.risk_max_position_pct:g}%)"
+    return text
+
+
+def loss_line(trade: TradeRisk, whole: str = "the portfolio") -> Optional[str]:
+    """Loss at the stop before costs, then the gap estimate or a plain "not measured"."""
+    planned = _money(trade.stop_loss_pct, trade.stop_loss_nok, whole)
+    if planned is None:
+        return None
+    if trade.gap_measured:
+        gap = (f"if it gaps through: about {_money(trade.gap_loss_pct, trade.gap_loss_nok, whole)}"
+               " (estimate, not a maximum)")
+    else:
+        gap = f"if it gaps through: not measured for a {trade.atr_multiple:g}×ATR stop"
+    return f"    loss at the stop: {planned}, before costs · {gap}"
+
+
+def warning_lines(trade: TradeRisk) -> List[str]:
+    return [f"    ⚠️ {escape(warning, quote=False)}" for warning in trade.warnings]
 
 
 def ask_lines(symbol: str) -> List[str]:
@@ -352,25 +598,18 @@ def ask_lines(symbol: str) -> List[str]:
 
 
 def candidate_lines(symbol: str, risk: Optional[PortfolioRisk]) -> List[str]:
-    """Extra lines under one candidate: sizing, fees and any event flag."""
+    """Extra lines under one candidate: stop, size, loss, fees, warnings and any event flag."""
     if risk is None:
         # The fee and the ASK rule are known without any lookups, so they show even then.
         return [fee_line(symbol, None), *ask_lines(symbol)]
     lines: List[str] = []
-    sized = risk.sizing.get(symbol)
-    if sized is not None:
-        text = (
-            f"    risk: volatility stop {sized.stop_price:,.2f} ({sized.stop_pct:.1f}% away)"
-            f" · size {sized.weight_pct:.0f}% of portfolio"
-        )
-        if sized.capped:
-            text += f" (capped; risks {sized.risk_pct:.2f}%)"
-        else:
-            text += f" for {sized.risk_pct:.2f}% risk"
-        if sized.amount is not None:
-            text += f" ≈ {sized.amount:,.0f}"
-        lines.append(text)
-    lines.append(fee_line(symbol, sized.amount if sized is not None else None))
+    trade = risk.trades.get(symbol)
+    if trade is not None:
+        lines.append(stop_line(trade))
+        lines.extend(line for line in (size_line(trade), loss_line(trade)) if line)
+    lines.append(fee_line(symbol, trade.exposure_nok if trade else None, trade.account_nok if trade else None))
+    if trade is not None:
+        lines.extend(warning_lines(trade))
     lines.extend(ask_lines(symbol))
     strength_line = relative_strength.render_line(risk.strength.get(symbol))
     if strength_line:
@@ -397,9 +636,13 @@ def portfolio_lines(risk: Optional[PortfolioRisk]) -> List[str]:
         lines.append(f"    Totals: {risk.total_weight_pct:.0f}% at work, {risk.max_loss_pct:.1f}% at risk if every stop is hit.")
     if risk.unknown_profiles:
         lines.append(f"    <i>Sector and earnings data unavailable for {risk.unknown_profiles} pick(s).</i>")
+    account = (f" Amounts use a portfolio of {SETTINGS.risk_account_size:,.0f} NOK (RISK_ACCOUNT_SIZE)."
+               if SETTINGS.risk_account_size > 0 else "")
     lines.append(
         f"    <i>Sizes risk {SETTINGS.risk_per_trade_pct:g}% of the portfolio per pick on a "
-        f"{SETTINGS.risk_stop_atr_multiple:g}×ATR stop. {GAP_RISK_NOTE} The screen itself has "
+        f"{SETTINGS.risk_stop_atr_multiple:g}×ATR stop below the signal close; buying above that "
+        f"close widens the loss.{account} {gap_note()} Fees are estimates; spread, slippage and "
+        "currency exchange cost are not included. The screen itself has "
         "not been shown to beat holding the same stocks.</i>"
     )
     lines.append("")

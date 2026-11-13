@@ -19,6 +19,7 @@ Status: **open** until the owner records a choice here.
 The Pi uses 3×ATR with **2% risk per trade**, a 25% position cap and 100% maximum exposure. Research §8 assumed 0.5% risk.
 
 - At 2% risk, a gap like the measured worst case loses about 4–5% of the account per position.
+- Update 2026-11-13: now measured for the live stop (3×ATR below the signal close, research §11). Worst case 11.9 points past the stop, so a capped 25% position with a 6% stop loses 4.5% of the account; the nine-in-ten gap loses 2.1%, against 1.5% at the stop. The settings themselves are unchanged and still the owner's call.
 - Four positions at 100% exposure put the whole account in four correlated names.
 
 **Options:**

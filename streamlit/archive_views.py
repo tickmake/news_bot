@@ -16,6 +16,7 @@ Only clean, finished rows of one series may be averaged. Classes and series
 are never pooled: `daily` refuses a frame that mixes them.
 """
 
+import json
 from typing import Dict, Optional
 
 import pandas as pd
@@ -209,3 +210,56 @@ def by_entry_session(scope: pd.DataFrame, chosen: pd.DataFrame) -> pd.DataFrame:
     averages = daily(chosen).set_index("day")[["picks", "skipped"]].rename(
         columns={"picks": "picks_avg", "skipped": "skipped_avg"})
     return counts.join(averages).sort_index(ascending=False)
+
+
+# --- risk of the picks that were sent ----------------------------------------
+
+# The bot saves the risk lines of a sent pick in `snapshot_json` under "risk"
+# (newsbot/risk.py, `snapshot`). This page shows that record and never works
+# one out: a pick sent before the record existed has none, and stays that way.
+PICK_RISK_SQL = """
+    SELECT substr(published_at, 1, 10) AS sent_on, symbol, signal_session, snapshot_json
+    FROM published_picks ORDER BY published_at DESC, symbol
+"""
+RISK_RECORDED = "recorded when sent"
+RISK_NOT_RECORDED = "not recorded"
+RISK_FIELDS = [
+    "reference_price", "stop_price", "stop_distance_price", "stop_distance_pct", "atr_pct",
+    "atr_multiple", "exposure_nok", "exposure_pct", "stop_loss_nok", "stop_loss_pct",
+    "gap_loss_nok", "gap_loss_pct", "fee_nok", "fee_pct",
+]
+# The record column comes early: a row of blanks must say why before anyone scrolls.
+RISK_COLUMNS = ["sent_on", "symbol", "record", "signal_session", *RISK_FIELDS, "gap", "costs",
+                "warnings"]
+
+
+def _gap_label(risk: dict) -> str:
+    if not risk.get("gap_measured"):
+        return f"not measured for {risk.get('atr_multiple'):g}×ATR"
+    return f"estimate: stop + {risk.get('gap_overshoot_pp'):.2f} pp"
+
+
+def _costs_label(risk: dict) -> str:
+    if risk.get("fee_nok") is None:
+        return "no amount, so no fee estimate"
+    fx = "" if risk.get("fx_cost_included") is None else "; currency exchange not included"
+    return f"estimated broker fee{fx}"
+
+
+def pick_risk(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per sent pick with the risk record it was sent with, or "not recorded"."""
+    rows = []
+    for row in df.itertuples(index=False):
+        try:
+            risk = json.loads(row.snapshot_json).get("risk")
+        except (TypeError, ValueError, AttributeError):
+            risk = None
+        out = {"sent_on": row.sent_on, "symbol": row.symbol, "signal_session": row.signal_session}
+        if isinstance(risk, dict):
+            out.update({name: risk.get(name) for name in RISK_FIELDS})
+            out.update(gap=_gap_label(risk), costs=_costs_label(risk),
+                       warnings=" ".join(risk.get("warnings") or []), record=RISK_RECORDED)
+        else:
+            out.update(record=RISK_NOT_RECORDED)
+        rows.append(out)
+    return pd.DataFrame(rows, columns=RISK_COLUMNS)

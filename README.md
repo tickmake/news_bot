@@ -475,7 +475,7 @@ After sending `/start` to the bot, you can use:
 - `/diagnostics` - break down historical signal outcomes and compare ranking on matching dates
 - `/pickperformance` - evaluate fixed-session outcomes of successfully delivered stock picks
 - `/health` - send runtime health report
-- `/check TICKER AMOUNT_NOK` - before placing an order, e.g. `/check EQNR.OL 12000`: shares and cost in NOK, the DNB fee and the rise needed to cover it, whether it may go in an Aksjesparekonto, earnings and ex-dividend dates in the next 4 weeks, overlap (same sector or moving together) with what `/fill` says you hold, the volatility stop's loss in NOK, how much it can fall over 2 and 4 weeks, and its share of your money. Telegram only. Information, never a buy or sell verdict
+- `/check TICKER AMOUNT_NOK` - before placing an order, e.g. `/check EQNR.OL 12000`: shares and cost in NOK, the DNB fee and the rise needed to cover it, whether it may go in an Aksjesparekonto, earnings and ex-dividend dates in the next 4 weeks, overlap (same sector or moving together) with what `/fill` says you hold, the volatility stop with its loss at the stop and its gap estimate in NOK and as a share of your money, the fee as a share of your money, how much it can fall over 2 and 4 weeks, and its share of your money. Telegram only. Information, never a buy or sell verdict
 
 `/morning` and `/evening` (forcing the greeting/tone of the scheduled
 07:00/19:00 briefing on demand) have been removed in favor of the more
@@ -788,13 +788,24 @@ risk, whether the picks are really one bet, and whether a known event sits insid
 the holding period, so each candidate and `/analyze` now carry:
 
 - **A volatility stop and a position size.** The stop is `RISK_STOP_ATR_MULTIPLE`
-  (2) times the stock's ATR below the close. The size is
-  `RISK_PER_TRADE_PCT` (0.5%) of the portfolio divided by that stop distance, so a
-  calmer stock gets a larger position and a wilder one a smaller one, each losing
-  the same fraction if the stop is hit. No position exceeds `RISK_MAX_POSITION_PCT`
-  (20%). Set `RISK_ACCOUNT_SIZE` to see an amount too. This stop is separate from
-  the "invalidation" level in the sketch, which is the 20-session low. A gap through
-  the stop loses more than planned.
+  (code default 2; the Pi's `.env` sets 3) times the stock's ATR below the close the
+  signal was formed on, not below your buy price. ATR is the plain average of the last
+  14 true ranges. The size is `RISK_PER_TRADE_PCT` (default 0.5%; the Pi sets 2%) of
+  the portfolio divided by that stop distance, so a calmer stock gets a larger position
+  and a wilder one a smaller one, each losing the same fraction if the stop is hit. No
+  position exceeds `RISK_MAX_POSITION_PCT` (20%). Set `RISK_ACCOUNT_SIZE` to see
+  amounts in NOK too. The "invalidation" level in the sketch is this same stop.
+- **Four separate risk numbers per pick**, worked out once in `risk.trade_risk` and
+  shown the same way in `/recommendations`, `/analyze`, `/check` and on the dashboard:
+  the **position** (money in the trade), the **loss at the stop** before costs, the
+  **loss if the stop gaps** (an estimate, never a maximum: the stop distance plus the
+  extra loss nine of ten measured gaps stayed under, from `research/gap_risk.py`; a
+  stop multiple that was never measured says "not measured" instead of borrowing
+  numbers), and the **fee** to buy and sell from the broker's table, also as a share of
+  the account. Spread, slippage and currency exchange cost are not included.
+- **A thin-trading warning** when the stock traded fewer shares a day over the last 20
+  sessions than `TRADE_BACKTEST_MIN_AVG_VOLUME` (100,000), or has no volume data. It is
+  a warning only: no gate and no size reads it.
 - **Whether it may go in an Aksjesparekonto** (#107): a `⛔ Not for ASK` line when
   `stock_list.csv` says `ask_allowed=no`, for any US listing, and `ASK: check first`
   for a stock outside the list.
@@ -1084,7 +1095,9 @@ crontab -e
 ## Dashboard
 
 Fjord Signals, at `http://raspberrypi5-02:8002`: the scorecard (picks vs
-skipped stocks), day by day, the latest screen, sent picks, a research page
+skipped stocks), day by day, the latest screen, sent picks with the risk lines each
+was sent with (stop, position, loss at the stop, gap estimate, fee; picks sent before
+that record existed show "not recorded" and are never recalculated), a research page
 per stock (price, key numbers, yearly company numbers, the bot's history with
 it), data collected per day, your `/fill` trades and holdings, and a what-if
 tool for the screen's filters. Built with Streamlit + Plotly; every page is in

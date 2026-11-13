@@ -25,6 +25,7 @@ python research/pit_coverage.py /tmp/pit_members.pkl sp500_wiki.html docs/resear
 # Both read the same basket pickle as step 1.
 python research/gate_sweep.py /tmp/basket.pkl /tmp/gate_sweep.pkl          # 3,456 threshold combinations x 3 hold lengths
 python research/gap_risk.py /tmp/basket.pkl                                # how often a 2xATR stop gaps through
+python research/gap_risk.py /tmp/basket.pkl 3.0 signal-close               # the same for the stop the bot places (section 11)
 
 # 5. Hold length and sell rule after DNB fees (issue #122)
 python research/fetch_stock_list.py /tmp/stock_list_10y.pkl                # stock_list.csv, ten years

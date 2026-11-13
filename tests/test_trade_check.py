@@ -58,12 +58,16 @@ class CheckTests(unittest.TestCase):
         text = self.check("eqnr.ol 12000")
         self.assertIn("<b>Check: EQNR.OL for 12,000 NOK</b>", text)
         self.assertIn("42 shares at 285.00 NOK = 11,970 NOK", text)
-        self.assertIn("fees: 118 NOK to buy and sell (1.0% of 11,970 NOK)", text)
+        self.assertIn("fees: 118 NOK to buy and sell (1.0% of 11,970 NOK, 0.24% of 50,000 NOK)", text)
         self.assertIn("    The stock must rise 1.0% before you make anything", text)
         self.assertIn("✅ Allowed in an Aksjesparekonto.", text)
         self.assertIn("Next earnings report: Jan 10, 2027, after a 4-week hold.", text)
         self.assertIn("You hold nothing yet.", text)
-        self.assertIn("2×ATR stop at 273.60 NOK (4.0% down) loses about 479 NOK", text)
+        self.assertIn("volatility stop 273.60 NOK, 2×ATR below the 285.00 close: 11.40 (4.0%) away"
+                      " · ATR 5.70 (2.0%)", text)
+        self.assertIn("loss at the stop: 0.96% of your money ≈ 479 NOK, before costs · if it gaps "
+                      "through: about 1.50% of your money ≈ 748 NOK (estimate, not a maximum)", text)
+        self.assertIn("The stop is measured from the 2026-11-10 close, not from your buy price.", text)
         self.assertIn("a bad 4 weeks: -9.0% ≈ -1,077 NOK on 11,970", text)
         self.assertIn("24% of your money (50,000 NOK). The risk rule suggests about 6,250 NOK.", text)
         self.assertIn("⚠️ More than the 20% limit for one stock.", text)

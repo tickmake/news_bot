@@ -246,6 +246,33 @@ def sent_picks() -> None:
         "benchmark_symbol": "Index", "net_return_pct": "Result after fees %",
         "excess_return_pct": "Better than index by %", "status": "Status"})
 
+    st.subheader("Risk when sent")
+    risk = views.pick_risk(query(views.PICK_RISK_SQL))
+    recorded = risk[risk["record"] == views.RISK_RECORDED]
+    st.write("The risk lines each pick was sent with: the same numbers as the Telegram message, "
+             "saved at that moment. Nothing here is worked out again later.")
+    st.dataframe(risk.round(2), hide_index=True, width="stretch", column_config={
+        "sent_on": "Sent on", "symbol": "Stock", "signal_session": "Close of",
+        "reference_price": "Close (stop measured from)", "stop_price": "Stop",
+        "stop_distance_price": "Stop distance", "stop_distance_pct": "Stop distance %",
+        "atr_pct": "ATR %", "atr_multiple": "ATR ×",
+        "exposure_nok": "Position (NOK)", "exposure_pct": "Position % of account",
+        "stop_loss_nok": "Loss at the stop (NOK)", "stop_loss_pct": "Loss at the stop % of account",
+        "gap_loss_nok": "Loss in a gap (NOK)", "gap_loss_pct": "Loss in a gap % of account",
+        "fee_nok": "Fees to buy and sell (NOK)", "fee_pct": "Fees % of account",
+        "gap": "Gap figure", "costs": "Costs", "warnings": "Trading warnings",
+        "record": "Risk record"})
+    st.caption(
+        "**Position** is the money in the trade; **loss at the stop** is what it loses if it sells "
+        "exactly at the stop, before costs. **Loss in a gap** is an estimate for a stop that opens "
+        "below its price (nine of ten measured gaps lost less); it is not a maximum. **Fees** are "
+        "the broker's table, not what was paid; spread, slippage and currency exchange are not "
+        "included. Prices are in the stock's currency. The stop is measured from the close the "
+        "signal was formed on, not from a buy price.  \n"
+        f"{len(risk) - len(recorded)} of {len(risk)} picks were sent before this record existed. "
+        "They show \"not recorded\": the settings they were sized with were not saved, so their "
+        "risk cannot be rebuilt.")
+
 
 RANGES = {"1M": 21, "3M": 63, "6M": 126, "YTD": None, "1Y": 252, "MAX": 0}
 YEARLY_CHARTS = [
@@ -482,6 +509,7 @@ def my_money() -> None:
     st.subheader("My trades")
     st.dataframe(trades[["trade_date", "side", "symbol", "shares", "price", "currency",
                          "fx_to_nok", "fee_nok"]], hide_index=True, width="stretch")
+    st.caption("Fees here are the ones you typed in with /fill: what was paid, not an estimate.")
 
 
 def what_if() -> None:

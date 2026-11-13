@@ -335,7 +335,7 @@ def _entry_exit_sketch(
     the "informational only" footer in `get_trade_candidates`.
 
     The downside is measured to the **same stop the sizing line uses** (the
-    2xATR volatility stop) whenever risk analytics produced one. This line
+    configured N x ATR volatility stop) whenever risk analytics produced one. This line
     used to measure risk to the 20-session low while the risk line directly
     below it placed a volatility stop somewhere else entirely, so one block
     showed two different stops and a reward:risk computed against the one the

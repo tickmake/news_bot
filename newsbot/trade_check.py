@@ -163,10 +163,13 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     lines.append(f"{shares} shares at {price_text} = {cost:,.0f} NOK (close of {escape(metrics.session)})")
     lines.append("")
 
+    total, cash = _account_value()
+    # The same calculation /recommendations uses, for the amount asked about.
+    trade = risk.trade_risk(metrics, exposure_nok=cost, account_nok=total)
+
     lines.append("<b>Fees</b>")
-    lines.append(risk.fee_line(symbol, cost))
-    per_side = max(SETTINGS.broker_fee_min_nok, cost * SETTINGS.broker_fee_pct / 100.0)
-    fee_pct = 2 * per_side / cost * 100
+    lines.append(risk.fee_line(symbol, cost, total))
+    fee_pct = risk.round_trip_fee(cost) / cost * 100
     mark = "⚠️ " if fee_pct >= FEE_WARN_PCT else ""
     lines.append(f"    {mark}The stock must rise {fee_pct:.1f}% before you make anything. "
                  "A 4-week hold made about 1.5% on average before fees in the 10-year test.")
@@ -189,15 +192,16 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
 
     lines.append("<b>Risk</b>")
     sized = risk.size_position(metrics)
-    if sized is not None:
-        lines.append(
-            f"    A {SETTINGS.risk_stop_atr_multiple:g}×ATR stop at {sized.stop_price:,.2f} {currency} "
-            f"({sized.stop_pct:.1f}% down) loses about {cost * sized.stop_pct / 100:,.0f} NOK, more if it gaps.")
+    if trade is not None:
+        lines.append(risk.stop_line(trade, currency))
+        lines.append(risk.loss_line(trade, "your money"))
+        lines.extend(risk.warning_lines(trade))
+    else:
+        lines.append("    No stop: the stock's daily swing (ATR) isn't available.")
     lines.extend(risk_forecast.lines(forecast, cost))
     lines.append("")
 
     lines.append("<b>Size</b>")
-    total, cash = _account_value()
     if total:
         share = cost / total * 100
         text = f"    {share:.0f}% of your money ({total:,.0f} NOK)."
@@ -206,7 +210,7 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
             text += f" The risk rule suggests about {suggested:,.0f} NOK."
         lines.append(text)
         if suggested:
-            suggested_fee = 2 * max(SETTINGS.broker_fee_min_nok, suggested * SETTINGS.broker_fee_pct / 100.0)
+            suggested_fee = risk.round_trip_fee(suggested)
             if suggested_fee / suggested * 100 > SMALL_SIZE_FEE_PCT:
                 lines.append(
                     f"    ⚠️ At that size the fee is {suggested_fee / suggested * 100:.1f}% round trip: "
@@ -218,5 +222,8 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     if cash is not None and cost > cash:
         lines.append(f"    ⚠️ More than your cash ({cash:,.0f} NOK).")
     lines.append("")
+    lines.append(f"<i>The stop is measured from the {escape(metrics.session)} close, not from your buy "
+                 f"price. {risk.gap_note()} Fees are estimates; spread, slippage and currency "
+                 "exchange cost are not included.</i>")
     lines.append("<i>Information only, not a buy or sell signal. Prices may be delayed.</i>")
     return "\n".join(lines)

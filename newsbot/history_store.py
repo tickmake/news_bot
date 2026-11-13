@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests.exceptions
 import yfinance as yf
 
-from newsbot import market_data
+from newsbot import market_data, risk
 from newsbot.benchmarks import _backtest_benchmark_for, _matched_benchmark_return
 from newsbot.config import SETTINGS
 from newsbot.indicators import TradeMetrics, _drop_unfinished_bar
@@ -458,6 +458,12 @@ class TradeHistoryStore:
                     snapshot = {
                         "rank": rank,
                         "metrics": asdict(metrics),
+                        # The risk lines as sent, so the dashboard shows what the
+                        # message showed. Rows published before this key existed
+                        # have none and are never given one: the settings they
+                        # were sized with were not saved.
+                        "risk": risk.snapshot(risk.pick_risk(metrics))
+                        if SETTINGS.risk_analytics_enabled else None,
                         "gates": {
                             key: getattr(SETTINGS, key)
                             for key in (

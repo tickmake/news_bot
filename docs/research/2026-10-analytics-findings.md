@@ -357,6 +357,41 @@ others next month. The 6-month forward test (#79) is not worth running on the sc
 they are. If anything is followed up, it is value in the EU, re-tested in 2027 with
 another year of data.
 
+## 11. Gap risk for the stop the bot actually places (issue #161, November 2026)
+
+Section 7 measured a 2xATR stop placed below the **buy price**. The bot places its stop
+below the **close the signal was formed on** (`risk.size_position`), and the Pi runs
+3xATR. So the footer quoted numbers for a stop that was never the live one.
+`research/gap_risk.py` now takes the multiple and the anchor as arguments. Same basket
+(44 stocks, ten years to 2026-11-13), same five gates, 20-session hold:
+
+| Stop | Entries | Stopped | Gapped (of stops) | Extra loss when gapped: mean / 90th / worst | Stop distance from the close vs from the buy |
+|---|---|---|---|---|---|
+| 2xATR below the buy price (section 7, rerun) | 26,583 | 46.5% | 14.0% | 0.93 / 2.28 / 10.82 pp | 4.13% / 4.13% |
+| 2xATR below the signal close | 26,541 | 45.9% | 14.3% | 0.95 / 2.25 / 11.22 pp | 4.13% / 4.20% |
+| **3xATR below the signal close (live)** | 26,572 | 28.9% | 13.7% | **1.02 / 2.55 / 11.94 pp** | 6.19% / 6.26% |
+| 3xATR below the signal close, volume 1.2x or more | 7,016 | 28.6% | 12.8% | 1.18 / 2.96 / 11.94 pp | 6.32% / 6.42% |
+| 3xATR below the buy price | 26,583 | 29.1% | 14.3% | 1.00 / 2.56 / 7.42 pp | 6.19% / 6.19% |
+
+What this says:
+
+- The rerun of section 7 reproduces it (46.4% / 13.9% / 0.93 / 2.29 / 10.82 then), so the
+  script change did not move the old numbers.
+- A 3xATR stop is hit less often (29% against 46%), but when it is hit it gaps about as
+  often: **about 1 stop in 7**, at either multiple and either anchor. The extra loss is a
+  little larger in points (1.0 mean, 2.6 at the 90th percentile, 11.9 at worst).
+- Anchoring to the signal close makes the real distance from the buy price 0.07 points
+  wider on average, and wider than stated in 57% of entries. It is a small average with a
+  tail: 11 entries opened at or below the stop and are counted as not traded.
+- Volume is not one of the five gates; it only orders the list. The "confirmed by volume"
+  rows are a subset, and their numbers are close (a slightly larger overshoot).
+
+The bot keeps one row per measured stop in `risk.GAP_STUDIES` (the two signal-close rows
+without the volume filter) and prints the row for the stop in use. A multiple with no row
+prints "not measured". The per-pick "if it gaps through" figure adds the 90th-percentile
+extra loss to the stop distance. It is an estimate from survivors in a rising decade, not a
+maximum: the worst case here was 11.9 points past the stop.
+
 ## Conclusions
 
 1. Daily price gates, classic factors and earnings surprises show **no reliable edge**
@@ -376,7 +411,7 @@ another year of data.
    one bet, and what events fall inside the hold**. That is what the risk and
    relative-strength lines in `/recommendations` and `/analyze` provide. Section 7 puts
    measured numbers behind two of its disclaimers: the stop gaps through about one time
-   in seven, and correlated picks now have their combined loss stated rather than implied.
+   in seven (section 11 repeats this for the 3xATR stop the bot places), and correlated picks now have their combined loss stated rather than implied.
 4. With real DNB fees, **hold length matters more than any signal tested here**: a
    5-session trade loses about 0.7% to fees on average, a 20-session trade makes about
    +0.5% (section 8). A 2xATR stop is hit in almost half of 4-week holds; 3xATR is the
