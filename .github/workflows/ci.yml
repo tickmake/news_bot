@@ -57,6 +57,13 @@ jobs:
         # A separate image with its own requirements; nothing else builds it.
         run: docker build -t news-bot-dashboard-ci ./streamlit
 
+      - name: Open dashboards close at logout and expiry (real Streamlit)
+        # Only the dashboard image has Streamlit, so the test job skips these.
+        run: |
+          docker run --rm --read-only --tmpfs /tmp -v "$PWD":/src:ro -w /src \
+            -e PYTHONDONTWRITEBYTECODE=1 news-bot-dashboard-ci \
+            python -m unittest -v tests.test_dashboard_websocket_live
+
       - name: Entrypoint drops privileges and fixes a root-owned volume
         run: |
           vol="$(mktemp -d)"

@@ -1112,7 +1112,9 @@ file and websocket: one password, then a signed session cookie (HttpOnly,
 SameSite=Lax, 12 hours by default), with "Log out" in the sidebar. Logging out
 ends every session, and stays in force across restarts and redeploys: the
 dashboard keeps one random value on a small volume of its own
-(`dashboard_state`). Only `/_stcore/health` answers without a session, for the
+(`dashboard_state`). Dashboards already open, on any device, are disconnected
+at the logout, and each one is disconnected when its session expires; nothing
+more reaches them, and a reload shows the login page. Only `/_stcore/health` answers without a session, for the
 Docker health check. Five wrong passwords from one address lock it out for 15
 minutes. Set it up once in the Pi's `.env`, **before** the change is deployed.
 Until a hash is set, every page answers 503:
