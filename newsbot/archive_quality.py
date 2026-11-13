@@ -65,8 +65,11 @@ def static_defect(row: Dict[str, Any]) -> Optional[str]:
         signal_day = date.fromisoformat(row["signal_session"])
     except (TypeError, ValueError):
         return "bad_signal_session"
-    if recorded.astimezone(exchange.zone).date() <= signal_day:
-        return "recorded_before_signal_closed"
+    if recorded.astimezone(exchange.zone).date() < signal_day:
+        # Only a recording dated before the signal's own session is impossible.
+        # The same date is fine: a screen run after the close records that day's
+        # signal, and the entry rule then picks the next session by itself.
+        return "recorded_before_signal_session"
     if row.get("outcome_json"):
         try:
             entry_session = json.loads(row["outcome_json"])["entry_session"]

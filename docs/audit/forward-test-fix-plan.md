@@ -149,7 +149,7 @@ The classifier therefore runs in two stages.
 |---|---|---|
 | 1 | `recorded_at` is empty, unparseable, or has no UTC offset | `bad_recorded_at` |
 | 2 | The symbol's suffix has no entry in the exchange table | `unsupported_exchange` |
-| 3 | `recorded_at`, in exchange time, is not after the date of `signal_session` | `recorded_before_signal_closed` |
+| 3 | `recorded_at`, in exchange time, falls on a date before `signal_session`. The same date is valid: a screen run after the close records that day's signal, and the entry rule picks the next session. (Corrected after review; revision 3 first said "not after", which wrongly rejected same-day recordings.) | `recorded_before_signal_session` |
 | 4 | A stored outcome has an `entry_session` that is not after `signal_session` | `bad_outcome` |
 
 **Stage 2: entry check.** Runs only on rows that passed stage 1, once the entry session is known. For a settled legacy row the entry is already in its outcome, so no fetch is needed. For every other row it comes from the validated price history (section 5.3).
@@ -437,7 +437,7 @@ Holiday dates in rows 5, 12 and 15 are fixtures: the test supplies bars without 
 - Empty string, garbage text, a date with no time, and a naive timestamp, for a new-policy row and for a legacy row: each is classified `invalid` with reason `bad_recorded_at` on the first pass.
 - For those rows, assert that **no price fetch is made**, that the view never shows them as `awaiting_entry` after that pass, and that a second settle pass reports zero failures and returns success.
 - A timestamp with a non-UTC offset (for example `+01:00`) gives the same entry as the equivalent UTC value.
-- `recorded_at` earlier than the signal session's own date: `invalid`, reason `recorded_before_signal_closed`.
+- `recorded_at` on an exchange-local date before the signal session's: `invalid`, reason `recorded_before_signal_session`. On the same date or later: valid.
 - A row failing two static checks gets the reason of the first in the order of section 3.3.
 
 ### 8.4 Invariant
