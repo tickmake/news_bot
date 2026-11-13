@@ -4,6 +4,8 @@ Report date: 2026-11-13. Branch `feat/dashboard-login`, from `main` at `a67ef63`
 
 **Corrected the same day (section 7):** in the first version, a logout did not survive a restart. Its record was kept in memory, but the signing key comes from `.env`, so after a restart or redeploy the old cookies worked again. Logout now writes a new random "session epoch" to a small volume of the dashboard's own. Sections 1 to 6 describe the corrected version.
 
+**Follow-up, branch `fix/dashboard-websocket-session-revocation` (section 8):** a dashboard that was already open kept receiving data after a logout or after its session expired, because the gate checked the websocket only when it opened. Every open websocket is now closed at logout, on every device, and at its session's expiry, and nothing more is delivered on it.
+
 **Not deployed to the Pi.** Nothing on the Pi was changed: no `.env` edit, no restart, no firewall, nginx or Portainer change. A merge to `main` deploys automatically within 5 minutes. Section 6 says what must be in the Pi's `.env` first.
 
 ## 1. What changed
@@ -52,6 +54,8 @@ The dashboard still opens the database read-only, on a read-only volume. The onl
 - **Logout:** "Log out" in the sidebar opens a confirm page, and its POST ends **every** session, including after restarts and redeploys (section 7).
   - The POST picks a new epoch, writes it to the volume, and only then answers.
   - A logout POST from a browser without a valid session only clears that browser's cookie. A forged form therefore cannot log the owner out.
+  - Every dashboard that is open at that moment, on any device, is disconnected at once (section 8).
+- **Expiry:** an open dashboard is disconnected when its session expires, even if nobody touches it (section 8).
 - **Restarts:** sessions survive a restart or redeploy while nobody has logged out, because the key and the epoch both survive it.
 
 **Responses**
@@ -73,7 +77,7 @@ The dashboard still opens the database read-only, on a read-only volume. The onl
 
 - **Redirect target:** after login, `next` must be a local path. `//host`, `https://…`, backslashes, control characters, `/login` and `/logout` all become `/`.
 - **Headers on the gate's own pages:** `Cache-Control: no-store`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and a CSP of `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`. The pages have no JavaScript.
-- **Logs:** the login logs `login_ok`, `login_failed`, `login_rate_limited`, `login_refused` and `logout`, each with the client address only. A refused websocket is logged at debug level, because a tab left open after logout keeps retrying. The epoch file logs `session_state_loaded` or `session_state_created` at start, and `session_state_invalid`, `_unreadable`, `_unwritable`, `_not_removed` or `_stuck` when something is wrong. These lines give the path and the OS error, never the epoch.
+- **Logs:** the login logs `login_ok`, `login_failed`, `login_rate_limited`, `login_refused` and `logout`, each with the client address only. A refused websocket is logged at debug level, because a tab left open after logout keeps retrying. An open websocket closed by the gate logs `websocket_closed reason=logout` or `reason=expired`, with the client address. The epoch file logs `session_state_loaded` or `session_state_created` at start, and `session_state_invalid`, `_unreadable`, `_unwritable`, `_not_removed` or `_stuck` when something is wrong. These lines give the path and the OS error, never the epoch.
 
 ## 3. Requirements against results
 
@@ -242,11 +246,7 @@ The image was run with a test hash, under the compose hardening (read-only, no c
 2. **Anyone with Docker or Portainer access on the Pi.** They can read the container environment and the database directly.
    - The bot's `env_file: .env` also loads the two dashboard settings into the bot container, as it does every other `.env` key.
    - Portainer is published on `0.0.0.0:9443/8000` and controls Docker. It is the bigger host risk, and outside this repository.
-3. **A websocket that is already open.** The gate checks the cookie only when the websocket opens.
-   - A tab connected before logout or expiry keeps working until it reloads or disconnects.
-   - So does a script holding a stolen cookie that keeps its connection open.
-   - The independent review showed this with real Streamlit: after logout the old cookie gets 401 and a new websocket gets 403, but the already-open one still reruns the app.
-   - The fix would be for the gate to watch each open websocket and close it (code 1008) once its token stops being valid. That is a change to the websocket path, not to how a logout is kept, so it was left out of this correction. **It is the main follow-up.**
+3. **A websocket that is already open: fixed by the follow-up (section 8).** Until then, the gate checked the cookie only when the websocket opened, so a tab connected before a logout or expiry kept working, and so did a script holding a stolen cookie. Now each open websocket is closed (code 1008) once its session is over. What remains is in section 8.6.
 4. **One shared password.** There are no separate accounts. Logout ends every session.
    - A logout POST from a browser without a valid session revokes nothing. That is what stops a forged logout. But it answers with the same 303 as a real logout.
    - So someone who has lost a phone must **log in first**, then log out, to end the phone's session. The confirm page does not say this today. Changing that page was outside this correction's scope (no UI changes).
@@ -399,4 +399,186 @@ A separate review was given the code and asked only to make an old session valid
 - The 500 page now says how to end the old sessions for certain.
 - The damaged-file tests now include damage that keeps the old epoch within reach, and the write is now broken inside the function in the tests, not only mocked out as a whole.
 
-**Found and not fixed** (section 5): the open websocket (item 3), the silent logout without a session (item 4), and an unsaved logout followed by a recovered disk (item 5). Also noted: the review's process killed after the temporary file was written, but before the rename, kept the old epoch. That is expected, because no logout answer had been sent yet. A FIFO placed at the state path would hang the start-up; doing that needs write access to the volume.
+**Found and not fixed** (section 5): the open websocket (item 3; fixed since, section 8), the silent logout without a session (item 4), and an unsaved logout followed by a recovered disk (item 5). Also noted: the review's process killed after the temporary file was written, but before the rename, kept the old epoch. That is expected, because no logout answer had been sent yet. A FIFO placed at the state path would hang the start-up; doing that needs write access to the volume.
+
+## 8. Follow-up: open dashboards close when their session ends
+
+Branch `fix/dashboard-websocket-session-revocation`, from `main` at `0dc17d9` (the login and the restart correction, merged). Not merged and not deployed.
+
+### 8.1 The defect
+
+A Streamlit page gets all of its data over one websocket, `/_stcore/stream`. The gate checked the session cookie only when that websocket opened. A tab that was already open therefore kept working after:
+
+- a logout, from that browser or any other device;
+- the session's expiry (12 hours by default).
+
+Reproduced on `main` with the real stack (`streamlit run serve.py`, uvicorn, Starlette, Streamlit's own websocket handler), by `tests/test_dashboard_websocket_live.py`:
+
+- after a logout, both open sockets stayed open, and a rerun on either still returned the page's data;
+- after the session expired, the idle socket stayed open past the expiry and still answered reruns.
+
+Both tests failed on `main` and pass on the branch.
+
+### 8.2 How it works now
+
+All of it is in `streamlit/auth.py`. Nothing else in the dashboard changed: no setting, route, page, volume or dependency.
+
+**Tracking.** When a websocket passes the gate's checks (a valid session cookie and a same-site `Origin`), the gate wraps it in a `_Socket` and adds it to a set of open sockets. It does this before Streamlit sees the connection.
+
+- A `_Socket` keeps only the session's **epoch** and **expiry time**, and the client address for the log.
+- It never keeps the cookie, the token, its nonce or signature, the password or the secret (tested).
+- The epoch is the server's own current value, which is also held in memory and in the state file. It cannot be used to make a token without the secret.
+- The socket leaves the set when Streamlit's handler returns: normally, by an error, or by cancellation at shutdown.
+
+**Logout, on every device.** A logout already starts a new epoch, which ends every session. Straight after that, in the same synchronous step, it marks every open socket's session as over. Each socket then closes at once:
+
+1. its watcher task sends a close with code **1008** (policy violation);
+2. Streamlit's handler, which is waiting for the browser's next message, gets a `websocket.disconnect` instead, so it ends its session and cleans up as if the browser had left.
+
+**Expiry, with no browser activity.** Each open socket has a small watcher task. It sleeps until the session's expiry time, or at most 60 seconds (`WATCH_SECONDS`), and then checks again. When the session is over, it closes the socket as above. It wakes at the expiry itself; the 60-second limit only matters if the clock jumps.
+
+**No data after the session ends.** Every message that Streamlit sends to the browser goes through the socket's `send`, which checks the session first.
+
+- If the session is over, the message is not sent. The socket is closed with 1008 instead.
+- After the close, nothing more is sent at all, including a second close from the app.
+- So data queued before a logout, but not yet written, is dropped. That includes rerun results and cache refreshes.
+
+**Opening race.** If a logout lands after the gate has checked a new websocket but before Streamlit has accepted it, the accept is turned into a close. The browser then gets **403**, the same as any refused websocket.
+
+- Starlette must read the browser's opening `websocket.connect` message before it accepts. The gate passes that one message through, because it carries no data. A disconnect at that point would have made Starlette raise an error.
+
+**Races and cancellation**
+
+- **Check and registration together.** The session check and the registration happen with no pause between them. The logout's epoch change and its sweep also happen with no pause. On the single event loop, a connecting socket is therefore either checked before the logout, and then registered and swept, or checked after it, and then refused.
+- **A missed socket still sends nothing.** If the sweep missed a socket, `send` and the watcher check the epoch themselves, so a new epoch alone stops the data (tested).
+- **One message at a time.** A lock serialises messages to the server. A close cannot interleave with a message being written, and nothing follows the close.
+- **Waiting for the browser.** The wait for the browser's next message is raced against the "session over" signal. The losing read is cancelled, and its result or exception is collected.
+- **Shutdown.** When the server cancels the connection, the socket leaves the set. Its watcher and any pending read are cancelled and awaited, and no task is left behind (tested).
+- **Ended for good.** Once a session is over for a socket, it stays over, even if the clock is later set back.
+
+**Close codes and Streamlit's reconnect**
+
+- The gate closes with **1008**, the code it already uses to refuse a websocket.
+- Streamlit's page reacts as it does to any lost connection: it tries to reconnect.
+  - Its first step is an HTTP request, which the gate answers with 401.
+  - The page then shows Streamlit's "Connection error: Connection failed with status 401" (headless Chrome, section 8.4).
+  - Reloading shows the login page.
+- After a fresh login, a new websocket works as before (tested).
+- A restart closes every socket on its own: uvicorn sends **1012** (service restart). The same cookie reconnects afterwards unless someone logged out, because the epoch is still on the volume.
+
+**Logs.** Each socket that the gate closes logs `websocket_closed reason=logout|expired client=<address>`. No token, cookie or epoch is logged.
+
+### 8.3 Tests
+
+`tests/test_dashboard_auth.py`: 17 new tests in `OpenWebsocketTests`. They drive the gate with a fake app shaped like Streamlit's handler:
+
+- it reads the opening message as Starlette insists;
+- it accepts;
+- one task reads the browser's messages while another sends from a queue.
+
+The gate's clock is a fake one that the tests move, so nothing waits for a real expiry. The re-check interval stays at the production 60 seconds, except in the tests whose subject is the expiry check, so a logout has to close sockets by itself.
+
+| Required behaviour | Test(s) |
+|---|---|
+| Logout closes the websocket | `test_a_logout_closes_the_open_dashboard` |
+| Two (here four) devices: logout from one closes all | `test_a_logout_on_one_device_closes_every_device`: two tabs on the laptop, a phone and a tablet all close with 1008; none of the cookies can open a new socket |
+| Idle expiry closes automatically | `test_an_idle_dashboard_closes_when_its_session_expires`: still open 0.1 s before the expiry, closed after it, with nothing sent by either side. `test_the_expiry_is_noticed_when_it_comes_not_at_the_next_check`: with the 60-second interval, a session 0.3 s from its expiry closes at the expiry |
+| No data after the session ends | Each close is followed by a browser request and a push from the app, and nothing arrives. `test_data_between_an_expiry_and_the_next_check_is_not_sent`; `test_nothing_queued_before_the_logout_is_sent_after_it`; `test_an_app_that_keeps_sending_after_the_close_gets_nothing_through` (not even a second close); `test_a_new_epoch_alone_stops_the_data` |
+| A new login after logout works | `test_signing_in_again_after_a_logout_opens_a_working_dashboard` |
+| No needless disconnects | `test_a_live_session_is_never_disconnected`: an hour of use, re-checked every 10 ms, another device signing in, a logout without a session, and a cross-site logout; the socket stays open throughout |
+| Many connections cleaned up | `test_many_open_dashboards_close_and_leave_nothing_behind`: 25 sockets on 5 sessions; afterwards no registration, no app queue and no task is left |
+| One client leaving does not affect others | `test_one_tab_leaving_does_not_touch_the_others` |
+| Logout racing connects | `test_logouts_racing_new_connections_leave_none_open_on_an_old_session`: 8 sockets started around a logout in five different orders; each is refused or closed, and none is left open. `test_a_logout_while_a_dashboard_is_opening_refuses_it`: the app holding before it reads the opening message, or before it accepts; the result is 403 and no error |
+| Shutdown and cancellation | `test_a_server_shutdown_leaves_nothing_behind` |
+| Nothing secret kept or logged | `test_the_tracking_keeps_no_token_and_the_log_names_none`; `test_a_session_that_is_over_stays_over_if_the_clock_steps_back` |
+| HTTP login, persistent revocation, CSRF, Origin checks, rate limits, health | The 64 earlier tests, unchanged and passing |
+
+`tests/test_dashboard_websocket_live.py` (new) is an integration test on the real ASGI stack.
+
+- It starts `streamlit run serve.py` and talks to it in Streamlit's own protobuf protocol.
+- **Logout:** a laptop and a phone each load the page. The laptop logs out. Both sockets are closed with 1008, with no message after the logout. A rerun sent on either one afterwards gets nothing. Both cookies are refused (403), and a fresh login loads the page.
+- **Expiry:** with a 12-second session, an idle socket that has loaded the page is closed with 1008 between 10 and 17 seconds after login. A rerun afterwards gets nothing.
+- **Log:** the server's log holds no token and no traceback.
+- The bot's test job skips this file, because it needs Streamlit. **CI now runs it inside the built dashboard image**: one new step in the existing `docker` job, read-only root, as `nobody`.
+
+### 8.4 Results
+
+| Check | Result |
+|---|---|
+| `python -W error::ResourceWarning -m unittest`, full suite (Python 3.15.2) | **1,159 tests, OK** (1,140 on `main` + 17 + 2 live, which skip outside the dashboard image). The same pre-existing "unclosed database" warning as on `main`. |
+| `tests.test_dashboard_auth` on Python 3.11 (CI's other version), `-X dev` | 81 tests, OK (2 skipped as root, as before) |
+| `ruff check news_bot.py newsbot tests streamlit/auth.py streamlit/serve.py` | All checks passed |
+| `docker build ./streamlit` | Built |
+| `tests.test_dashboard_websocket_live` in the built image (the CI step's command) | **2 tests, OK**. On `main` both fail: the sockets are never closed. |
+
+**Guards broken on purpose.** All 21 of the following breaks fail tests:
+
+| Broken guard | Tests failing |
+|---|---|
+| Logout does not end open sockets (sweep emptied / not called) | 7 / 7 |
+| `send` does not check the session | 5 |
+| `send` passes messages after the close | 1 |
+| The wait for the browser is not interrupted | 16 |
+| The opening message not passed through | 1 |
+| A socket never leaves the set | 5 |
+| The watcher not cancelled | hangs (caught by the timeout) |
+| The watcher ignores the expiry time (60-second checks only) | 1 |
+| The watcher closes after one wait | 2 |
+| A socket's session check ignores the session / the expiry / the epoch | 5 / 4 / 1 |
+| An ended session counts as live again if the clock steps back | 1 |
+| Closing does not end the session | 3 |
+| Close code 1000 instead of 1008 | 15 |
+| The app is not told the browser left | 16 |
+| The pending read not cancelled | 13 |
+| Websockets passed straight to the app (no tracking) | 16 |
+| Websocket origin / session not checked | 4 / 27 |
+
+**Challenge: trying to get data after a logout and after an expiry.** These checks ran against the real dashboard, in the built image.
+
+- **A raw TCP websocket client** that ignores the server's close frame. It sent a rerun request every 0.3 seconds and read every byte until the server dropped the connection.
+  - A rerun was in flight at the moment of the logout.
+  - Both devices received `close 1008`, then end-of-stream, and **no data frame after the close**.
+  - Both old cookies were refused with 403.
+  - With a 10-second session, the idle socket was closed with 1008 at the expiry (9.3 s after the page finished loading). Hammering it afterwards got only end-of-stream, and the cookie was refused.
+  - The server log held no tracebacks and none of the tokens.
+- **Headless Chrome**, logged in on "My money" with a demo database. The tab's own cookie was then logged out from outside the browser.
+  - The tab's websocket closed **11 ms** after the logout.
+  - It received **0** frames afterwards, including after an `r` (rerun) key press.
+  - Streamlit showed "Connection error: Connection failed with status 401".
+  - A reload showed the login page.
+- **Restart**, with a compose-style container: read-only root, no capabilities, a named volume at `/app/state`.
+  - A `docker restart` closed the open socket with 1012 within 0.2 s.
+  - The same cookie then reconnected and loaded the page, because the epoch was kept.
+  - After a logout and another restart, that cookie's websocket got 403.
+- The test containers, volume and network were removed afterwards.
+
+### 8.5 Files
+
+| File | Change |
+|---|---|
+| `streamlit/auth.py` | `_Socket`, plus `LoginGate._serve_websocket`, `_watch` and `_end_sockets`. `Sessions.claims()` returns the epoch and expiry of a valid token, and `valid()` is built on it. `Sessions.current()` asks whether that session is still in force. Two constants, `WATCH_SECONDS` and `POLICY_VIOLATION`. The token format, the signing, the hashing and the epoch file are unchanged. |
+| `tests/test_dashboard_auth.py` | 17 tests and their harness (`Dashboard`, `Browser`, `RunningClock`, async `ahttp`). |
+| `tests/test_dashboard_websocket_live.py` (new) | The real-stack test (section 8.3). |
+| `.github/workflows/ci.yml` | One step: run that test in the dashboard image. |
+| `README.md`, this report | Updated. |
+
+No new setting, dependency, service, volume or route. The UI, Telegram, strategy, risk, records and data collection are untouched.
+
+### 8.6 What it still does not do
+
+- **What is already on screen stays there.** The tab keeps showing the last page it rendered, dimmed, under "Connection error", until it is reloaded or closed. Nothing new reaches it. Clearing the page or redirecting to the login would need a front-end change, which was out of scope.
+- **Bytes already sent are not recalled.** A message that Streamlit had handed to the server before the logout can still arrive, a few milliseconds later. Nothing is handed over after it.
+- **HTTP requests already in progress finish.** For example, a media file that started downloading before the logout. Every new request is checked, as before. The data itself only travels over the websocket.
+- **Expiry follows the Pi's clock,** as before.
+  - The watcher wakes at the expiry time, as it stood when the watcher last went to sleep.
+  - If the clock jumps forwards past an expiry, an idle socket is closed at the next check, within 60 seconds. Any message sent in the meantime is checked and stopped at once.
+  - If the clock is set back, a session can last longer, as tokens always could.
+- **One process.** The set of open sockets lives in memory, as the epoch does. That fits the single dashboard container. A second process sharing the volume was already unsupported (section 5, item 5).
+- **The logout from a browser without a valid session still revokes nothing** (section 5, item 4). So it also closes no sockets.
+
+### 8.7 Deployment
+
+- Merging deploys it, as usual.
+- Nothing new is needed in the Pi's `.env`, and no volume is added.
+- Open dashboards are cut off once by the redeploy's restart (code 1012). They then reconnect with their existing session.
+- To roll back, revert the commit. The epoch file and the sessions are unaffected.

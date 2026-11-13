@@ -109,8 +109,13 @@ def _scope_headers(headers):
     return [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()]
 
 
-def http(gate, path, method="GET", headers=None, body=b"", query=b"", scheme="http", client=LAN,
-         chunks=None):
+def http(gate, path, *args, **kwargs):
+    return asyncio.run(ahttp(gate, path, *args, **kwargs))
+
+
+async def ahttp(gate, path, method="GET", headers=None, body=b"", query=b"", scheme="http", client=LAN,
+                chunks=None):
+    """`http` inside a running event loop, next to open websockets."""
     headers = {"host": HOST, **(headers or {})}
     scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
              "scheme": scheme, "path": path, "raw_path": path.encode(), "query_string": query,
@@ -126,7 +131,7 @@ def http(gate, path, method="GET", headers=None, body=b"", query=b"", scheme="ht
     async def send(message):
         sent.append(message)
 
-    asyncio.run(gate(scope, receive, send))
+    await gate(scope, receive, send)
     return Response(sent)
 
 
@@ -150,9 +155,9 @@ def websocket(gate, headers=None, path="/_stcore/stream"):
     return "accepted" if first["type"] == "websocket.accept" else first["code"]
 
 
-def make_gate(password_hash=HASH, secret=SECRET, hours=12, clock=None, state_path=None):
+def make_gate(password_hash=HASH, secret=SECRET, hours=12, clock=None, state_path=None, inner=None):
     """A gate with its own state file, unless given one: the same file again is a restart."""
-    inner = Inner()
+    inner = inner or Inner()
     gate = auth.LoginGate(inner, password_hash=password_hash, session_secret=secret,
                           session_hours=hours, clock=clock or Clock(),
                           state_path=state_path or new_state_path())
@@ -178,6 +183,18 @@ def signed_in(gate, client=LAN):
     response = login(gate, client=client)
     assert response.status == 303, response.status
     return {"cookie": f"fjord_session={session_cookie(response)}"}
+
+
+async def asigned_in(gate):
+    """`signed_in` inside a running event loop."""
+    form = f"password={PASSWORD.replace(' ', '+')}&next=/".encode()
+    response = await ahttp(gate, "/login", "POST", headers={"origin": ORIGIN}, body=form)
+    assert response.status == 303, response.status
+    return {"cookie": f"fjord_session={session_cookie(response)}"}
+
+
+async def alogout(gate, cookie):
+    return await ahttp(gate, "/logout", "POST", headers={**cookie, "origin": ORIGIN})
 
 
 EPOCH_FILE = re.compile(rb"[A-Za-z0-9_-]{43}\n")
@@ -441,6 +458,504 @@ class LogoutTests(unittest.TestCase):
         # Same origin but no session (a LAN client forging the header): no revocation.
         self.assertEqual(http(gate, "/logout", "POST", headers={"origin": ORIGIN}).status, 303)
         self.assertEqual(http(gate, "/", headers=cookie).status, 200)
+
+
+class RunningClock(Clock):
+    """Real time passing, from `now` on: for the gate's own timing."""
+
+    def __init__(self, now=1_800_000_000.0):
+        super().__init__(now)
+        self.since = time.monotonic()
+
+    def __call__(self):
+        return self.now + time.monotonic() - self.since
+
+
+class Dashboard:
+    """The app behind the gate, shaped like Streamlit's websocket handler.
+
+    It reads the opening message as Starlette does, accepts, then reads the
+    browser's messages in one task while another sends from a queue: an answer
+    to each message, and whatever `push` adds (a rerun's results, say). It
+    stops when `receive` says the browser left, and records the code.
+    """
+
+    def __init__(self):
+        self.hold_open = None  # an asyncio.Event: read the opening message only once it is set
+        self.hold_accept = None  # an asyncio.Event: accept only once it is set
+        self.paused = None  # an asyncio.Event: send only while it is set
+        self.queues = []
+        self.ended = []
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "websocket":
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"page"})
+            return
+        if self.hold_open:
+            await self.hold_open.wait()
+        message = await receive()
+        if message["type"] != "websocket.connect":  # as Starlette's accept() insists
+            raise RuntimeError(f'Expected ASGI message "websocket.connect", but got {message["type"]!r}')
+        if self.hold_accept:
+            await self.hold_accept.wait()
+        await send({"type": "websocket.accept", "subprotocol": "streamlit"})
+        queue = asyncio.Queue()
+        self.queues.append(queue)
+
+        async def sender():
+            while True:
+                data = await queue.get()
+                if self.paused:
+                    await self.paused.wait()
+                await send({"type": "websocket.send", "bytes": data})
+
+        sending = asyncio.ensure_future(sender())
+        try:
+            while True:
+                message = await receive()
+                if message["type"] == "websocket.disconnect":
+                    self.ended.append(message.get("code"))
+                    return
+                queue.put_nowait(b"answer:" + message["bytes"])
+        finally:
+            self.queues.remove(queue)
+            sending.cancel()
+            await asyncio.gather(sending, return_exceptions=True)
+
+    def push(self, data=b"update"):
+        for queue in self.queues:
+            queue.put_nowait(data)
+
+
+class Browser:
+    """A dashboard tab's websocket on the gate, open in the running event loop.
+
+    It plays the ASGI server: it hands the app the browser's messages and
+    keeps every message the app sends. A real server refuses anything sent
+    after the close; here it lands in `after_close`, as evidence.
+    """
+
+    def __init__(self, gate, cookie, origin=ORIGIN):
+        headers = {"host": HOST, "origin": origin, **cookie}
+        scope = {"type": "websocket", "asgi": {"version": "3.0"}, "scheme": "ws", "path": "/_stcore/stream",
+                 "raw_path": b"/_stcore/stream", "query_string": b"", "root_path": "",
+                 "headers": _scope_headers(headers), "client": LAN, "subprotocols": ["streamlit"]}
+        self.frames = []
+        self._incoming = asyncio.Queue()
+        self._incoming.put_nowait({"type": "websocket.connect"})
+        self._arrived = asyncio.Event()
+        self.task = asyncio.ensure_future(gate(scope, self._incoming.get, self._send))
+
+    async def _send(self, message):
+        self.frames.append(message)
+        self._arrived.set()
+
+    @property
+    def kinds(self):
+        return [m["type"] for m in self.frames]
+
+    @property
+    def accepted(self):
+        return "websocket.accept" in self.kinds
+
+    @property
+    def close_code(self):
+        return next((m["code"] for m in self.frames if m["type"] == "websocket.close"), None)
+
+    @property
+    def data(self):
+        return [m["bytes"] for m in self.frames if m["type"] == "websocket.send"]
+
+    @property
+    def after_close(self):
+        kinds = self.kinds
+        return self.frames[kinds.index("websocket.close") + 1:] if "websocket.close" in kinds else []
+
+    def ask(self, data=b"rerun"):
+        self._incoming.put_nowait({"type": "websocket.receive", "bytes": data})
+
+    def leave(self):
+        self._incoming.put_nowait({"type": "websocket.disconnect", "code": 1001})
+
+    async def until(self, condition, timeout=2.0):
+        """Whether `condition()` comes true within `timeout` seconds."""
+        async def wait():
+            while not condition():
+                self._arrived.clear()
+                await self._arrived.wait()
+        try:
+            await asyncio.wait_for(wait(), timeout)
+        except TimeoutError:
+            return False
+        return True
+
+    async def ended(self, timeout=2.0):
+        """Whether the gate (and the app behind it) finished with this socket."""
+        await asyncio.wait({self.task}, timeout=timeout)
+        return self.task.done()
+
+
+def leftover_tasks():
+    return asyncio.all_tasks() - {asyncio.current_task()}
+
+
+QUIET = 0.05  # long enough for anything queued to be sent, and for several checks at TICK
+TICK = 0.01
+
+
+class OpenWebsocketTests(unittest.TestCase):
+    """An open dashboard is held to its session for as long as it stays open.
+
+    The gate's clock is a fake one, moved by the tests. Where a test moves it
+    past an expiry, the gate re-checks open sockets every TICK of real time
+    instead of every minute, so it notices within one TICK. Elsewhere the
+    minute stands, so a logout has to close sockets by itself, not by a check.
+    """
+
+    def make(self, clock=None, hours=12, tick=auth.WATCH_SECONDS):
+        self.clock = clock or Clock()
+        self.dashboard = Dashboard()
+        gate, _ = make_gate(clock=self.clock, hours=hours, inner=self.dashboard)
+        gate.watch_seconds = tick
+        return gate
+
+    def run_async(self, scenario):
+        async def bounded():
+            async with asyncio.timeout(20):
+                await scenario()
+        asyncio.run(bounded())
+
+    async def open(self, gate, cookie):
+        tab = Browser(gate, cookie)
+        self.assertTrue(await tab.until(lambda: tab.accepted), tab.frames)
+        return tab
+
+    async def assertAnswers(self, tab, data=b"rerun"):
+        tab.ask(data)
+        self.assertTrue(await tab.until(lambda: b"answer:" + data in tab.data), tab.frames)
+
+    async def assertShut(self, tab):
+        """Closed with 1008, the app told, and nothing gets through any more."""
+        self.assertTrue(await tab.until(lambda: tab.close_code is not None), tab.frames)
+        self.assertEqual(tab.close_code, 1008)
+        self.assertTrue(await tab.ended())
+        self.assertIsNone(tab.task.exception())
+        self.assertNotIn(tab, self.dashboard.queues)
+        before = list(tab.frames)
+        tab.ask(b"after")
+        self.dashboard.push(b"after")
+        await asyncio.sleep(QUIET)
+        self.assertEqual(tab.frames, before)
+        self.assertEqual(tab.after_close, [])
+
+    def test_a_logout_closes_the_open_dashboard(self):
+        gate = self.make()
+
+        async def scenario():
+            cookie = await asigned_in(gate)
+            tab = await self.open(gate, cookie)
+            await self.assertAnswers(tab)
+            self.assertEqual((await alogout(gate, cookie)).status, 303)
+            await self.assertShut(tab)
+            self.assertEqual(self.dashboard.ended, [1008])
+            self.assertEqual(gate._sockets, set())
+
+        self.run_async(scenario)
+
+    def test_a_logout_on_one_device_closes_every_device(self):
+        gate = self.make()
+
+        async def scenario():
+            laptop, phone, tablet = await asigned_in(gate), await asigned_in(gate), await asigned_in(gate)
+            tabs = [await self.open(gate, cookie) for cookie in (laptop, laptop, phone, tablet)]
+            for tab in tabs:
+                await self.assertAnswers(tab)
+            self.assertEqual((await alogout(gate, phone)).status, 303)
+            for tab in tabs:
+                await self.assertShut(tab)
+            self.assertEqual(self.dashboard.ended, [1008] * 4)
+            for cookie in (laptop, phone, tablet):  # and none of them can open a new one
+                refused = Browser(gate, cookie)
+                self.assertTrue(await refused.ended())
+                self.assertEqual(refused.kinds, ["websocket.close"])
+                self.assertEqual(refused.close_code, 1008)
+
+        self.run_async(scenario)
+
+    def test_an_idle_dashboard_closes_when_its_session_expires(self):
+        gate = self.make(hours=1, tick=TICK)
+
+        async def scenario():
+            tab = await self.open(gate, await asigned_in(gate))
+            await self.assertAnswers(tab)
+            self.clock.now += 3599.9
+            await asyncio.sleep(QUIET)
+            self.assertIsNone(tab.close_code)  # not yet
+            self.clock.now += 0.1
+            # Neither side sends anything: the gate notices by itself.
+            await self.assertShut(tab)
+            self.assertEqual(self.dashboard.ended, [1008])
+
+        with self.assertLogs(auth.LOG, "INFO") as logs:
+            self.run_async(scenario)
+        self.assertIn("websocket_closed reason=expired client=192.168.4.10", "\n".join(logs.output))
+
+    def test_the_expiry_is_noticed_when_it_comes_not_at_the_next_check(self):
+        clock = RunningClock()
+        gate = self.make(clock=clock)
+
+        async def scenario():
+            cookie = await asigned_in(gate)
+            clock.now += 12 * 3600 - 0.3
+            tab = await self.open(gate, cookie)
+            # A minute between checks, but the session ends in 0.3 seconds.
+            self.assertTrue(await tab.until(lambda: tab.close_code is not None, timeout=5))
+            await self.assertShut(tab)
+
+        self.run_async(scenario)
+
+    def test_data_between_an_expiry_and_the_next_check_is_not_sent(self):
+        gate = self.make()  # the next check is a minute away
+
+        async def scenario():
+            tab = await self.open(gate, await asigned_in(gate))
+            await self.assertAnswers(tab)
+            self.clock.now += 12 * 3600
+            self.dashboard.push(b"holdings")  # the app sends: the session is checked first
+            await self.assertShut(tab)
+            self.assertNotIn(b"holdings", tab.data)
+
+        self.run_async(scenario)
+
+    def test_nothing_queued_before_the_logout_is_sent_after_it(self):
+        gate = self.make()
+
+        async def scenario():
+            cookie = await asigned_in(gate)
+            tab = await self.open(gate, cookie)
+            self.dashboard.paused = asyncio.Event()
+            for question in (b"one", b"two", b"three"):
+                tab.ask(question)
+            self.dashboard.push(b"holdings")
+            await asyncio.sleep(QUIET)
+            self.assertEqual(tab.data, [])  # all of it waiting to be sent
+            await alogout(gate, cookie)
+            self.dashboard.paused.set()
+            await self.assertShut(tab)
+            self.assertEqual(tab.data, [])
+
+        self.run_async(scenario)
+
+    def test_an_app_that_keeps_sending_after_the_close_gets_nothing_through(self):
+        gate = self.make()
+        sent_late = []
+
+        async def stubborn(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            while (await receive())["type"] != "websocket.disconnect":
+                pass
+            for data in (b"late", b"later"):  # Streamlit's sender can still be running here
+                await send({"type": "websocket.send", "bytes": data})
+                sent_late.append(data)
+            await send({"type": "websocket.close", "code": 1000})  # a second close: uvicorn would raise
+            sent_late.append("close")
+
+        gate.app = stubborn
+
+        async def scenario():
+            cookie = await asigned_in(gate)
+            tab = await self.open(gate, cookie)
+            await alogout(gate, cookie)
+            self.assertTrue(await tab.ended())
+            self.assertEqual(sent_late, [b"late", b"later", "close"])  # the app was not stopped by an error
+            self.assertEqual(tab.kinds, ["websocket.accept", "websocket.close"])
+
+        self.run_async(scenario)
+
+    def test_signing_in_again_after_a_logout_opens_a_working_dashboard(self):
+        gate = self.make()
+
+        async def scenario():
+            old = await asigned_in(gate)
+            tab = await self.open(gate, old)
+            await alogout(gate, old)
+            await self.assertShut(tab)
+            new = await self.open(gate, await asigned_in(gate))
+            await self.assertAnswers(new)
+            self.dashboard.push(b"holdings")
+            self.assertTrue(await new.until(lambda: b"holdings" in new.data))
+            await asyncio.sleep(QUIET)
+            self.assertIsNone(new.close_code)
+            new.leave()
+            self.assertTrue(await new.ended())
+
+        self.run_async(scenario)
+
+    def test_a_live_session_is_never_disconnected(self):
+        gate = self.make(hours=1, tick=TICK)
+
+        async def scenario():
+            cookie = await asigned_in(gate)
+            tab = await self.open(gate, cookie)
+            for _ in range(10):  # an hour of use, checked many times over
+                self.clock.now += 359
+                await self.assertAnswers(tab)
+                await asyncio.sleep(TICK * 2)
+            await asigned_in(gate)  # another device signs in
+            self.assertEqual((await ahttp(gate, "/logout", "POST", headers={"origin": ORIGIN})).status, 303)
+            self.assertEqual((await ahttp(gate, "/logout", "POST",
+                                          headers={**cookie, "origin": "http://evil.example"})).status, 403)
+            await self.assertAnswers(tab, b"still")
+            self.assertIsNone(tab.close_code)
+            self.assertEqual(self.dashboard.ended, [])
+            tab.leave()
+            self.assertTrue(await tab.ended())
+            self.assertEqual(self.dashboard.ended, [1001])
+
+        self.run_async(scenario)
+
+    def test_one_tab_leaving_does_not_touch_the_others(self):
+        gate = self.make()
+
+        async def scenario():
+            cookie = await asigned_in(gate)
+            first, second = await self.open(gate, cookie), await self.open(gate, cookie)
+            first.leave()
+            self.assertTrue(await first.ended())
+            self.assertEqual(len(gate._sockets), 1)
+            self.assertIsNone(first.close_code)  # the browser closed it; the gate had nothing to send
+            await self.assertAnswers(second)
+            await alogout(gate, cookie)
+            await self.assertShut(second)
+            self.assertEqual(self.dashboard.ended, [1001, 1008])
+
+        self.run_async(scenario)
+
+    def test_many_open_dashboards_close_and_leave_nothing_behind(self):
+        gate = self.make()
+
+        async def scenario():
+            cookies = [await asigned_in(gate) for _ in range(5)]
+            tabs = [await self.open(gate, cookies[i % 5]) for i in range(25)]
+            self.assertEqual(len(gate._sockets), 25)
+            await alogout(gate, cookies[0])
+            for tab in tabs:
+                await self.assertShut(tab)
+            await asyncio.sleep(0)
+            self.assertEqual(gate._sockets, set())
+            self.assertEqual(self.dashboard.queues, [])
+            self.assertEqual(leftover_tasks(), set())  # no watcher, no pending receive
+
+        self.run_async(scenario)
+
+    def test_a_server_shutdown_leaves_nothing_behind(self):
+        gate = self.make()
+
+        async def scenario():
+            tabs = [await self.open(gate, await asigned_in(gate)) for _ in range(3)]
+            for tab in tabs:
+                tab.task.cancel()  # what uvicorn does to open websockets when it stops
+            await asyncio.gather(*(tab.task for tab in tabs), return_exceptions=True)
+            await asyncio.sleep(0)
+            self.assertEqual(gate._sockets, set())
+            self.assertEqual(leftover_tasks(), set())
+
+        self.run_async(scenario)
+
+    def test_a_logout_while_a_dashboard_is_opening_refuses_it(self):
+        for hold in ("hold_open", "hold_accept"):  # before or after the app reads the opening message
+            with self.subTest(hold=hold):
+                gate = self.make()
+
+                async def scenario(gate=gate, hold=hold):
+                    cookie = await asigned_in(gate)
+                    setattr(self.dashboard, hold, asyncio.Event())
+                    tab = Browser(gate, cookie)  # the session checks out; the app has yet to accept
+                    await asyncio.sleep(QUIET)
+                    self.assertEqual(len(gate._sockets), 1)
+                    await alogout(gate, cookie)
+                    getattr(self.dashboard, hold).set()
+                    self.assertTrue(await tab.ended())
+                    self.assertIsNone(tab.task.exception())  # Starlette got its opening message
+                    self.assertEqual(tab.kinds, ["websocket.close"])  # the accept became a refusal: 403
+                    self.assertEqual(tab.close_code, 1008)
+                    self.assertEqual(self.dashboard.ended, [1008])
+
+                self.run_async(scenario)
+
+    def test_a_new_epoch_alone_stops_the_data(self):
+        """Even a socket the logout's sweep never reached sends nothing more."""
+        gate = self.make()
+
+        async def scenario():
+            tab = await self.open(gate, await asigned_in(gate))
+            await self.assertAnswers(tab)
+            gate.sessions.revoke_all()  # the epoch changes; no sweep
+            self.dashboard.push(b"holdings")
+            await self.assertShut(tab)
+            self.assertNotIn(b"holdings", tab.data)
+
+        self.run_async(scenario)
+
+    def test_a_session_that_is_over_stays_over_if_the_clock_steps_back(self):
+        gate = self.make(tick=TICK)
+
+        async def scenario():
+            tab = await self.open(gate, await asigned_in(gate))
+            (socket,) = gate._sockets
+            self.clock.now += 12 * 3600
+            await self.assertShut(tab)
+            self.clock.now -= 3600  # an NTP correction, say
+            self.assertFalse(socket.live)
+
+        self.run_async(scenario)
+
+    def test_logouts_racing_new_connections_leave_none_open_on_an_old_session(self):
+        gate = self.make()
+
+        async def scenario():
+            for split in range(0, 9, 2):
+                cookie = await asigned_in(gate)
+                before = [Browser(gate, cookie) for _ in range(split)]
+                logging_out = asyncio.ensure_future(alogout(gate, cookie))
+                after = [Browser(gate, cookie) for _ in range(8 - split)]
+                await logging_out
+                for tab in before + after:
+                    self.assertTrue(await tab.ended(), (split, tab.frames))
+                    self.assertEqual(tab.close_code, 1008)
+                    self.assertEqual(tab.data, [])
+                    self.assertEqual(tab.after_close, [])
+                for tab in after:  # checked after the logout: refused outright
+                    self.assertEqual(tab.kinds, ["websocket.close"])
+                self.assertEqual(gate._sockets, set())
+            await self.assertAnswers(await self.open(gate, await asigned_in(gate)))
+
+        self.run_async(scenario)
+
+    def test_the_tracking_keeps_no_token_and_the_log_names_none(self):
+        gate = self.make()
+
+        async def scenario():
+            cookie = await asigned_in(gate)
+            token = cookie["cookie"].split("=", 1)[1]
+            tab = await self.open(gate, cookie)
+            (socket,) = gate._sockets
+            kept = repr({name: value for name, value in vars(socket).items() if name != "_sessions"})
+            for secret in (token, token.rsplit(".", 1)[1], token.split(".")[3], SECRET, HASH, PASSWORD):
+                self.assertNotIn(secret, kept)
+            await alogout(gate, cookie)
+            await self.assertShut(tab)
+            return token
+
+        with self.assertLogs(auth.LOG, "INFO") as logs:
+            asyncio.run(scenario())
+        logged = "\n".join(logs.output)
+        self.assertIn("websocket_closed reason=logout client=192.168.4.10", logged)
+        for record in logs.records:
+            self.assertNotIn("fjord_session", record.getMessage())
+            self.assertNotIn(SECRET, record.getMessage())
 
 
 class StateTestCase(unittest.TestCase):

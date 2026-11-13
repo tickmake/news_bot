@@ -9,7 +9,8 @@ check.
 
 Standard library only, so the tests run without Streamlit installed. It
 writes one file, the session epoch (`STATE_FILE`), so a logout outlives a
-restart (`Sessions`).
+restart (`Sessions`). An open websocket is held to its session for as long as
+it stays open, not only when it connects (`_Socket`).
 
     python3 auth.py hash      # type a password; prints a DASHBOARD_PASSWORD_HASH value
     python3 auth.py secret    # prints a DASHBOARD_SESSION_SECRET value
@@ -57,6 +58,8 @@ MAX_FAILURES_ALL = 50         # ... and from all addresses together (a LAN host 
 FAILURE_WINDOW_SECONDS = 15 * 60   # ... in this window, then 429 until it passes
 MAX_LOGIN_BODY = 4096
 _ALL_CLIENTS = "*"
+WATCH_SECONDS = 60.0          # an open websocket's session is re-checked at least this often
+POLICY_VIOLATION = 1008       # websocket close code: refused, or its session is over
 
 _PAGE_HEADERS = [
     (b"cache-control", b"no-store"),
@@ -225,20 +228,30 @@ class Sessions:
         body = f"{self.epoch}.{issued}.{issued + self.max_age * 1000}.{secrets.token_urlsafe(12)}"
         return f"{body}.{self._sign(body)}"
 
-    def valid(self, token: str) -> bool:
+    def claims(self, token: str):
+        """(epoch, expires_ms) of a token that is valid now, else None."""
         body, _, signature = token.rpartition(".")
         if not body or not body.isascii():
-            return False
+            return None
         if not hmac.compare_digest(signature.encode("utf-8"), self._sign(body).encode("ascii")):
-            return False
+            return None
         try:
             epoch, issued_text, expires_text, _nonce = body.split(".")
             issued, expires = int(issued_text), int(expires_text)
         except ValueError:
-            return False
+            return None
         if not hmac.compare_digest(epoch, self.epoch):
-            return False
-        return issued <= self._now_ms() < expires
+            return None
+        if not issued <= self._now_ms() < expires:
+            return None
+        return epoch, expires
+
+    def valid(self, token: str) -> bool:
+        return self.claims(token) is not None
+
+    def current(self, epoch: str, expires_ms: int) -> bool:
+        """Whether a session `claims` accepted earlier is still in force."""
+        return epoch == self.epoch and self._now_ms() < expires_ms
 
     def revoke_all(self) -> bool:
         """End every session issued so far.
@@ -414,17 +427,113 @@ async def _read_body(receive, limit: int):
             return b"".join(chunks)
 
 
+class _Socket:
+    """One open dashboard websocket, held to the session it was opened with.
+
+    It keeps that session's epoch and expiry, never the token. Every message to
+    the browser is checked first, so once the session is over (logout or
+    expiry) nothing more is delivered: the socket is closed with 1008 instead,
+    and the app is told that the browser left, so Streamlit ends its session
+    there. Streamlit's page then tries to reconnect, which the gate refuses
+    until the browser signs in again.
+    """
+
+    def __init__(self, sessions, epoch, expires_ms, receive, send, client):
+        self._sessions = sessions
+        self.epoch, self.expires_ms, self.client = epoch, expires_ms, client
+        self._receive, self._send = receive, send
+        self._lock = asyncio.Lock()  # one message to the server at a time; none after the close
+        self._closed = False
+        self._opening = True  # the browser's opening message is still to be read
+        self.over = asyncio.get_running_loop().create_future()  # done once the session is over
+
+    @property
+    def live(self) -> bool:
+        return not self.over.done() and self._sessions.current(self.epoch, self.expires_ms)
+
+    def end(self) -> None:
+        """The session is over: from now on nothing more reaches the browser."""
+        if not self.over.done():
+            self.over.set_result(None)
+
+    async def shut(self) -> None:
+        """End the session and close the socket, once."""
+        self.end()
+        async with self._lock:
+            await self._close()
+
+    async def _close(self) -> None:
+        # Called with the lock held.
+        if self._closed:
+            return
+        self._closed = True
+        LOG.info("websocket_closed reason=%s client=%s",
+                 "logout" if self.epoch != self._sessions.epoch else "expired", self.client)
+        try:
+            await self._send({"type": "websocket.close", "code": POLICY_VIOLATION})
+        except Exception as error:  # the browser had already gone
+            LOG.debug("websocket_close_failed client=%s error=%s", self.client, type(error).__name__)
+
+    async def send(self, message) -> None:
+        """The app's messages to the browser, only while the session lasts."""
+        async with self._lock:
+            if self._closed:
+                return
+            if message.get("type") == "websocket.close":
+                self._closed = True
+                return await self._send(message)
+            if not self.live:
+                self.end()
+                return await self._close()  # instead of the message: before the accept, a 403
+            await self._send(message)
+
+    async def receive(self):
+        """The browser's messages to the app, until the session is over.
+
+        The app waits here while the page is idle, so a logout or expiry must
+        interrupt the wait: it then gets a disconnect, and stops.
+        """
+        if self._opening:
+            # `websocket.connect` carries no data, and Starlette insists on
+            # reading it before it accepts; the accept is checked in `send`.
+            self._opening = False
+            return await self._receive()
+        if self.live:
+            pending = asyncio.ensure_future(self._receive())
+            try:
+                await asyncio.wait({pending, self.over}, return_when=asyncio.FIRST_COMPLETED)
+            except BaseException:
+                pending.cancel()
+                raise
+            if self.live:  # so `pending` is what finished
+                return pending.result()
+            if not pending.done():
+                pending.cancel()
+            elif not pending.cancelled():
+                pending.exception()  # read, so asyncio does not warn; the message is dropped
+        await self.shut()
+        return {"type": "websocket.disconnect", "code": POLICY_VIOLATION}
+
+
 class LoginGate:
     """ASGI middleware: every request needs a valid session, except the health check.
 
     Without a usable `password_hash`, or when a logout could not be kept across
     a restart (`Sessions.ready`), it fails closed: 503 for everything but the
     health check.
+
+    A websocket needs a valid session to open and keeps needing one while it
+    is open: a logout closes every open websocket, on every device, and each
+    one closes by itself when its session expires (`_Socket`, `_watch`).
     """
+
+    watch_seconds = WATCH_SECONDS
 
     def __init__(self, app, password_hash: str = "", session_secret: str = "",
                  session_hours: float = DEFAULT_SESSION_HOURS, clock=time.time, state_path=None):
         self.app = app
+        self._clock = clock
+        self._sockets = set()  # the open websockets, so a logout can close them all
         self._hash = password_hash.strip()
         self.configured = parse_hash(self._hash) is not None
         if not self.configured:
@@ -445,9 +554,38 @@ class LoginGate:
         self._closed = (b"Dashboard login is not configured.\n" if not self.configured else
                         b"Dashboard login cannot save its sessions.\n" if not self.sessions.ready else None)
 
-    def _has_session(self, headers: dict) -> bool:
+    def _claims(self, headers: dict):
         token = _cookie(headers, COOKIE_NAME)
-        return bool(token) and self.sessions.valid(token)
+        return self.sessions.claims(token) if token else None
+
+    def _has_session(self, headers: dict) -> bool:
+        return self._claims(headers) is not None
+
+    async def _serve_websocket(self, scope, receive, send, claims):
+        # Registered before the app runs, with no pause since the session was
+        # checked: a logout has either refused this socket already or will find it.
+        socket = _Socket(self.sessions, *claims, receive, send, _client(scope))
+        self._sockets.add(socket)
+        watcher = asyncio.ensure_future(self._watch(socket))
+        try:
+            return await self.app(scope, socket.receive, socket.send)
+        finally:
+            self._sockets.discard(socket)
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    async def _watch(self, socket: _Socket) -> None:
+        """Close `socket` once its session is over, even if neither side sends anything."""
+        while socket.live:
+            left = socket.expires_ms / 1000 - self._clock()
+            await asyncio.wait({socket.over}, timeout=min(self.watch_seconds, max(left, 0.001)))
+        await socket.shut()
+
+    def _end_sockets(self) -> None:
+        """After a logout: every open websocket's session is over, on every device.
+        Each one's `_watch` then closes it, and its `receive` tells the app."""
+        for socket in self._sockets:
+            socket.end()
 
     async def __call__(self, scope, receive, send):
         kind = scope["type"]
@@ -463,8 +601,9 @@ class LoginGate:
 
         headers = _headers(scope)
         if kind == "websocket":
-            if self._has_session(headers) and _websocket_origin_allowed(headers):
-                return await self.app(scope, receive, send)
+            claims = self._claims(headers)
+            if claims and _websocket_origin_allowed(headers):
+                return await self._serve_websocket(scope, receive, send, claims)
             # Debug only: a tab left open after logout retries for as long as it stays open.
             LOG.debug("websocket_refused client=%s", _client(scope))
             return await _refuse_websocket(receive, send)
@@ -540,6 +679,7 @@ class LoginGate:
             # Synchronous on purpose: no request is checked between the new epoch
             # and its write to disk, and the answer goes out only once it is saved.
             kept = self.sessions.revoke_all()
+            self._end_sockets()
             LOG.info("logout client=%s", _client(scope))
             if not kept:
                 return await _respond(send, 500, b"Logged out, but the dashboard could not save the logout: "
