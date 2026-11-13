@@ -239,15 +239,24 @@ class TradeHistoryStore:
             raise
 
     @staticmethod
-    def current_rule_id() -> str:
-        """Identifies the gate thresholds a signal was produced under, so a later
-        change to them is never averaged together with earlier signals."""
+    def gate_rule_id() -> str:
+        """The gate thresholds alone. Rows archived before the hold joined the
+        rule id (P1-2) carry exactly this; their hold is in `horizon_sessions`."""
         return (
             f"mom{SETTINGS.trade_min_week_momentum_pct:g}"
             f"-day{SETTINGS.trade_min_day_change_pct:g}"
             f"-atr{SETTINGS.trade_max_atr_pct:g}"
             f"-dd{SETTINGS.trade_max_drawdown_pct:g}"
             f"-vol{SETTINGS.trade_min_volume_ratio:g}"
+        )
+
+    @staticmethod
+    def current_rule_id() -> str:
+        """Identifies the gate thresholds and hold a signal was produced under, so
+        a later change to either is never averaged together with earlier signals."""
+        return (
+            f"{TradeHistoryStore.gate_rule_id()}"
+            f"-h{SETTINGS.trade_outcome_lookback_days}"
         )
 
     def archive_signal(

@@ -93,12 +93,13 @@ def choose(df: pd.DataFrame, key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         quality = st.radio("Data quality", views.CLASSES, horizontal=True,
                            format_func=views.QUALITY_LABELS.get, key=f"{key}_quality")
     scope = df[df["series"] == series]
-    rules = sorted(scope["rule_id"].unique())
+    gates = views.filter_settings(scope["rule_id"])
+    rules = sorted(gates.unique())
     rule = rules[-1] if rules else None
     if len(rules) > 1:
         rule = st.selectbox("Filter settings (never mixed)", rules, index=len(rules) - 1,
                             key=f"{key}_rule")
-    scope = scope[scope["rule_id"] == rule]
+    scope = scope[gates == rule]
     chosen = views.selection(scope, series, quality)
     counts = views.state_counts(scope)
     policy = ("entry is the first open after the signal was recorded (after-recorded-v1)"

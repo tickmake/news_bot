@@ -115,16 +115,17 @@ class StoreCase(unittest.TestCase):
         return value
 
     def archive(self, symbol, signal, recorded, qualified=True, horizon=2):
-        self.store.archive_signal(
-            _metrics(symbol, signal), qualified, None if qualified else "trend", recorded_at=recorded)
-        with self.store._connection() as conn:
-            conn.execute(
-                "UPDATE signal_archive SET horizon_sessions = ? WHERE symbol = ? AND signal_session = ?",
-                (horizon, symbol, signal))
+        # Archived under that hold, so the row's rule id and horizon agree as in production.
+        with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", horizon):
+            self.store.archive_signal(
+                _metrics(symbol, signal), qualified, None if qualified else "trend", recorded_at=recorded)
 
     def insert(self, symbol, signal, recorded_at, policy=POLICY, outcome=None, qualified=1,
                horizon=2, rank=None, rule=None):
         """A row exactly as given, including values `archive_signal` would refuse."""
+        if rule is None:
+            with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", horizon):
+                rule = self.store.current_rule_id()
         with self.store._connection() as conn:
             conn.execute(
                 """INSERT INTO signal_archive (symbol, signal_session, qualified, rank, failed_gate,
@@ -132,7 +133,7 @@ class StoreCase(unittest.TestCase):
                    drawdown_pct, rsi_14, rule_id, horizon_sessions, cost_bps_per_side,
                    benchmark_symbol, recorded_at, outcome_json, entry_policy)
                    VALUES (?, ?, ?, ?, NULL, 100, 1, 3, 1.5, 2, 2, 60, ?, ?, 10, NULL, ?, ?, ?)""",
-                (symbol, signal, qualified, rank, rule or self.store.current_rule_id(), horizon,
+                (symbol, signal, qualified, rank, rule, horizon,
                  recorded_at, outcome, policy))
 
     def view(self):
@@ -563,7 +564,7 @@ class MigrationTests(unittest.TestCase):
         self.path = os.path.join(tempfile.mkdtemp(), "old.db")
         conn = sqlite3.connect(self.path)
         conn.execute(OLD_SCHEMA)
-        rule = nb_history_store.TradeHistoryStore.current_rule_id()
+        rule = nb_history_store.TradeHistoryStore.gate_rule_id()  # that build's id had no hold
         rows = [
             # settled, recorded before its entry open: clean
             ("AAA", "2026-10-05", "2026-10-06T05:00:00+00:00", legacy_outcome("2026-10-06", "2026-10-07", 1.5)),

@@ -181,7 +181,7 @@ class AppSettings(BaseSettings):
     risk_corr_threshold: float = 0.7
     risk_corr_window: int = 60
     risk_corr_min_obs: int = 30
-    # Calendar days; 7 covers the default 5-session hold.
+    # Calendar days; 7 covers a 5-session hold, not the default 20 (.env.example sets 28).
     risk_earnings_warn_days: int = 7
     # How much a stock can fall over a 2-4 week hold, in /analyze and /check (#123).
     risk_forecast_enabled: bool = True
@@ -223,8 +223,9 @@ class AppSettings(BaseSettings):
     # volume; a path inside it would survive DB corruption but not the volume.
     trade_backup_dir: str = ""
     trade_backup_keep: int = 14
-    # Legacy variable name; this is the fixed backtest holding period in sessions.
-    trade_outcome_lookback_days: int = 5
+    # Legacy variable name; this is the hold in trading sessions for the backtest,
+    # the forward test and /pickperformance, and part of every new rule id.
+    trade_outcome_lookback_days: int = 20
     trade_backtest_period: str = "2y"
     trade_backtest_universe: str = "configured"
     trade_backtest_universe_max: int = 100

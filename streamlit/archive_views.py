@@ -17,6 +17,7 @@ are never pooled: `daily` refuses a frame that mixes them.
 """
 
 import json
+import re
 from typing import Dict, Optional
 
 import pandas as pd
@@ -66,6 +67,19 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df["signal_day"] = pd.to_datetime(df["signal_session"])
     df["day"] = pd.to_datetime(df["entry_session"])
     return df
+
+
+# Since P1-2 a new rule id ends in its hold ("...-vol1.2-h20"); a row archived
+# before then carries the gate thresholds alone and its hold only in
+# `horizon_sessions`. Pages choose by the gates and split by `horizon_sessions`,
+# so an old row stays in the group it always had and the clean test is not cut
+# in two at the change.
+_HOLD_SUFFIX = re.compile(r"-h\d+$")
+
+
+def filter_settings(rule_ids: pd.Series) -> pd.Series:
+    """The gate-threshold part of each rule id: what a page's rule choice is made by."""
+    return rule_ids.map(lambda rule_id: _HOLD_SUFFIX.sub("", rule_id))
 
 
 def selection(df: pd.DataFrame, series: str, quality: str = CLEAN) -> pd.DataFrame:
