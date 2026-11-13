@@ -13,6 +13,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import archive_views as views
+
 DB_FILE = os.environ.get("DASHBOARD_DB_FILE", "/bot-data/.news_bot_trade_history.db")
 
 GATE_LABELS = {
@@ -39,47 +41,89 @@ def reason(df: pd.DataFrame, gate_col: str = "failed_gate") -> pd.Series:
     return df[gate_col].map(GATE_LABELS).fillna(df[gate_col]).where(df["qualified"] == 0, "Picked")
 
 
-def signals() -> pd.DataFrame:
-    df = query(
-        """
-        SELECT symbol, signal_session, horizon_sessions, qualified, failed_gate,
-               last_close, day_change_pct, week_momentum_pct, volume_ratio,
-               atr_pct, drawdown_pct,
-               json_extract(outcome_json, '$.net_return_pct') AS net_return_pct,
-               json_extract(outcome_json, '$.excess_return_pct') AS excess_return_pct
-        FROM signal_archive
-        """
-    )
-    df["day"] = pd.to_datetime(df["signal_session"])
+def load_signals() -> tuple[pd.DataFrame, str | None]:
+    """Every archived signal with its series and data-quality class, and why not if none.
+
+    The one place the dashboard reads the signal archive, through the bot's
+    `signal_archive_evaluated` view, so a page can never show a row the
+    Telegram report would leave out.
+    """
+    try:
+        df = query(views.SIGNALS_SQL)
+        active = query(views.POINTER_SQL)
+    except Exception:  # the view is made by the bot when it starts
+        return views.prepare(pd.DataFrame(columns=_SIGNAL_COLUMNS)).assign(reason=None), (
+            "The bot has not prepared the forward-test data yet. It does so when it "
+            "starts; this page fills in after that.")
+    df = views.prepare(df)
     df["reason"] = reason(df)
+    if active.empty:
+        return df.iloc[0:0], ("Classifier not active: no data-quality classification is in "
+                              "force, so no result is shown. Check the bot's logs.")
+    return df, None
+
+
+_SIGNAL_COLUMNS = [
+    "symbol", "signal_session", "recorded_at", "rule_id", "horizon_sessions", "qualified",
+    "failed_gate", "last_close", "day_change_pct", "week_momentum_pct", "volume_ratio",
+    "atr_pct", "drawdown_pct", "entry_policy", "series", "classifier_version", "quality",
+    "quality_reason", "settled", "entry_session", "net_return_pct", "excess_return_pct",
+]
+
+
+def signals() -> pd.DataFrame:
+    """The signals for a performance page; stops the page when they cannot be shown."""
+    df, problem = load_signals()
+    if problem:
+        st.error(problem)
+        st.stop()
     return df
 
 
-def daily(df: pd.DataFrame, picked_col: str = "qualified") -> pd.DataFrame:
-    """One row per day: average result of picked vs skipped stocks."""
-    done = df[df["net_return_pct"].notna()]
-    out = done.groupby(["day", "horizon_sessions"]).apply(
-        lambda g: pd.Series(
-            {
-                "picks": g.loc[g[picked_col] == 1, "net_return_pct"].mean(),
-                "skipped": g.loc[g[picked_col] == 0, "net_return_pct"].mean(),
-                "n_picks": int((g[picked_col] == 1).sum()),
-            }
-        ),
-        include_groups=False,
+def choose(df: pd.DataFrame, key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Ask which results to show. Returns (rows that may be averaged, every row in scope).
+
+    The clean test is the default everywhere. Historical rows are one class at
+    a time; nothing here can pool classes, series or filter sets.
+    """
+    series = st.radio("Results", [views.CLEAN_TEST, views.HISTORICAL], horizontal=True,
+                      format_func=views.SERIES_LABELS.get, key=f"{key}_series")
+    quality = views.CLEAN
+    if series == views.HISTORICAL:
+        quality = st.radio("Data quality", views.CLASSES, horizontal=True,
+                           format_func=views.QUALITY_LABELS.get, key=f"{key}_quality")
+    scope = df[df["series"] == series]
+    rules = sorted(scope["rule_id"].unique())
+    rule = rules[-1] if rules else None
+    if len(rules) > 1:
+        rule = st.selectbox("Filter settings (never mixed)", rules, index=len(rules) - 1,
+                            key=f"{key}_rule")
+    scope = scope[scope["rule_id"] == rule]
+    chosen = views.selection(scope, series, quality)
+    counts = views.state_counts(scope)
+    policy = ("entry is the first open after the signal was recorded (after-recorded-v1)"
+              if series == views.CLEAN_TEST
+              else "entry was the first session after the signal date, whenever it was recorded")
+    version = int(df["classifier_version"].iloc[0]) if not df.empty else "–"
+    holds = ", ".join(str(int(h)) for h in sorted(scope["horizon_sessions"].unique())) or "–"
+    st.caption(
+        f"**{views.SERIES_LABELS[series]}** · showing {views.QUALITY_LABELS[quality].lower()}, "
+        f"finished rows only · {policy} · classifier v{version} · filter settings `{rule or '–'}` · "
+        f"hold {holds} days.  \n"
+        f"Rows: {counts['clean_finished']} clean and finished · {counts['clean_in_hold']} clean and "
+        f"in hold · {counts['potentially_contaminated']} potentially contaminated · "
+        f"{counts['invalid']} invalid · {counts['awaiting_entry']} awaiting entry · "
+        f"{counts['overdue']} overdue."
     )
-    return out.reset_index()
-
-
-def scorecard(days: pd.DataFrame) -> dict:
-    both = days.dropna(subset=["picks", "skipped"])
-    return {
-        "days": len(days),
-        "picks": days["picks"].mean(),
-        "skipped": days["skipped"].mean(),
-        "better": int((both["picks"] > both["skipped"]).sum()),
-        "compared": len(both),
-    }
+    if chosen.empty:
+        if series == views.CLEAN_TEST and not scope.empty:
+            st.info(f"The clean test started on {scope['recorded_at'].min()[:10]}. "
+                    f"{len(scope)} signals are recorded; results appear when their hold ends.")
+        elif series == views.CLEAN_TEST:
+            st.info("No signals have been recorded since the entry fix yet.")
+        else:
+            st.info("No finished rows in this class.")
+    return chosen, scope
 
 
 def metric_row(card: dict) -> None:
@@ -101,17 +145,18 @@ def home() -> None:
         "what it actually did after fees. **If picks do not beat the skipped stocks, the "
         "filters are not helping.**"
     )
-    days = daily(signals())
+    chosen, _scope = choose(signals(), "home")
+    days = views.daily(chosen)
     for hold, d in days.groupby("horizon_sessions"):
         st.subheader(f"Scorecard, {int(hold)}-day hold")
-        metric_row(scorecard(d))
-    both = days.dropna(subset=["picks", "skipped"]).sort_values("day").copy()
-    both["running"] = (both["picks"] - both["skipped"]).groupby(both["horizon_sessions"]).cumsum()
-    both["hold"] = both["horizon_sessions"].astype(int).astype(str) + "-day hold"
-    fig = px.line(both, x="day", y="running", color="hold", markers=True,
-                  labels={"running": "%", "day": ""},
-                  title="Picks minus skipped, added up day by day (%)")
-    st.plotly_chart(fig, width="stretch")
+        metric_row(views.scorecard(d))
+    both = views.running_difference(days)
+    if not both.empty:
+        both["hold"] = both["horizon_sessions"].astype(int).astype(str) + "-day hold"
+        fig = px.line(both, x="day", y="running", color="hold", markers=True,
+                      labels={"running": "%", "day": "Entry session"},
+                      title="Picks minus skipped, added up entry session by entry session (%)")
+        st.plotly_chart(fig, width="stretch")
     st.caption('"After fees" assumes 0.10% per buy and per sell. Real DNB fees are higher '
                "on small trades (59 NOK minimum). Data is at most a minute old.")
     st.subheader("The data behind it")
@@ -146,24 +191,31 @@ def latest_screen() -> None:
 
 def day_by_day() -> None:
     st.title("Day by day")
-    st.write("Each row is one day's screen. Returns are after fees; the newest days are "
-             "still waiting for their hold to end.")
-    df = signals()
-    days = daily(df).sort_values("day", ascending=False)
-    long = days.melt(id_vars="day", value_vars=["picks", "skipped"], var_name="group",
-                     value_name="average")
-    st.plotly_chart(px.bar(long, x="day", y="average", color="group", barmode="group",
-                           labels={"average": "%", "day": ""},
-                           title="Average result after fees, picks vs skipped (%)"),
-                    width="stretch")
-    counts = df.groupby("day").agg(picks=("qualified", "sum"), checked=("symbol", "count"),
-                                   with_result=("net_return_pct", "count"))
-    table = counts.join(days.set_index("day")[["picks", "skipped"]].rename(
-        columns={"picks": "picks_avg", "skipped": "skipped_avg"})).sort_index(ascending=False)
+    st.write("Each row is one entry session: the day the stocks would have been bought. "
+             "Returns are after fees. A signal counts on the day it enters, not the day it "
+             "is dated, because two signals with the same date can enter on different days.")
+    chosen, scope = choose(signals(), "days")
+    holds = sorted(int(h) for h in scope["horizon_sessions"].unique())
+    if not holds:
+        return
+    hold = st.radio("Hold (trading days)", holds, horizontal=True, index=len(holds) - 1)
+    chosen, scope = chosen[chosen["horizon_sessions"] == hold], scope[scope["horizon_sessions"] == hold]
+    days = views.daily(chosen).sort_values("day", ascending=False)
+    if not days.empty:
+        long = days.melt(id_vars="day", value_vars=["picks", "skipped"], var_name="group",
+                         value_name="average")
+        st.plotly_chart(px.bar(long, x="day", y="average", color="group", barmode="group",
+                               labels={"average": "%", "day": "Entry session"},
+                               title="Average result after fees, picks vs skipped (%)"),
+                        width="stretch")
+    table = views.by_entry_session(scope, chosen)
     table.index = table.index.date
     st.dataframe(table.round(2), width="stretch", column_config={
-        "picks": "Picks", "checked": "Stocks checked", "with_result": "With result",
+        "checked": "Stocks entered", "picks": "Picks", "clean": "Clean",
+        "potentially_contaminated": "Potentially contaminated", "invalid": "Invalid",
         "picks_avg": "Picks: average %", "skipped_avg": "Skipped: average %"})
+    st.caption("Counts cover every row that entered that day. The two averages use only the "
+               "rows selected above.")
 
 
 def sent_picks() -> None:
@@ -230,7 +282,7 @@ def _small_chart(df: pd.DataFrame, y, title: str, color=None):
 
 
 def one_stock() -> None:
-    sig = signals()
+    sig, signals_problem = load_signals()
     symbols = sorted(set(sig["symbol"]) | set(query("SELECT DISTINCT symbol FROM daily_prices")["symbol"]))
     recent = st.session_state.setdefault("recent_stocks", [])
     default = recent[0] if recent else ("EQNR.OL" if "EQNR.OL" in symbols else symbols[0])
@@ -255,7 +307,7 @@ def one_stock() -> None:
     snap = query("SELECT data_json FROM stock_snapshots WHERE symbol = ? "
                  "ORDER BY snapshot_date DESC LIMIT 1", (symbol,))
     info = json.loads(snap["data_json"].iloc[0]).get("info", {}) if not snap.empty else {}
-    mine = sig[sig["symbol"] == symbol].sort_values("day")
+    mine = sig[sig["symbol"] == symbol].sort_values("signal_day")
 
     left, right = st.columns([3, 1], gap="large")
     with left:
@@ -279,9 +331,9 @@ def one_stock() -> None:
             fig.update_traces(fill="tozeroy", line_color=line)
             fig.update_yaxes(range=[p["close"].min() * 0.95, p["close"].max() * 1.02])
             # The bot's picks on this stock, as markers on the price line.
-            picks = mine[(mine["qualified"] == 1) & (mine["day"] >= p["day"].min())]
+            picks = mine[(mine["qualified"] == 1) & (mine["signal_day"] >= p["day"].min())]
             if not picks.empty:
-                fig.add_scatter(x=picks["day"], y=picks["last_close"], mode="markers",
+                fig.add_scatter(x=picks["signal_day"], y=picks["last_close"], mode="markers",
                                 name="Bot picked", marker=dict(symbol="triangle-up", size=11,
                                                                color="#f2c94c"))
             fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10),
@@ -351,37 +403,63 @@ def one_stock() -> None:
             st.caption(f"Yearly figures in {nums['currency'].dropna().iloc[-1]}, by financial "
                        "year end. Earnings per share = net profit / shares outstanding.")
     with tab_bot:
-        done = mine.dropna(subset=["net_return_pct"])
+        if signals_problem:
+            st.error(signals_problem)
+            return
+        chosen, scope = choose(mine, "stock")
+        averages = views.stock_averages(chosen)
         cols = st.columns(4)
-        cols[0].metric("Days screened", len(mine))
-        cols[1].metric("Times picked", int(mine["qualified"].sum()))
-        cols[2].metric("Average result when picked %",
-                       _num(done.loc[done["qualified"] == 1, "net_return_pct"].mean()))
-        cols[3].metric("Average result when skipped %",
-                       _num(done.loc[done["qualified"] == 0, "net_return_pct"].mean()))
-        view = mine.sort_values("day", ascending=False)[
-            ["signal_session", "reason", "last_close", "day_change_pct", "week_momentum_pct",
-             "net_return_pct"]]
+        cols[0].metric("Days screened", len(scope))
+        cols[1].metric("Times picked", int(scope["qualified"].sum()))
+        cols[2].metric("Average result when picked %", _num(averages["picked"]))
+        cols[3].metric("Average result when skipped %", _num(averages["skipped"]))
+        view = mine.sort_values("signal_day", ascending=False).assign(
+            series=lambda d: d["series"].map(views.SERIES_LABELS),
+            quality=lambda d: d["quality"].map(views.QUALITY_LABELS))[
+            ["signal_session", "entry_session", "reason", "last_close", "day_change_pct",
+             "week_momentum_pct", "net_return_pct", "series", "quality"]]
         st.dataframe(view.round(2), hide_index=True, width="stretch", column_config={
-            "signal_session": "Day", "reason": "Result", "last_close": "Price",
-            "day_change_pct": "Today %", "week_momentum_pct": "Last 5 days %",
-            "net_return_pct": "At the end of the hold, after fees %"})
+            "signal_session": "Signal date", "entry_session": "Entered on", "reason": "Result",
+            "last_close": "Price", "day_change_pct": "Today %",
+            "week_momentum_pct": "Last 5 days %",
+            "net_return_pct": "At the end of the hold, after fees %",
+            "series": "Recorded", "quality": "Data quality"})
+        st.caption("Every row is listed with its class. The two averages above use only the "
+                   "rows selected.")
 
 
 def data_collected() -> None:
     st.title("Data collected")
     st.write("A gap in the dates means the bot did not run that day; weekends and holidays "
-             "are normal gaps.")
-    df = query(
-        "SELECT signal_session AS day, COUNT(*) AS checked, SUM(qualified) AS picked, "
-        "SUM(outcome_json IS NOT NULL) AS with_result FROM signal_archive "
-        "GROUP BY signal_session ORDER BY signal_session DESC"
-    )
+             "are normal gaps. Each stock is in exactly one of the four data-quality columns.")
+    sig = signals()
+    df = views.collected(sig)
     st.plotly_chart(px.bar(df, x="day", y=["checked", "picked"], barmode="group",
                            labels={"value": "Stocks", "day": "", "variable": ""},
-                           title="Stocks checked and picked per day"),
+                           title="Stocks checked and picked per signal date"),
                     width="stretch")
-    st.dataframe(df, hide_index=True, width="stretch")
+    st.dataframe(df, hide_index=True, width="stretch", column_config={
+        "day": "Signal date", "checked": "Checked", "picked": "Picked",
+        "with_result": "With result", "clean": "Clean",
+        "potentially_contaminated": "Potentially contaminated", "invalid": "Invalid",
+        "awaiting_entry": "Awaiting entry", "overdue": "Overdue"})
+    st.caption(
+        "**Clean**: bought at an open that came after the signal was recorded. "
+        "**Potentially contaminated**: recorded before the entry fix, and scored from an open "
+        "that had already happened. **Invalid**: cannot be evaluated (reason below). "
+        "**Awaiting entry**: the next session has not opened yet. **Overdue**: still no entry "
+        f"session after {views.OVERDUE_AFTER_DAYS} days; the symbol or its price data needs a look.")
+    reasons = views.invalid_reasons(sig)
+    if not reasons.empty:
+        st.subheader("Invalid rows, by reason")
+        st.dataframe(reasons, hide_index=True, column_config={
+            "quality_reason": "Reason", "rows": "Rows"})
+    late = views.overdue(sig)
+    if not late.empty:
+        st.subheader("Overdue")
+        st.dataframe(late[["symbol", "signal_session", "recorded_at"]], hide_index=True,
+                     column_config={"symbol": "Stock", "signal_session": "Signal date",
+                                    "recorded_at": "Recorded at"})
 
 
 def my_money() -> None:
@@ -415,9 +493,11 @@ def what_if() -> None:
         "threshold set that held up out of sample. Use it to understand the filters, "
         "not to pick new ones."
     )
-    df = signals()
-    df = df[df["net_return_pct"].notna() & (df["failed_gate"].fillna("") != "stale")].copy()
+    df, _scope = choose(signals(), "whatif")
+    df = df[df["failed_gate"].fillna("") != "stale"].copy()
     holds = sorted(df["horizon_sessions"].unique())
+    if not holds:
+        return
     hold = st.radio("Hold (trading days)", holds, horizontal=True,
                     index=holds.index(5) if 5 in holds else 0)
     df = df[df["horizon_sessions"] == hold]
@@ -430,24 +510,13 @@ def what_if() -> None:
     dd = c3.slider("Max below 20-day high %", 0.0, 30.0, 8.0, 1.0)
     vol = c3.slider("Min volume vs normal (x, 0 = off)", 0.0, 3.0, 0.0, 0.1)
 
-    # The screen checks the trend filter first, so failed_gate == 'trend' is the
-    # only way to tell a stock was below its 20-day average.
-    above = df["failed_gate"].fillna("") != "trend"
-    picked = (
-        (above | (not trend))
-        & (df["week_momentum_pct"] >= m5)
-        & (df["day_change_pct"] >= m1)
-        & (df["atr_pct"] <= atr)
-        & (df["drawdown_pct"] <= dd)
-        & ((vol == 0) | (df["volume_ratio"].fillna(0) >= vol))
-    )
-    df["what_if"] = picked.astype(int)
+    df["what_if"] = views.what_if_picks(df, trend, m5, m1, atr, dd, vol)
 
-    now, new = daily(df, "qualified"), daily(df, "what_if")
+    now, new = views.daily(df, "qualified"), views.daily(df, "what_if")
     st.subheader("The bot's filters today")
-    metric_row(scorecard(now))
+    metric_row(views.scorecard(now))
     st.subheader("Your filters")
-    metric_row(scorecard(new))
+    metric_row(views.scorecard(new))
     st.caption(f"Your filters pick {int(df['what_if'].sum())} of {len(df)} stock-days; "
                f"the bot's picked {int(df['qualified'].sum())}.")
 
@@ -458,8 +527,8 @@ def what_if() -> None:
         d["set"] = name
         lines.append(d)
     fig = px.line(pd.concat(lines), x="day", y="running", color="set", markers=True,
-                  labels={"running": "%", "day": "", "set": ""},
-                  title="Picks minus skipped, added up day by day (%)")
+                  labels={"running": "%", "day": "Entry session", "set": ""},
+                  title="Picks minus skipped, added up entry session by entry session (%)")
     st.plotly_chart(fig, width="stretch")
 
 

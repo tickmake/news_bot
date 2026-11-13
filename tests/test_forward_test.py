@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pandas as pd
@@ -28,6 +28,11 @@ def _metrics(symbol="AAA", session="2026-09-01", **overrides):
     return nb_indicators.TradeMetrics(**base)
 
 
+def _next_morning(session):
+    """06:00 UTC on the day after `session`: recorded before New York opens, as the 07:00 run does."""
+    return (datetime.strptime(session, "%Y-%m-%d") + timedelta(days=1, hours=6)).replace(tzinfo=timezone.utc)
+
+
 def _bars(start, opens, closes):
     index = pd.date_range(start, periods=len(opens), freq="B", tz="America/New_York")
     return pd.DataFrame({"Open": opens, "Close": closes}, index=index)
@@ -47,6 +52,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(rows["AAA"]["qualified"], 1)
         self.assertEqual(rows["BBB"]["failed_gate"], "trend")
         self.assertEqual(rows["AAA"]["rule_id"], self.store.current_rule_id())
+        self.assertEqual(rows["AAA"]["entry_policy"], nb_history_store.ENTRY_POLICY_AFTER_RECORDED)
 
     def test_first_observation_wins(self):
         self.store.archive_signal(_metrics(last_close=100.0), True, None)
@@ -111,7 +117,7 @@ class PairedTests(unittest.TestCase):
     @staticmethod
     def _rows(spec):
         return [
-            {"signal_session": date, "outcome": {"net_return_pct": value}}
+            {"entry_session": date, "outcome": {"net_return_pct": value}}
             for date, value in spec
         ]
 
@@ -145,8 +151,8 @@ class ReportTests(unittest.TestCase):
 
     def test_report_settles_and_flags_thin_sample(self):
         winner, loser = _metrics("AAA", "2026-09-02"), _metrics("BBB", "2026-09-02")
-        self.store.archive_signal(winner, True, None)
-        self.store.archive_signal(loser, False, "trend")
+        self.store.archive_signal(winner, True, None, recorded_at=_next_morning("2026-09-02"))
+        self.store.archive_signal(loser, False, "trend", recorded_at=_next_morning("2026-09-02"))
         self.store.archive_ranks([winner])
         up = _bars("2026-09-01", [10, 10, 11, 12, 13, 14], [10, 10.5, 11.5, 12.5, 13.5, 14.5])
         flat = _bars("2026-09-01", [10] * 6, [10] * 6)
@@ -161,7 +167,8 @@ class ReportTests(unittest.TestCase):
             with self.store._connection() as conn:
                 conn.execute("UPDATE signal_archive SET horizon_sessions = 3")
             report = nb_forward.build_forward_test_report(datetime(2026, 10, 3))
-        self.assertIn("2 completed", report)
+        self.assertIn("2 archived signals · 2 completed over 1 entry sessions (2026-09-03 to 2026-09-03)", report)
+        self.assertIn("2 clean and finished · 0 clean and in hold · 0 awaiting entry", report)
         self.assertIn("Not enough data to conclude", report)
         self.assertIn("Top 5 as delivered: 1 signals", report)
         self.assertIn("Qualified: 1 signals", report)
@@ -233,7 +240,7 @@ class SettleTests(unittest.TestCase):
         self.addCleanup(self.drop.stop)
 
     def _archive(self, symbol="AAA", session="2026-09-02", horizon=3):
-        self.store.archive_signal(_metrics(symbol, session), True, None)
+        self.store.archive_signal(_metrics(symbol, session), True, None, recorded_at=_next_morning(session))
         with self.store._connection() as conn:
             conn.execute("UPDATE signal_archive SET horizon_sessions = ?", (horizon,))
 
@@ -259,7 +266,8 @@ class SettleTests(unittest.TestCase):
 
     def test_a_symbol_is_fetched_once_for_all_its_rows(self):
         self._archive(session="2026-09-02")
-        self.store.archive_signal(_metrics("AAA", "2026-09-03"), True, None)
+        self.store.archive_signal(
+            _metrics("AAA", "2026-09-03"), True, None, recorded_at=_next_morning("2026-09-03"))
         up = _bars("2026-09-01", [10, 10, 11, 12, 13, 14, 15], [10, 10.5, 11.5, 12.5, 13.5, 14.5, 15.5])
         with self.store._connection() as conn:
             conn.execute("UPDATE signal_archive SET horizon_sessions = 2")
@@ -270,6 +278,9 @@ class SettleTests(unittest.TestCase):
 
     def test_rows_without_a_benchmark_still_settle(self):
         self._archive(symbol="ZZZ.XX")  # no suffix mapping -> no benchmark
+        with self.store._connection() as conn:
+            # Recorded before the entry fix: such rows settle whatever their exchange.
+            conn.execute("UPDATE signal_archive SET entry_policy = NULL")
         up = _bars("2026-09-01", [10, 10, 11, 12, 13, 14], [10, 10.5, 11.5, 12.5, 13.5, 14.5])
         with patch("newsbot.market_data._fetch_ticker_history", return_value=up):
             self.assertEqual(nb_forward.settle_pending(datetime(2026, 10, 3)), (1, 0))
@@ -308,14 +319,14 @@ class SettleJobTests(unittest.TestCase):
 class RenderingTests(unittest.TestCase):
     def test_delta_line_shapes(self):
         empty = {"dates": 0}
-        self.assertIn("no dates with both groups yet", nb_forward._delta_line("Qualified", empty))
+        self.assertIn("no entry sessions with both groups yet", nb_forward._delta_line("Qualified", empty))
         one_date = {"dates": 1, "mean_delta_pp": 0.5, "se_pp": None, "better_pct": 100.0, "t": None}
-        self.assertEqual(nb_forward._delta_line("Q", one_date), "    Q: +0.50 pp over 1 dates")
+        self.assertEqual(nb_forward._delta_line("Q", one_date), "    Q: +0.50 pp over 1 entry sessions")
         flat = {"dates": 3, "mean_delta_pp": 0.0, "se_pp": 0.0, "better_pct": 0.0, "t": None}
         self.assertNotIn(" t ", nb_forward._delta_line("Q", flat))
         full = {"dates": 70, "mean_delta_pp": -0.3, "se_pp": 0.12, "better_pct": 40.0, "t": -2.5}
         text = nb_forward._delta_line("Q", full)
-        self.assertIn("-0.30 pp over 70 dates", text)
+        self.assertIn("-0.30 pp over 70 entry sessions", text)
         self.assertIn("±0.12 se", text)
         self.assertIn("t -2.5", text)
 
@@ -330,14 +341,14 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn("matched", line)
 
     def test_paired_with_a_single_date_has_no_standard_error(self):
-        rows = [{"signal_session": "d", "outcome": {"net_return_pct": 1.0}}]
-        base = [{"signal_session": "d", "outcome": {"net_return_pct": 0.0}}]
+        rows = [{"entry_session": "d", "outcome": {"net_return_pct": 1.0}}]
+        base = [{"entry_session": "d", "outcome": {"net_return_pct": 0.0}}]
         result = nb_forward.paired_vs_baseline(rows, base)
         self.assertEqual((result["dates"], result["se_pp"], result["t"]), (1, None, None))
 
     def test_identical_deltas_have_no_t_value(self):
-        rows = [{"signal_session": f"d{i}", "outcome": {"net_return_pct": 1.0}} for i in range(3)]
-        base = [{"signal_session": f"d{i}", "outcome": {"net_return_pct": 0.0}} for i in range(3)]
+        rows = [{"entry_session": f"d{i}", "outcome": {"net_return_pct": 1.0}} for i in range(3)]
+        base = [{"entry_session": f"d{i}", "outcome": {"net_return_pct": 0.0}} for i in range(3)]
         result = nb_forward.paired_vs_baseline(rows, base)
         self.assertEqual(result["mean_delta_pp"], 1.0)
         self.assertIsNone(result["t"])
@@ -357,24 +368,31 @@ class ReportEdgeTests(unittest.TestCase):
         self.assertIn("Signal archive unavailable", report)
 
     def test_enough_dates_switches_the_verdict_wording(self):
-        # 60+ signal dates, each with one qualified and one rejected symbol, all settled.
+        # 60+ entry sessions, each with one qualified and one rejected symbol, all settled
+        # under the after-recording policy.
+        sessions = [day.strftime("%Y-%m-%d") for day in pd.bdate_range("2026-01-05", periods=66)]
         with self.store._connection() as conn:
-            for i in range(65):
-                date = f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}"
+            for signal, entry in zip(sessions, sessions[1:], strict=False):
                 for symbol, qualified, ret in (("AAA", 1, 2.0), ("BBB", 0, 1.0)):
                     conn.execute(
                         """INSERT INTO signal_archive (symbol, signal_session, qualified, rank, failed_gate,
                            last_close, day_change_pct, week_momentum_pct, volume_ratio, atr_pct,
                            drawdown_pct, rsi_14, rule_id, horizon_sessions, cost_bps_per_side,
-                           benchmark_symbol, recorded_at, outcome_json)
-                           VALUES (?, ?, ?, ?, NULL, 1, 0, 0, NULL, 1, 0, NULL, ?, 5, 10, NULL, 'x', ?)""",
-                        (symbol, date, qualified, 1 if qualified else None,
-                         self.store.current_rule_id(),
-                         json.dumps({"net_return_pct": ret, "gross_return_pct": ret,
-                                     "benchmark_return_pct": None, "excess_return_pct": None})),
+                           benchmark_symbol, recorded_at, outcome_json, entry_policy)
+                           VALUES (?, ?, ?, ?, NULL, 1, 0, 0, NULL, 1, 0, NULL, ?, 5, 10, NULL, ?, ?, ?)""",
+                        (symbol, signal, qualified, 1 if qualified else None,
+                         self.store.current_rule_id(), f"{entry}T06:00:00+00:00",
+                         json.dumps({"entry_session": entry, "exit_session": entry,
+                                     "net_return_pct": ret, "gross_return_pct": ret,
+                                     "benchmark_return_pct": None, "excess_return_pct": None,
+                                     "entry_policy": nb_history_store.ENTRY_POLICY_AFTER_RECORDED}),
+                         nb_history_store.ENTRY_POLICY_AFTER_RECORDED),
                     )
-        with patch.object(nb_forward, "settle_pending", return_value=(0, 0)):
+        with patch("newsbot.market_data._fetch_ticker_history", return_value=None) as fetch:
             report = nb_forward.build_forward_test_report()
+        fetch.assert_not_called()  # finished rows are classified from what is stored
+        self.assertIn("130 completed over 65 entry sessions", report)
+        self.assertIn("Qualified: +0.50 pp over 65 entry sessions", report)  # the baseline includes the pick
         self.assertIn("Judge the paired difference against its standard error", report)
         self.assertNotIn("Not enough data", report)
 
