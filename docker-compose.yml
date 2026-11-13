@@ -3,14 +3,70 @@ services:
   # Off by default -- start it with:  docker compose --profile bundled-ollama up
   # If you already run an Ollama container named `ollama` (see
   # RANKER_NETWORK below), leave this profile off and the bot will use it.
+  #
+  # This file owns only these three bundled-ollama services. A shared Ollama
+  # from another compose project (the Pi's) keeps its own user, limits and
+  # ports; nothing here changes it.
+  #
+  # The image has no non-root user and keeps models under /root, which only
+  # root can enter, so the services run as uid 10002 with HOME moved to
+  # /home/ollama and the volume mounted at $HOME/.ollama. Volumes written by
+  # the earlier root-running service are root-owned; this one-shot hands them
+  # to 10002 before the server starts, and changes nothing once they are.
+  ollama-volume-init:
+    profiles: ["bundled-ollama"]
+    image: ollama/ollama:0.32.9@sha256:1685741456770df6e3cceb2a945a5f75e020f658d1701509668d6f4688f1dd3f
+    container_name: news_bot_ollama_volume_init
+    entrypoint: ["find", "/home/ollama/.ollama", "!", "-user", "10002",
+                 "-exec", "chown", "10002:10002", "{}", "+"]
+    volumes:
+      - ollama_models:/home/ollama/.ollama
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
   ollama:
     profiles: ["bundled-ollama"]
-    image: ollama/ollama:latest
+    # Pinned by digest: the non-root setup was verified against this version,
+    # and it is the build the Pi's shared Ollama runs.
+    image: ollama/ollama:0.32.9@sha256:1685741456770df6e3cceb2a945a5f75e020f658d1701509668d6f4688f1dd3f
     container_name: news_bot_ollama
     restart: unless-stopped
+    depends_on:
+      ollama-volume-init:
+        condition: service_completed_successfully
+    user: "10002:10002"
+    environment:
+      - HOME=/home/ollama
     volumes:
       # Models are large; keep them out of the image and across restarts.
-      - ollama_models:/root/.ollama
+      - ollama_models:/home/ollama/.ollama
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # qwen2.5:3b at a 4096 context holds about 2.5 GB that cannot be reclaimed,
+    # plus page cache that can. 4g leaves room for llama3.2:3b too; a 7B model
+    # needs about 6 GB, so raise BUNDLED_OLLAMA_MEM_LIMIT before switching.
+    # No CPU cap by default: ranking is CPU-bound and already takes 100-240 s
+    # of the 240 s timeout on a Pi 5. BUNDLED_OLLAMA_CPUS=3 would keep a core
+    # free at the cost of slower ranking.
+    mem_limit: ${BUNDLED_OLLAMA_MEM_LIMIT:-4g}
+    cpus: ${BUNDLED_OLLAMA_CPUS:-0}
+    # Its own network, shared only with the bot: not the dashboard, and never
+    # an external network where it could shadow a shared `ollama`. Nothing is
+    # published on the host.
+    networks:
+      - bundled-ollama
     healthcheck:
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -28,17 +84,25 @@ services:
 
   # One-shot model pull for the bundled Ollama. Same profile, so it only runs
   # when the bundled service does.
+  # The server does the download; this client only asks for it over HTTP, so
+  # it needs neither the model volume nor root.
   ollama-pull:
     profiles: ["bundled-ollama"]
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.32.9@sha256:1685741456770df6e3cceb2a945a5f75e020f658d1701509668d6f4688f1dd3f
     container_name: news_bot_ollama_pull
     depends_on:
       ollama:
         condition: service_started
-    volumes:
-      - ollama_models:/root/.ollama
+    user: "10002:10002"
     environment:
       - OLLAMA_HOST=http://ollama:11434
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - bundled-ollama
     entrypoint: ["/bin/sh", "-c"]
     # Single-element list: with a list entrypoint, a *string* command is
     # shlex-split into separate args, so `sh -c` would receive only the first
@@ -72,6 +136,8 @@ services:
       - default
       # Lets the bot resolve an Ollama running in another compose project.
       - ranker
+      # The bundled Ollama, when that profile runs; empty otherwise.
+      - bundled-ollama
     volumes:
       # Everything the bot needs to survive a recreate. Without this the
       # trade-history SQLite DB and the news dedup state live in the
@@ -261,17 +327,21 @@ services:
 
 networks:
   default:
-  # Network carrying the Ollama the bot should talk to.
+  # Network carrying an Ollama from another compose project.
   #
-  # Default is the bundled service's own network. To reuse an Ollama from
-  # another compose project, set RANKER_NETWORK to that project's network and
+  # To reuse one, set RANKER_NETWORK to that project's network and
   # RANKER_NETWORK_EXTERNAL=true, e.g. in .env:
   #   RANKER_NETWORK=poster-bot_default
   #   RANKER_NETWORK_EXTERNAL=true
   # Find it with: docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' ollama
+  # Unset, it is an empty network of this project's own. When it points at
+  # another project's Ollama, do not also start the bundled profile: the bot
+  # would see two hosts named `ollama`.
   ranker:
     name: ${RANKER_NETWORK:-daily-news-bot_ranker}
     external: ${RANKER_NETWORK_EXTERNAL:-false}
+  # The bundled Ollama's network: the bot and the bundled-ollama services only.
+  bundled-ollama:
 
 volumes:
   ollama_models:

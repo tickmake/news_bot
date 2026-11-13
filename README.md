@@ -228,6 +228,41 @@ on the *ranker network*. Two ways to provide it:
   ```
 
   This starts Ollama and pulls `NEWS_RANKER_MODEL` into a named volume.
+  Don't combine it with an external `RANKER_NETWORK`: the bot would then see
+  two hosts named `ollama`.
+
+**What this repository owns.** Only the three `bundled-ollama` services. A
+shared Ollama from another compose project keeps its own user, limits, ports
+and image, and nothing here changes it. Set those in that project's compose
+file. The bot only needs the shared container on a network it can join and a
+`NEWS_RANKER_URL` that resolves. The bot never waits for Ollama: if it is
+down, sections are ranked by the heuristic.
+
+The bundled services are hardened as follows:
+
+- **Unprivileged.** The server and the pull run as uid 10002, with no
+  capabilities and a read-only root filesystem. The image has no non-root
+  user and keeps models under `/root`, which only root can enter. So `HOME` is
+  `/home/ollama` and the model volume is mounted at `/home/ollama/.ollama`.
+  The one-shot `ollama-volume-init` (`CHOWN` only, no network) hands volumes
+  from the earlier root-running service to 10002 before the server starts, and
+  changes nothing once they are. Existing models, and the server key, are kept.
+- **Limited.** `BUNDLED_OLLAMA_MEM_LIMIT` (default `4g`) and
+  `BUNDLED_OLLAMA_CPUS` (default `0`, no cap). `qwen2.5:3b` holds about 2.5 GB
+  that cannot be reclaimed, plus page cache that can. Ollama reads the limit
+  and plans model loads within it. A limit that is too small does not crash
+  anything: the model swaps, and ranking slows until it times out and the
+  heuristic takes over. Raise the limit before switching to a 7B model (about
+  6 GB). CPU is uncapped because ranking on a Pi 5 already uses 100-240 s of
+  the 240 s timeout; set `3` to keep a core free if you can afford slower
+  ranking.
+- **Not exposed.** Nothing is published on the host. The bundled services sit
+  on their own `bundled-ollama` network, which only the bot joins, so the
+  dashboard cannot reach the API and a shared `ollama` is never shadowed.
+- **Pinned.** The image is `ollama/ollama:0.32.9` by digest, the version
+  this setup was verified with.
+
+The GPU block in the compose file has not been tested with these settings.
 
 Outside Docker, run Ollama yourself and set
 `NEWS_RANKER_URL=http://localhost:11434`:
@@ -248,8 +283,10 @@ each send, which is what makes cross-outlet deduplication possible.
 | `NEWS_RANKER_MAX_CANDIDATES` | `14` | Shortlist size sent to the LLM |
 | `BRIEFING_BUDGET_SECONDS` | `900` | Time allowed to compose a briefing; news sections not yet started when it runs out are skipped |
 | `NEWS_RANKER_TIMEOUT_SECONDS` | `240` | Per-call timeout |
-| `RANKER_NETWORK` | bundled net | Network carrying Ollama |
+| `RANKER_NETWORK` | empty project network | Network of a shared Ollama from another project |
 | `RANKER_NETWORK_EXTERNAL` | `false` | Set `true` to reuse another project's network |
+| `BUNDLED_OLLAMA_MEM_LIMIT` | `4g` | Memory limit of the bundled Ollama only |
+| `BUNDLED_OLLAMA_CPUS` | `0` | CPU limit of the bundled Ollama only; `0` means none |
 | `NEWS_MAX_AGE_HOURS` | `30` | Freshness ceiling; undated items exempt |
 | `NORWAY_NEWS_MAX_AGE_HOURS` | `96` | Same, for the Norway section, whose English outlets publish less often |
 | `NEWS_CANDIDATE_POOL_SIZE` | `60` | Candidates ranked per section |
