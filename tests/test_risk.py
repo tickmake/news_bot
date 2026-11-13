@@ -271,19 +271,21 @@ class RenderingTests(SettingsCase):
             context = risk.assess([_m("AAA", atr=2.0)],
                                   {"AAA": {"next_earnings": TODAY + timedelta(days=2)}}, [], TODAY)
         lines = risk.candidate_lines("AAA", context)
-        self.assertIn("volatility stop 96.00, 2×ATR below the 100.00 close: 4.00 (4.0%) away", lines[0])
+        self.assertIn("volatility stop 96.00, 2×ATR below the 100.00 signal close: 4.00 (4.0%) away", lines[0])
         self.assertEqual("    size: 12% of the portfolio", lines[1])
-        self.assertIn("loss at the stop: 0.50% of the portfolio, before costs", lines[2])
-        self.assertIn("fees: at least 118 NOK to buy and sell + currency exchange fee", lines[3])
-        self.assertEqual("    ⛔ Not for ASK (US stock)", lines[4])
-        self.assertIn("⚠️ earnings in 2 days", lines[5])
+        self.assertIn("loss if bought at the 100.00 close: 0.50% of the portfolio at the stop, before costs",
+                      lines[2])
+        self.assertIn("if it gaps through: sold near", lines[3])
+        self.assertIn("fees: at least 118 NOK to buy and sell + currency exchange fee", lines[4])
+        self.assertEqual("    ⛔ Not for ASK (US stock)", lines[5])
+        self.assertIn("⚠️ earnings in 2 days", lines[6])
 
     def test_capped_size_says_so_and_amount_is_shown(self):
         self.use(risk_account_size=50_000.0)
         context = risk.assess([_m("AAA", atr=0.3)], {}, [], TODAY)
         lines = risk.candidate_lines("AAA", context)
         self.assertEqual("    size: 20% of the portfolio ≈ 10,000 NOK (capped at 20%)", lines[1])
-        self.assertIn("loss at the stop: 0.12% of the portfolio ≈ 60 NOK", lines[2])
+        self.assertIn("loss if bought at the 100.00 close: 0.12% of the portfolio ≈ 60 NOK", lines[2])
 
     def test_fee_line_shows_the_minimum_as_a_share_of_the_position(self):
         self.assertEqual(risk.fee_line("EQNR.OL", 4_500.0),

@@ -3,10 +3,13 @@
 The stop, the money in a position, the loss at the stop, the gap estimate and
 the fee are worked out once in `risk.trade_risk`. /recommendations, /analyze
 and /check render that; a published pick saves it; the dashboard shows the
-saved copy. These tests pin the arithmetic to the settings in use, and pin
-that a pick sent before the record existed is never given one.
+saved copy. These tests pin the arithmetic to the settings in use, pin that
+the losses are said to be modelled from the signal close (the buy price is not
+known), tie the gap numbers to the research that measured them, and pin that a
+pick sent before the record existed is never given one.
 """
 
+import ast
 import importlib.util
 import json
 import os
@@ -33,16 +36,16 @@ TODAY = date(2026, 11, 13)
 SENT = datetime(2026, 11, 13, 6, 0, tzinfo=timezone.utc)
 
 
-def _load_views():
-    # By path: the folder is named like the Streamlit package and is not importable as one.
-    spec = importlib.util.spec_from_file_location(
-        "archive_views", os.path.join(ROOT, "streamlit", "archive_views.py"))
+def _load(name, *path):
+    # By path: neither streamlit/ nor research/ is a package.
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, *path))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-views = _load_views()
+views = _load("archive_views", "streamlit", "archive_views.py")
+gap_research = _load("gap_risk", "research", "gap_risk.py")
 
 
 def _m(symbol="AAA", atr=2.0, close=100.0, **overrides):
@@ -135,8 +138,8 @@ class SizingAndLossTests(LiveSettingsCase):
     def test_exposure_and_loss_are_separate_numbers(self):
         lines = risk.candidate_lines("AAA", risk.assess([_m()], {}, [], TODAY))
         self.assertEqual("    size: 25% of the portfolio ≈ 12,500 NOK (capped at 25%)", lines[1])
-        self.assertTrue(lines[2].startswith(
-            "    loss at the stop: 1.50% of the portfolio ≈ 750 NOK, before costs"))
+        self.assertEqual(lines[2], "    loss if bought at the 100.00 close: 1.50% of the portfolio ≈ 750 NOK "
+                                   "at the stop, before costs; your actual risk isn't known until you buy")
 
     def test_without_an_account_size_only_shares_of_the_portfolio_are_shown(self):
         self.use(risk_account_size=0.0)
@@ -147,8 +150,8 @@ class SizingAndLossTests(LiveSettingsCase):
         self.assertAlmostEqual(trade.stop_loss_pct, 1.5)
         lines = risk.candidate_lines("AAA", risk.assess([_m()], {}, [], TODAY))
         self.assertEqual("    size: 25% of the portfolio (capped at 25%)", lines[1])
-        self.assertNotIn("NOK", lines[2])
-        self.assertIn("fees: at least 118 NOK", lines[3])
+        self.assertNotIn("NOK", lines[2] + lines[3])
+        self.assertIn("fees: at least 118 NOK", lines[4])
 
     def test_check_and_recommendations_agree_for_the_same_money(self):
         pick = risk.pick_risk(_m("EQNR.OL", atr=2.0, close=250.0))      # 12,500 NOK = 50 shares
@@ -160,22 +163,37 @@ class SizingAndLossTests(LiveSettingsCase):
              patch.object(fills, "current_holdings", return_value={}):
             text = trade_check.build_check("EQNR.OL 12500", today=TODAY)
         self.assertIn(risk.stop_line(pick, "NOK"), text)
-        self.assertIn(risk.loss_line(pick, "your money"), text)
+        for line in risk.loss_lines(pick, "your money"):
+            self.assertIn(line, text)
         self.assertIn(risk.fee_line("EQNR.OL", pick.exposure_nok, pick.account_nok), text)
-        self.assertIn("volatility stop 235.00 NOK, 3×ATR below the 250.00 close: 15.00 (6.0%) away", text)
-        self.assertIn("1.50% of your money ≈ 750 NOK", text)
+        self.assertIn("volatility stop 235.00 NOK, 3×ATR below the 250.00 signal close: 15.00 (6.0%) away",
+                      text)
+        self.assertIn("loss if bought at the 250.00 close: 1.50% of your money ≈ 750 NOK at the stop", text)
+        self.assertIn("not from your buy price, which isn't known yet", text)
 
 
 class GapTests(LiveSettingsCase):
-    def test_the_estimate_is_the_stop_plus_the_measured_overshoot(self):
+    def test_the_gap_sale_is_the_stop_less_the_measured_shortfall(self):
         study = risk.gap_study()
         self.assertEqual((study.multiple, study.anchor), (3.0, "signal_close"))
-        trade = risk.pick_risk(_m(atr=2.0))
+        trade = risk.pick_risk(_m(atr=2.0, close=100.0))
         self.assertTrue(trade.gap_measured)
-        self.assertEqual(trade.gap_overshoot_pp, study.overshoot_p90_pp)
-        self.assertAlmostEqual(trade.gap_loss_nok, 12_500 * (6.0 + study.overshoot_p90_pp) / 100)
-        self.assertAlmostEqual(trade.gap_loss_pct, 25.0 * (6.0 + study.overshoot_p90_pp) / 100)
+        self.assertEqual(trade.gap_below_stop_pct, study.gap_below_stop_p90_pct)
+        self.assertAlmostEqual(trade.gap_fill_price, 94.0 * (1 - 2.75 / 100))       # 91.415
+        # Bought at the 100.00 reference and sold at 91.415: 8.585% of the position.
+        self.assertAlmostEqual(trade.gap_loss_nok, 12_500 * 0.08585)
+        self.assertAlmostEqual(trade.gap_loss_pct, 25.0 * 0.08585)
         self.assertGreater(trade.gap_loss_nok, trade.stop_loss_nok)
+
+    def test_units_are_not_mixed(self):
+        # The first version added the shortfall, measured in points of the buy
+        # price, to the stop distance, measured from the signal close.
+        trade = risk.pick_risk(_m(atr=2.0, close=100.0))
+        loss_pct_of_position = trade.gap_loss_nok / trade.exposure_nok * 100
+        self.assertAlmostEqual(loss_pct_of_position,
+                               (1 - trade.gap_fill_price / trade.reference_price) * 100)
+        self.assertNotAlmostEqual(loss_pct_of_position,
+                                  trade.stop_distance_pct + trade.gap_below_stop_pct, places=3)
 
     def test_it_is_called_an_estimate_and_a_real_gap_can_be_worse(self):
         # The audit's example: stop at 94, the stock opens at 85.
@@ -185,19 +203,20 @@ class GapTests(LiveSettingsCase):
         self.assertAlmostEqual(realised, 1_875.0)
         self.assertAlmostEqual(realised / trade.account_nok * 100, 3.75)
         self.assertGreater(realised, trade.gap_loss_nok)
-        line = risk.loss_line(trade)
-        self.assertIn("if it gaps through: about 2.14% of the portfolio ≈ 1,069 NOK", line)
-        self.assertIn("(estimate, not a maximum)", line)
-        self.assertNotIn("most you can lose", line.lower())
+        lines = risk.loss_lines(trade)
+        self.assertEqual(lines[1], "    if it gaps through: sold near 91.42, about 2.15% of the portfolio "
+                                   "≈ 1,073 NOK from that close (estimate, not a maximum)")
+        self.assertNotIn("most you can lose", " ".join(lines).lower())
 
     def test_a_stop_that_was_never_measured_gets_no_borrowed_numbers(self):
         self.use(risk_stop_atr_multiple=2.5)
         self.assertIsNone(risk.gap_study())
         trade = risk.pick_risk(_m())
         self.assertFalse(trade.gap_measured)
+        self.assertIsNone(trade.gap_fill_price)
         self.assertIsNone(trade.gap_loss_nok)
         self.assertIsNone(trade.gap_loss_pct)
-        self.assertIn("if it gaps through: not measured for a 2.5×ATR stop", risk.loss_line(trade))
+        self.assertEqual(risk.loss_lines(trade)[1], "    if it gaps through: not measured for a 2.5×ATR stop")
         footer = "\n".join(risk.portfolio_lines(risk.assess([_m()], {}, [], TODAY)))
         self.assertIn("Gap risk has not been measured for a 2.5×ATR stop", footer)
         self.assertNotIn("1 stop in", footer)
@@ -207,13 +226,156 @@ class GapTests(LiveSettingsCase):
         for multiple in (2.0, 3.0):
             self.use(risk_stop_atr_multiple=multiple)
             notes[multiple] = risk.gap_note()
-            self.assertIn(f"under {risk.gap_study().overshoot_p90_pp:.1f} in nine of ten", notes[multiple])
+            self.assertIn(f"less than {risk.gap_study().gap_below_stop_p90_pct:.1f}% below in nine of ten",
+                          notes[multiple])
+            self.assertIn("not a maximum", notes[multiple])
         self.assertNotEqual(notes[2.0], notes[3.0])
 
     def test_only_stops_placed_the_way_the_bot_places_them_count(self):
         # The 2xATR figures of research section 7 were for a stop below the buy
         # price. They are not in the table, so they can never be quoted.
         self.assertTrue(all(study.anchor == risk.STOP_ANCHOR for study in risk.GAP_STUDIES))
+
+
+class BuyPriceTests(LiveSettingsCase):
+    """The buy price is not known when the risk is shown. Above or below the close
+    it changes the actual loss, and must never change the stop or the gap sale."""
+
+    def _gapped(self, entry):
+        # Signal close 100, ATR 2%: stop 94. Bought at `entry`, it opens at 90 next day.
+        return gap_research.simulate(100.0, 2.0, 3.0, "signal-close",
+                                     opens=[entry, 90.0], lows=[entry - 0.5, 89.0], closes=[entry, 91.0])
+
+    def test_the_measured_shortfall_does_not_depend_on_the_buy_price(self):
+        for entry in (98.0, 100.0, 102.0):
+            trade = self._gapped(entry)
+            self.assertTrue(trade["gapped"])
+            self.assertAlmostEqual(trade["below_stop_pct"], (1 - 90 / 94) * 100)       # 4.26% of 94
+            self.assertAlmostEqual(trade["realised_pct"], (90 / entry - 1) * 100)
+        # The old measure moves with the buy price, which is why it could not be applied before a buy.
+        self.assertNotAlmostEqual(self._gapped(98.0)["overshoot_from_entry_pp"],
+                                  self._gapped(102.0)["overshoot_from_entry_pp"])
+
+    def test_the_bot_reproduces_the_research_loss_at_the_reference_and_only_there(self):
+        study = risk.GapStudy(multiple=3.0, anchor="signal_close", entries=1, stopped_pct=100.0,
+                              gapped_of_stops_pct=100.0, gap_below_stop_mean_pct=(1 - 90 / 94) * 100,
+                              gap_below_stop_p90_pct=(1 - 90 / 94) * 100,
+                              gap_below_stop_worst_pct=(1 - 90 / 94) * 100)
+        with patch.object(risk, "GAP_STUDIES", (study,)):
+            trade = risk.pick_risk(_m(atr=2.0, close=100.0))
+        self.assertAlmostEqual(trade.stop_price, 94.0)
+        self.assertAlmostEqual(trade.gap_fill_price, 90.0)
+        modelled = trade.gap_loss_nok / trade.exposure_nok * 100
+        actual = {entry: -self._gapped(entry)["realised_pct"] for entry in (98.0, 100.0, 102.0)}
+        self.assertAlmostEqual(modelled, actual[100.0])                 # 10.0%: bought at the close
+        self.assertGreater(actual[102.0], modelled)                     # 11.8%: paid more
+        self.assertLess(actual[98.0], modelled)                         # 8.2%: paid less
+
+    def test_the_stop_is_measured_from_the_close_whatever_the_buy_price(self):
+        stops = {entry: (1 - gap_research.simulate(100.0, 2.0, 3.0, "signal-close", [entry, entry],
+                                                    [entry, entry], [entry, entry])["stop_from_entry_pct"]
+                              / 100) * entry
+                 for entry in (98.0, 102.0)}
+        self.assertAlmostEqual(stops[98.0], 94.0)
+        self.assertAlmostEqual(stops[102.0], 94.0)
+        above = gap_research.simulate(100.0, 2.0, 3.0, "signal-close", [102.0], [101.0], [101.5])
+        below = gap_research.simulate(100.0, 2.0, 3.0, "signal-close", [98.0], [97.0], [97.5])
+        self.assertGreater(above["stop_from_entry_pct"], 6.0)          # 7.84% from 102
+        self.assertLess(below["stop_from_entry_pct"], 6.0)             # 4.08% from 98
+
+    def test_an_open_at_or_below_the_stop_is_no_trade(self):
+        self.assertIsNone(gap_research.simulate(100.0, 2.0, 3.0, "signal-close", [94.0, 95.0],
+                                                [93.0, 94.0], [94.5, 95.0]))
+        self.assertIsNotNone(gap_research.simulate(100.0, 2.0, 3.0, "signal-close", [94.01, 95.0],
+                                                   [94.01, 94.5], [94.5, 95.0]))
+
+    def test_a_stop_hit_without_a_gap_sells_at_the_stop(self):
+        trade = gap_research.simulate(100.0, 2.0, 3.0, "signal-close", [101.0, 96.0], [100.0, 93.0],
+                                      [100.5, 95.0])
+        self.assertTrue(trade["stopped"])
+        self.assertFalse(trade["gapped"])
+        self.assertEqual(trade["below_stop_pct"], 0.0)
+        self.assertAlmostEqual(trade["realised_pct"], (94 / 101 - 1) * 100)
+
+    def test_every_view_says_the_actual_risk_is_not_known(self):
+        trade = risk.pick_risk(_m())
+        self.assertIn("your actual risk isn't known until you buy", risk.loss_lines(trade)[0])
+        footer = "\n".join(risk.portfolio_lines(risk.assess([_m()], {}, [], TODAY)))
+        self.assertIn("the actual risk of a position isn't known until it is bought", footer)
+        saved = risk.snapshot(trade)
+        self.assertEqual(saved["loss_basis"], "if_bought_at_reference_price")
+        self.assertIsNone(saved["entry_price"])
+
+
+class ResearchMethodTests(unittest.TestCase):
+    """The gap study screens sessions the way the live screen does."""
+
+    def _bars(self, sessions=160, seed=3):
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        close = 100 * np.cumprod(1 + rng.normal(0.003, 0.015, sessions))
+        spread = np.abs(rng.normal(0, 0.01, sessions)) * close
+        index = pd.bdate_range("2025-01-02", periods=sessions)
+        return pd.DataFrame({"Open": close * (1 + rng.normal(0, 0.004, sessions)), "High": close + spread,
+                             "Low": close - spread, "Close": close,
+                             "Volume": rng.integers(1_000_000, 3_000_000, sessions).astype(float)}, index=index)
+
+    def test_the_ema_is_seeded_where_the_live_screen_seeds_it(self):
+        close = self._bars()["Close"]
+        ema = gap_research.screen_ema20(close)
+        for position in (10, 61, 62, 63, 100, 159):
+            window = close.iloc[max(0, position - gap_research.SCREEN_SESSIONS + 1):position + 1]
+            expected = window.ewm(span=20, adjust=False).mean().iloc[-1]
+            self.assertAlmostEqual(ema.iloc[position], expected, places=9)
+
+    def test_the_study_uses_the_screens_ema_unless_asked_not_to(self):
+        # A seed ten years back differs by about 0.2% from one 3 months back, too
+        # little to flip a gate on test data, so the wiring is checked directly.
+        bars = self._bars()
+        with patch.object(gap_research, "screen_ema20", wraps=gap_research.screen_ema20) as ema:
+            gap_research.qualifying(bars)
+            self.assertEqual(ema.call_count, 1)
+            gap_research.qualifying(bars, full_history_ema=True)
+            self.assertEqual(ema.call_count, 1)
+
+    def test_the_gates_match_the_live_screen_session_by_session(self):
+        bars = self._bars()
+        passes, atr_pct = gap_research.qualifying(bars)
+        defaults = nb_config.AppSettings(_env_file=None)
+        self.assertEqual(gap_research.GATES["week"], defaults.trade_min_week_momentum_pct)
+        self.assertEqual(gap_research.GATES["day"], defaults.trade_min_day_change_pct)
+        self.assertEqual(gap_research.GATES["atr"], defaults.trade_max_atr_pct)
+        self.assertEqual(gap_research.GATES["dd"], defaults.trade_max_drawdown_pct)
+        compared = qualified = 0
+        for position in range(len(bars)):
+            history = bars.iloc[max(0, position - gap_research.SCREEN_SESSIONS + 1):position + 1]
+            with patch.object(md, "_fetch_ticker_history", return_value=history), \
+                 patch.object(nb_indicators, "_drop_in_progress_bar", side_effect=lambda h: h):
+                metrics = nb_indicators._compute_trade_metrics("X")
+            live = metrics is not None and not nb_indicators._failed_gates(metrics)
+            self.assertEqual(bool(passes.iloc[position]), live, position)
+            if metrics is not None:
+                self.assertAlmostEqual(metrics.atr_pct, atr_pct.iloc[position], places=9)
+                compared += 1
+            qualified += live
+        self.assertGreater(compared, 100)
+        self.assertGreater(qualified, 10)
+
+
+class ReproducibilityTests(unittest.TestCase):
+    def test_every_gap_row_is_the_saved_research_output(self):
+        for study in risk.GAP_STUDIES:
+            path = os.path.join(ROOT, "docs", "research", "data",
+                                f"gap_risk_{study.multiple:.1f}x_{study.anchor.replace('_', '-')}.txt")
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn(f"research/gap_risk.py basket.pkl {study.multiple:.1f} "
+                          f"{study.anchor.replace('_', '-')}\n", text)
+            last = [line for line in text.splitlines() if line.startswith("GapStudy(")][-1]
+            call = ast.parse(last).body[0].value
+            saved = {keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords}
+            self.assertEqual(saved, {name: getattr(study, name) for name in saved})
+            self.assertEqual(set(saved), set(risk.GapStudy.__dataclass_fields__))
 
 
 class CostTests(LiveSettingsCase):
@@ -244,7 +406,7 @@ class CostTests(LiveSettingsCase):
     def test_costs_are_not_folded_into_the_loss_at_the_stop(self):
         trade = risk.pick_risk(_m())
         self.assertAlmostEqual(trade.stop_loss_nok, trade.exposure_nok * trade.stop_distance_pct / 100)
-        self.assertIn("before costs", risk.loss_line(trade))
+        self.assertIn("before costs", risk.loss_lines(trade)[0])
 
 
 class MissingAtrTests(LiveSettingsCase):
@@ -284,7 +446,7 @@ class MissingAtrTests(LiveSettingsCase):
         self.assertIsNone(trade.exposure_nok)
         self.assertIsNone(trade.account_nok)
         self.assertIsNone(trade.stop_loss_nok)
-        self.assertIsNone(risk.loss_line(trade))
+        self.assertEqual(risk.loss_lines(trade), [])
 
 
 class LiquidityTests(LiveSettingsCase):
@@ -365,21 +527,37 @@ class DashboardConsistencyTests(StoreCase):
             self.assertAlmostEqual(row[name], getattr(trade, name), msg=name)
         message = "\n".join(risk.candidate_lines("EQNR.OL", risk.assess([metrics], {}, [], TODAY)))
         for shown in (f"volatility stop {row['stop_price']:,.2f}",
-                      f"{row['atr_multiple']:g}×ATR below the {row['reference_price']:,.2f} close",
+                      f"{row['atr_multiple']:g}×ATR below the {row['reference_price']:,.2f} signal close",
                       f"{row['stop_distance_price']:,.2f} ({row['stop_distance_pct']:.1f}%) away",
                       f"size: {row['exposure_pct']:.0f}% of the portfolio ≈ {row['exposure_nok']:,.0f} NOK",
-                      f"loss at the stop: {row['stop_loss_pct']:.2f}% of the portfolio ≈ {row['stop_loss_nok']:,.0f} NOK",
-                      f"about {row['gap_loss_pct']:.2f}% of the portfolio ≈ {row['gap_loss_nok']:,.0f} NOK",
+                      f"loss if bought at the {row['reference_price']:,.2f} close: {row['stop_loss_pct']:.2f}% "
+                      f"of the portfolio ≈ {row['stop_loss_nok']:,.0f} NOK at the stop",
+                      f"sold near {row['gap_fill_price']:,.2f}, about {row['gap_loss_pct']:.2f}% of the "
+                      f"portfolio ≈ {row['gap_loss_nok']:,.0f} NOK from that close",
                       f"fees: {row['fee_nok']:,.0f} NOK to buy and sell"):
             self.assertIn(shown, message)
-        self.assertEqual(row["gap"], "estimate: stop + 2.55 pp")
+        self.assertEqual(row["gap"], "estimate: sold 2.75% below the stop (nine in ten did better)")
+        self.assertEqual(row["actual"], "not known: no buy price is linked to a sent pick")
         self.assertEqual(row["costs"], "estimated broker fee")
+
+    def test_the_dashboard_knows_the_record_layout_the_bot_writes(self):
+        self.assertEqual(views.RISK_MODEL_VERSION, risk.RISK_MODEL_VERSION)
+
+    def test_a_record_of_another_layout_is_listed_without_numbers(self):
+        frame = pd.DataFrame([{"sent_on": "2026-11-13", "symbol": "V1", "signal_session": "2026-11-12",
+                               "snapshot_json": json.dumps({"risk": {"model_version": 1, "stop_price": 94.0,
+                                                                     "gap_overshoot_pp": 2.55}})}])
+        row = views.pick_risk(frame).iloc[0]
+        self.assertEqual(row["record"], "risk model v1: not shown")
+        self.assertTrue(pd.isna(row["stop_price"]))
 
     def test_the_record_names_its_model_and_anchor(self):
         self.store.publish([_m("AAPL", avg_volume_20=40_000.0)], SENT)
         saved = json.loads(self.store.published_picks()[0]["snapshot_json"])["risk"]
         self.assertEqual(saved["model_version"], risk.RISK_MODEL_VERSION)
         self.assertEqual(saved["stop_anchor"], "signal_close")
+        self.assertEqual(saved["loss_basis"], "if_bought_at_reference_price")
+        self.assertIsNone(saved["entry_price"])
         self.assertEqual(saved["atr_multiple"], 3.0)
         row = self.table().iloc[0]
         self.assertEqual(row["costs"], "estimated broker fee; currency exchange not included")
@@ -391,6 +569,7 @@ class DashboardConsistencyTests(StoreCase):
         row = self.table().iloc[0]
         self.assertEqual(row["gap"], "not measured for 2.5×ATR")
         self.assertTrue(pd.isna(row["gap_loss_nok"]))
+        self.assertTrue(pd.isna(row["gap_fill_price"]))
 
     def test_no_risk_record_when_the_risk_lines_were_not_sent(self):
         self.use(risk_analytics_enabled=False)
@@ -468,7 +647,7 @@ class OneStopTests(StoreCase):
              patch.object(md, "_fetch_event_profile", return_value={}):
             report = nb_reports.build_ticker_analysis("AAA")
         self.assertIn("invalidation below 94.00 (stop)", report)
-        self.assertIn("volatility stop 94.00, 3×ATR below the 100.00 close", report)
+        self.assertIn("volatility stop 94.00, 3×ATR below the 100.00 signal close", report)
         self.assertNotIn("(20-day low)", report)
 
     def test_recommendations_carry_every_risk_line_per_pick(self):
@@ -478,8 +657,9 @@ class OneStopTests(StoreCase):
              patch.object(risk, "correlated_pairs", return_value=[]), \
              patch.object(nb_history_store.TRADE_HISTORY, "archive_ranks"):
             text, _, _ = nb_screener.build_trade_candidates_payload(universe={"A": "AAA", "E": "EQNR.OL"})
-        for needle in ("volatility stop 94.00, 3×ATR below the 100.00 close", "size: 25% of the portfolio",
-                       "loss at the stop: 1.50% of the portfolio ≈ 750 NOK", "(estimate, not a maximum)",
+        for needle in ("volatility stop 94.00, 3×ATR below the 100.00 signal close", "size: 25% of the portfolio",
+                       "loss if bought at the 100.00 close: 1.50% of the portfolio ≈ 750 NOK at the stop",
+                       "sold near 91.42", "(estimate, not a maximum)", "your actual risk isn't known until you buy",
                        "fees: 118 NOK to buy and sell"):
             self.assertEqual(text.count(needle), 2, needle)
         self.assertIn("3×ATR stop below the signal close", text)

@@ -362,35 +362,51 @@ another year of data.
 Section 7 measured a 2xATR stop placed below the **buy price**. The bot places its stop
 below the **close the signal was formed on** (`risk.size_position`), and the Pi runs
 3xATR. So the footer quoted numbers for a stop that was never the live one.
-`research/gap_risk.py` now takes the multiple and the anchor as arguments. Same basket
-(44 stocks, ten years to 2026-11-13), same five gates, 20-session hold:
 
-| Stop | Entries | Stopped | Gapped (of stops) | Extra loss when gapped: mean / 90th / worst | Stop distance from the close vs from the buy |
+`research/gap_risk.py` now takes the multiple and the anchor, and screens sessions the way
+the live screen does: the five gates (volume is not one), 30 closes needed, and EMA20
+seeded at the start of the 3 months of bars the screen fetches (section 7 seeded it ten
+years back; that changes one entry in 26,000). A test checks the study's gates against
+`indicators._failed_gates` session by session.
+
+**Units.** When a stop gaps, the sale is at the open, below the stop price. The study now
+records that shortfall in **percent of the stop price**. Section 7 recorded it in points of
+the buy price, which depends on what was paid; with a stop measured from the signal close,
+adding those points to the stop distance mixes two reference prices. The shortfall below
+the stop price depends on neither, so the bot can apply it before anyone has bought:
+
+    gap sale  = stop × (1 − shortfall)
+    gap loss  = 1 − gap sale / reference      (reference = the signal close)
+
+Same basket (44 stocks, ten years to 2026-11-13), 20-session hold. Outputs in
+`docs/research/data/gap_risk_*x_signal-close.txt`.
+
+| Stop | Entries | Stopped | Gapped (of stops) | Sale below the stop when gapped, % of stop price: mean / 90th / worst | Same in points of the buy price |
 |---|---|---|---|---|---|
-| 2xATR below the buy price (section 7, rerun) | 26,583 | 46.5% | 14.0% | 0.93 / 2.28 / 10.82 pp | 4.13% / 4.13% |
-| 2xATR below the signal close | 26,541 | 45.9% | 14.3% | 0.95 / 2.25 / 11.22 pp | 4.13% / 4.20% |
-| **3xATR below the signal close (live)** | 26,572 | 28.9% | 13.7% | **1.02 / 2.55 / 11.94 pp** | 6.19% / 6.26% |
-| 3xATR below the signal close, volume 1.2x or more | 7,016 | 28.6% | 12.8% | 1.18 / 2.96 / 11.94 pp | 6.32% / 6.42% |
-| 3xATR below the buy price | 26,583 | 29.1% | 14.3% | 1.00 / 2.56 / 7.42 pp | 6.19% / 6.19% |
+| 2xATR below the buy price, section 7 method | 26,448 | 46.7% | 14.0% | 0.98 / 2.37 / 11.62 | 0.93 / 2.26 / 10.82 |
+| 2xATR below the signal close | 26,407 | 46.0% | 14.3% | 0.99 / 2.36 / 12.04 | 0.94 / 2.24 / 11.22 |
+| **3xATR below the signal close (live)** | 26,438 | 29.0% | 13.7% | **1.09 / 2.75 / 12.75** | 1.02 / 2.55 / 11.94 |
+| 3xATR below the signal close, volume 1.2x or more | 6,980 | 28.7% | 12.8% | 1.27 / 3.21 / 12.75 | 1.18 / 2.96 / 11.94 |
 
 What this says:
 
-- The rerun of section 7 reproduces it (46.4% / 13.9% / 0.93 / 2.29 / 10.82 then), so the
-  script change did not move the old numbers.
+- The section-7 method reproduces section 7 in its own units (0.93 / 2.26 / 10.82 against
+  0.93 / 2.29 / 10.82 then; entries differ because 30 closes are now required).
 - A 3xATR stop is hit less often (29% against 46%), but when it is hit it gaps about as
-  often: **about 1 stop in 7**, at either multiple and either anchor. The extra loss is a
-  little larger in points (1.0 mean, 2.6 at the 90th percentile, 11.9 at worst).
+  often: **about 1 stop in 7**. The sale then comes 1.1% below the stop price on average,
+  less than 2.75% below in nine of ten, 12.75% at worst.
 - Anchoring to the signal close makes the real distance from the buy price 0.07 points
-  wider on average, and wider than stated in 57% of entries. It is a small average with a
-  tail: 11 entries opened at or below the stop and are counted as not traded.
-- Volume is not one of the five gates; it only orders the list. The "confirmed by volume"
-  rows are a subset, and their numbers are close (a slightly larger overshoot).
+  wider on average, and wider than stated in 57% of entries. 11 entries opened at or below
+  the stop and are counted as no trade.
+- The "confirmed by volume" rows are a subset, not the live screen; their shortfall is a
+  little larger.
 
 The bot keeps one row per measured stop in `risk.GAP_STUDIES` (the two signal-close rows
-without the volume filter) and prints the row for the stop in use. A multiple with no row
-prints "not measured". The per-pick "if it gaps through" figure adds the 90th-percentile
-extra loss to the stop distance. It is an estimate from survivors in a rising decade, not a
-maximum: the worst case here was 11.9 points past the stop.
+without the volume filter); a test checks them against the saved outputs. A multiple with no
+row prints "not measured". The "if it gaps through" figure uses the 90th-percentile
+shortfall and is labelled an estimate, not a maximum. All loss figures are modelled as if
+bought at the signal close: the actual loss on a position depends on its buy price, which
+the bot does not have for a signal.
 
 ## Conclusions
 

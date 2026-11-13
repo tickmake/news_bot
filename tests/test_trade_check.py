@@ -63,11 +63,15 @@ class CheckTests(unittest.TestCase):
         self.assertIn("✅ Allowed in an Aksjesparekonto.", text)
         self.assertIn("Next earnings report: Jan 10, 2027, after a 4-week hold.", text)
         self.assertIn("You hold nothing yet.", text)
-        self.assertIn("volatility stop 273.60 NOK, 2×ATR below the 285.00 close: 11.40 (4.0%) away"
+        self.assertIn("volatility stop 273.60 NOK, 2×ATR below the 285.00 signal close: 11.40 (4.0%) away"
                       " · ATR 5.70 (2.0%)", text)
-        self.assertIn("loss at the stop: 0.96% of your money ≈ 479 NOK, before costs · if it gaps "
-                      "through: about 1.50% of your money ≈ 748 NOK (estimate, not a maximum)", text)
-        self.assertIn("The stop is measured from the 2026-11-10 close, not from your buy price.", text)
+        self.assertIn("loss if bought at the 285.00 close: 0.96% of your money ≈ 479 NOK at the stop, "
+                      "before costs; your actual risk isn't known until you buy", text)
+        # 2xATR: stop 273.60 less the 2.36% measured for that stop sells near 267.14.
+        self.assertIn("if it gaps through: sold near 267.14, about 1.50% of your money ≈ 750 NOK from "
+                      "that close (estimate, not a maximum)", text)
+        self.assertIn("worked out from the 2026-11-10 close, not from your buy price, which isn't known yet",
+                      text)
         self.assertIn("a bad 4 weeks: -9.0% ≈ -1,077 NOK on 11,970", text)
         self.assertIn("24% of your money (50,000 NOK). The risk rule suggests about 6,250 NOK.", text)
         self.assertIn("⚠️ More than the 20% limit for one stock.", text)
