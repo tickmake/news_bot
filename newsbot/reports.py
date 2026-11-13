@@ -135,6 +135,11 @@ def build_ticker_analysis(raw_symbol: str) -> str:
         lines.append(f"Employees: {employees:,.0f}")
     lines.append("")
 
+    # Looked up before the sketch, so its invalidation level is the same stop
+    # the risk lines place rather than the 20-day low.
+    context = (risk_analytics.build_context([metrics], {symbol: name})
+               if metrics and SETTINGS.risk_analytics_enabled else None)
+
     # 2. Price & technicals (reuses the automated screener's own math)
     lines.append("<b>Price &amp; Technicals</b>")
     if metrics:
@@ -154,7 +159,7 @@ def build_ticker_analysis(raw_symbol: str) -> str:
             f" · daily swing (ATR) {metrics.atr_pct:.1f}%"
             f" · {metrics.drawdown_pct:.1f}% below its 20-day high."
         )
-        lines.append(_entry_exit_sketch(metrics).strip())
+        lines.append(_entry_exit_sketch(metrics, context).strip())
     else:
         lines.append("Not enough price history available from yfinance for this symbol.")
     lines.append("")
@@ -162,7 +167,6 @@ def build_ticker_analysis(raw_symbol: str) -> str:
     # 2b. Risk and event risk, from the same helpers /recommendations uses.
     if metrics:
         lines.append("<b>Risk &amp; Events</b>")
-        context = risk_analytics.build_context([metrics], {symbol: name}) if SETTINGS.risk_analytics_enabled else None
         sized_lines = risk_analytics.candidate_lines(symbol, context)
         lines.extend(sized_lines or ["Position sizing unavailable (no usable volatility reading)."])
         profile = (context.profiles.get(symbol) if context else None) or {}

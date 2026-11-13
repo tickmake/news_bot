@@ -39,12 +39,18 @@ than ranked 1-5.
 - Commands: `/now`, `/news`, `/recommendations` (with charts), `/stocks`,
   `/watchlist`, `/analyze`, `/performance`, `/diagnostics`, `/pickperformance`,
   `/forwardtest`, `/health`.
-- Risk analytics under each candidate and in `/analyze` (`newsbot/risk.py`): a 2xATR
-  volatility stop, fixed-fractional position size, earnings-date flags, correlation
+- Risk analytics under each candidate and in `/analyze` (`newsbot/risk.py`): an N x ATR
+  volatility stop below the signal close (`RISK_STOP_ATR_MULTIPLE`: code default 2, the
+  Pi runs 3), fixed-fractional position size, earnings-date flags, correlation
   and sector clustering, totals at work and at risk. Reward:risk is measured to that
   same stop, not to the 20-day low. Correlated picks also get a combined
-  stopped-out-together figure, and the footer states the measured frequency with which
-  the stop gaps through (about one in seven) rather than only warning that it can.
+  stopped-out-together figure.
+- One risk calculation (`risk.trade_risk`, #161) feeds `/recommendations`, `/analyze`,
+  `/check` and the dashboard: position, loss at the stop, gap estimate, fee. The gap
+  numbers come from `risk.GAP_STUDIES`, one row per stop that `research/gap_risk.py`
+  measured; any other multiple prints "not measured". A published pick saves its risk
+  lines in `published_picks.snapshot_json` under `risk`; older picks have none and are
+  never given one.
 - Relative strength and beta versus the market and, for US stocks, the sector ETF
   (`newsbot/relative_strength.py`). Context, not a ranking.
 - Candidates grouped as volume-confirmed / unconfirmed / extended (RSI 70+) and listed

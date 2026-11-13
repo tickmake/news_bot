@@ -134,6 +134,9 @@ class TradeMetrics:
     support_level: float = 0.0
     resistance_level: float = 0.0
     volume_trend: str = "unknown"
+    # Shares a day over the 20 sessions before this one. A fact for the risk
+    # lines' thin-trading warning; no gate reads it.
+    avg_volume_20: Optional[float] = None
 
 
 def _drop_in_progress_bar(history: Any) -> Any:
@@ -219,6 +222,7 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
         ema_20 = float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
 
         volume_ratio: Optional[float] = None
+        avg_volume_20: Optional[float] = None
         volume_trend = "unknown"
         if "Volume" in history:
             volume_series = history["Volume"]
@@ -264,6 +268,7 @@ def _compute_trade_metrics(symbol: str) -> Optional[TradeMetrics]:
             support_level=support_level,
             resistance_level=resistance_level,
             volume_trend=volume_trend,
+            avg_volume_20=avg_volume_20,
         )
     except Exception as exc:
         SYS_LOG.debug("metrics_failed symbol=%s detail=%s", symbol, exc)
