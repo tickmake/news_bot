@@ -151,8 +151,10 @@ class ReportTests(unittest.TestCase):
 
     def test_report_settles_and_flags_thin_sample(self):
         winner, loser = _metrics("AAA", "2026-09-02"), _metrics("BBB", "2026-09-02")
-        self.store.archive_signal(winner, True, None, recorded_at=_next_morning("2026-09-02"))
-        self.store.archive_signal(loser, False, "trend", recorded_at=_next_morning("2026-09-02"))
+        # Archive rows carry the horizon at recording time.
+        with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 3):
+            self.store.archive_signal(winner, True, None, recorded_at=_next_morning("2026-09-02"))
+            self.store.archive_signal(loser, False, "trend", recorded_at=_next_morning("2026-09-02"))
         self.store.archive_ranks([winner])
         up = _bars("2026-09-01", [10, 10, 11, 12, 13, 14], [10, 10.5, 11.5, 12.5, 13.5, 14.5])
         flat = _bars("2026-09-01", [10] * 6, [10] * 6)
@@ -163,9 +165,6 @@ class ReportTests(unittest.TestCase):
         with patch("newsbot.market_data._fetch_ticker_history", side_effect=fake_history), \
              patch.object(nb_forward, "_drop_unfinished_bar", side_effect=lambda h: h), \
              patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 3):
-            # Archive rows carry the horizon at recording time.
-            with self.store._connection() as conn:
-                conn.execute("UPDATE signal_archive SET horizon_sessions = 3")
             report = nb_forward.build_forward_test_report(datetime(2026, 10, 3))
         self.assertIn("2 archived signals · 2 completed over 1 entry sessions (2026-09-03 to 2026-09-03)", report)
         self.assertIn("2 clean and finished · 0 clean and in hold · 0 awaiting entry", report)
@@ -183,7 +182,8 @@ class ReportTests(unittest.TestCase):
         self.assertIn("1 recorded under earlier rules or hold lengths (excluded)", report)
 
     def test_other_hold_length_rows_are_excluded(self):
-        self.store.archive_signal(_metrics(), True, None)
+        with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 5):
+            self.store.archive_signal(_metrics(), True, None)
         with patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 20), \
              patch("newsbot.market_data._fetch_ticker_history", return_value=None):
             report = nb_forward.build_forward_test_report(datetime(2026, 10, 3))
@@ -371,6 +371,9 @@ class ReportEdgeTests(unittest.TestCase):
         # 60+ entry sessions, each with one qualified and one rejected symbol, all settled
         # under the after-recording policy.
         sessions = [day.strftime("%Y-%m-%d") for day in pd.bdate_range("2026-01-05", periods=66)]
+        hold = patch.object(nb_config.SETTINGS, "trade_outcome_lookback_days", 5)
+        hold.start()
+        self.addCleanup(hold.stop)
         with self.store._connection() as conn:
             for signal, entry in zip(sessions, sessions[1:], strict=False):
                 for symbol, qualified, ret in (("AAA", 1, 2.0), ("BBB", 0, 1.0)):

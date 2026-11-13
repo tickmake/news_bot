@@ -690,7 +690,8 @@ independent-trade confidence intervals. The assumed next-open fills are not a
 simulation of the bot's actual briefing delivery time.
 
 - `TRADE_OUTCOME_LOOKBACK_DAYS` - backward-compatible setting name for the
-  holding horizon in trading sessions (default `5`)
+  holding horizon in trading sessions (default `20`); it is also the `-h{N}`
+  suffix of every new forward-test rule id
 - `TRADE_BACKTEST_PERIOD` - historical bars fetched for the backtest (default `2y`)
 - `TRADE_BACKTEST_UNIVERSE` - `configured` (default) or the fixed `broad-v1` basket
 - `TRADE_BACKTEST_UNIVERSE_MAX` - evaluation-only symbol limit (default `100`);
@@ -817,7 +818,8 @@ the holding period, so each candidate and `/analyze` now carry:
   average move on the last 8 report days. From the saved `daily_prices`; Yahoo only
   for stocks outside the list. `RISK_FORECAST_ENABLED=false` turns it off.
 - **An earnings flag** when the next report is within `RISK_EARNINGS_WARN_DAYS`
-  (7) calendar days, which covers the default 5-session hold. Dates come from
+  (7) calendar days, which covers a 5-session hold; `.env.example` sets 28 for the
+  default 20-session hold. Dates come from
   yfinance's calendar, not `.info` (whose earnings timestamp is often the previous
   report). A missing date means unknown, not "none".
 - **A "Taken together" section** under the candidates: pairs whose last 60 daily
@@ -898,8 +900,12 @@ so it cannot show a row the Telegram report leaves out.
 deploy and fails if any recorded signal or existing outcome changed. Details:
 `docs/audit/forward-test-fix-plan.md`.
 
-Signals made under different gate thresholds are never mixed: each row carries
-a rule id, and only the current one is reported. Below 60 paired entry sessions
+Signals made under different gate thresholds or holds are never mixed: each
+row carries a rule id, the gates plus the hold (`mom1-day0-atr4.5-dd8-vol1.2-h20`),
+and only the current one is reported. Rows archived before the hold joined the
+id keep their gate-only id (`mom1-day0-atr4.5-dd8-vol1.2`) and are reported
+under the same gates, split by the hold they were recorded with, as before; no
+id is rewritten. Below 60 paired entry sessions
 the report says it cannot conclude anything. The baseline is the bot's own
 screened set (watchlist plus mover discovery, not liquidity-filtered), not the
 whole market; holds overlap and averages are not portfolio returns. Nothing is

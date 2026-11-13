@@ -482,7 +482,10 @@ def build_forward_test_report(today: Optional[datetime] = None) -> str:
     rule = history_store.TradeHistoryStore.current_rule_id()
     # A different hold length is a different test, so it is never averaged in either.
     horizon = SETTINGS.trade_outcome_lookback_days
-    mine = [row for row in rows if row["rule_id"] == rule]
+    # Rows archived before the hold joined the rule id keep their gate-only id;
+    # their hold is split out by `horizon_sessions` below, as it always was.
+    rules = {rule, history_store.TradeHistoryStore.gate_rule_id()}
+    mine = [row for row in rows if row["rule_id"] in rules]
     test = [
         row for row in mine
         if row["series"] == "clean_test" and int(row["horizon_sessions"]) == horizon

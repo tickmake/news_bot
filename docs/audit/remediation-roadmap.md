@@ -52,6 +52,7 @@ Each task can be done on its own. "Archive?" says whether the task changes histo
 | **Test** | `current_rule_id()` contains `h20`. An existing archive row keeps its old id and is still reported. |
 | **Complexity** | S |
 | **Archive?** | No. Old ids are kept. |
+| **Status** | Implemented on `fix/holding-horizon-rule-id`, not yet merged or deployed. Old gate-only ids are matched on their gates in `/forwardtest` and the dashboard, so they stay reported. See `holding-horizon-report.md`. |
 
 ### P1-3: Stop is anchored to the signal close, not the entry price
 
