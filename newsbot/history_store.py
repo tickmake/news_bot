@@ -19,6 +19,50 @@ from newsbot.indicators import TradeMetrics, _drop_unfinished_bar
 from newsbot.logsetup import APP_LOG, SYS_LOG
 from newsbot.state import TRADE_HISTORY_LOCK
 
+# How the forward test picks a signal's entry session. NULL on a row means the
+# old rule (first session after the signal date, whenever the row was written);
+# this one means the first session whose open is strictly after `recorded_at`.
+ENTRY_POLICY_AFTER_RECORDED = "after-recorded-v1"
+
+# The one definition of which archive rows may be evaluated, shared by the
+# Telegram report and the dashboard (a separate image that cannot import this
+# code). `quality` comes from the classifier version the pointer table names,
+# never from "the latest": a newer classifier that has only reached some rows
+# must not change what is shown. A new-policy row settled by an older build
+# carries an outcome without the policy key and is reported invalid here, so
+# the classification table can stay insert-only.
+_EVALUATED_VIEW = """
+    CREATE VIEW signal_archive_evaluated AS
+    SELECT a.*,
+           CASE WHEN a.entry_policy = 'after-recorded-v1' THEN 'clean_test' ELSE 'historical' END AS series,
+           v.version AS classifier_version,
+           CASE
+             WHEN q.quality IS NULL THEN 'awaiting_entry'
+             WHEN a.outcome_json IS NOT NULL
+                  AND COALESCE(json_extract(a.outcome_json, '$.entry_policy'), '') <> COALESCE(a.entry_policy, '')
+               THEN 'invalid'
+             ELSE q.quality
+           END AS quality,
+           CASE
+             WHEN q.quality IS NULL THEN NULL
+             WHEN a.outcome_json IS NOT NULL
+                  AND COALESCE(json_extract(a.outcome_json, '$.entry_policy'), '') <> COALESCE(a.entry_policy, '')
+               THEN 'settled_under_another_policy'
+             ELSE q.reason
+           END AS quality_reason,
+           q.entry_open_at,
+           a.outcome_json IS NOT NULL                          AS settled,
+           json_extract(a.outcome_json, '$.entry_session')     AS entry_session,
+           json_extract(a.outcome_json, '$.exit_session')      AS exit_session,
+           json_extract(a.outcome_json, '$.net_return_pct')    AS net_return_pct,
+           json_extract(a.outcome_json, '$.excess_return_pct') AS excess_return_pct
+    FROM signal_archive a
+    CROSS JOIN signal_archive_quality_active v
+    LEFT JOIN signal_archive_quality q
+      ON q.symbol = a.symbol AND q.signal_session = a.signal_session
+     AND q.classifier_version = v.version
+"""
+
 
 class TradeHistoryStore:
     """Remembers what the screener measured each session, for every symbol it
@@ -132,8 +176,67 @@ class TradeHistoryStore:
                 """
             )
             conn.commit()
+            try:
+                self._prepare_forward_test(conn)
+            except Exception:
+                conn.close()
+                raise
             self._conn = conn
         return self._conn
+
+    @staticmethod
+    def _prepare_forward_test(conn: sqlite3.Connection) -> None:
+        """Additive schema for the forward-test entry fix; safe to run at every start.
+
+        Existing archive rows are not updated: they keep `entry_policy` NULL,
+        which is exactly how they were scored. The view holds no data, so it
+        is dropped and recreated each time; `IF NOT EXISTS` would keep an old
+        definition for ever after a later release corrected it.
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {column[1] for column in conn.execute("PRAGMA table_info(signal_archive)")}
+            if "entry_policy" not in columns:
+                conn.execute("ALTER TABLE signal_archive ADD COLUMN entry_policy TEXT")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_archive_quality (
+                    symbol TEXT NOT NULL,
+                    signal_session TEXT NOT NULL,
+                    classifier_version INTEGER NOT NULL,
+                    quality TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    entry_open_at TEXT,
+                    classified_at TEXT NOT NULL,
+                    PRIMARY KEY (symbol, signal_session, classifier_version)
+                )
+                """
+            )
+            had_pointer = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signal_archive_quality_active'"
+            ).fetchone()
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_archive_quality_active (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    version INTEGER NOT NULL,
+                    activated_at TEXT NOT NULL
+                )
+                """
+            )
+            if not had_pointer:
+                # Seeded once, when the table is created. A later start never
+                # moves it, and never refills it if it was emptied on purpose.
+                conn.execute(
+                    "INSERT INTO signal_archive_quality_active VALUES (1, 1, ?)",
+                    (datetime.now(timezone.utc).isoformat(),),
+                )
+            conn.execute("DROP VIEW IF EXISTS signal_archive_evaluated")
+            conn.execute(_EVALUATED_VIEW)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     @staticmethod
     def current_rule_id() -> str:
@@ -148,10 +251,19 @@ class TradeHistoryStore:
         )
 
     def archive_signal(
-        self, metrics: "TradeMetrics", qualified: bool, failed_gate: Optional[str]
+        self, metrics: "TradeMetrics", qualified: bool, failed_gate: Optional[str],
+        recorded_at: Optional[datetime] = None,
     ) -> None:
         """First observation of a (symbol, session) wins, like published picks:
-        a rerun or a later settings change cannot rewrite what was signalled."""
+        a rerun or a later settings change cannot rewrite what was signalled.
+
+        `recorded_at` is when the signal came into existence, and the forward
+        test may not enter before it. It defaults to now; tests pass a value.
+        """
+        if recorded_at is None:
+            recorded_at = datetime.now(timezone.utc)
+        if recorded_at.tzinfo is None:
+            raise ValueError("recorded_at must include a timezone")
         with TRADE_HISTORY_LOCK:
             try:
                 conn = self._connection()
@@ -162,8 +274,8 @@ class TradeHistoryStore:
                             symbol, signal_session, qualified, failed_gate, last_close,
                             day_change_pct, week_momentum_pct, volume_ratio, atr_pct,
                             drawdown_pct, rsi_14, rule_id, horizon_sessions,
-                            cost_bps_per_side, benchmark_symbol, recorded_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            cost_bps_per_side, benchmark_symbol, recorded_at, entry_policy
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(symbol, signal_session) DO NOTHING
                         """,
                         (
@@ -174,7 +286,8 @@ class TradeHistoryStore:
                             SETTINGS.trade_outcome_lookback_days,
                             SETTINGS.trade_backtest_cost_bps,
                             _backtest_benchmark_for(metrics.symbol),
-                            datetime.now(timezone.utc).isoformat(),
+                            recorded_at.isoformat(),
+                            ENTRY_POLICY_AFTER_RECORDED,
                         ),
                     )
             except Exception as exc:
@@ -216,6 +329,117 @@ class TradeHistoryStore:
                     """,
                     (json.dumps(outcome, allow_nan=False), symbol, signal_session),
                 )
+
+    def evaluated_rows(self) -> List[Dict[str, Any]]:
+        """Archive rows with their series and data-quality class, from the view.
+
+        Empty when no classifier version is active, so a reader shows nothing
+        instead of unfiltered rows.
+        """
+        with TRADE_HISTORY_LOCK:
+            cursor = self._connection().execute(
+                "SELECT * FROM signal_archive_evaluated ORDER BY signal_session, symbol"
+            )
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
+    def quality_rows(self, version: int) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Classes already written under one classifier version, by (symbol, session)."""
+        with TRADE_HISTORY_LOCK:
+            rows = self._connection().execute(
+                "SELECT symbol, signal_session, quality, reason, entry_open_at "
+                "FROM signal_archive_quality WHERE classifier_version = ?", (version,)
+            ).fetchall()
+        return {
+            (symbol, session): {"quality": quality, "reason": reason, "entry_open_at": opened}
+            for symbol, session, quality, reason, opened in rows
+        }
+
+    def classify(
+        self, entries: List[Tuple[str, str, str, str, Optional[str]]], version: int
+    ) -> int:
+        """Write classes as (symbol, session, quality, reason, entry_open_at). Returns how many were new.
+
+        Insert-only: a class, once written under a version, is never changed.
+        Archive rows are not touched.
+        """
+        if not entries:
+            return 0
+        classified_at = datetime.now(timezone.utc).isoformat()
+        with TRADE_HISTORY_LOCK:
+            conn = self._connection()
+            before = conn.total_changes
+            with conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO signal_archive_quality VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (symbol, session, version, quality, reason, opened, classified_at)
+                        for symbol, session, quality, reason, opened in entries
+                    ],
+                )
+            return conn.total_changes - before
+
+    def active_classifier_version(self) -> Optional[int]:
+        with TRADE_HISTORY_LOCK:
+            row = self._connection().execute(
+                "SELECT version FROM signal_archive_quality_active WHERE id = 1"
+            ).fetchone()
+        return None if row is None else int(row[0])
+
+    def activate_classifier(self, version: int) -> bool:
+        """Point the view at another classifier version. Returns whether it moved.
+
+        Moving forward is refused until every row classed under the version
+        in force also has a class under the new one; otherwise the rows not
+        yet reached would silently drop out of every result. Moving back is
+        always allowed: that is the rollback.
+        """
+        with TRADE_HISTORY_LOCK:
+            conn = self._connection()
+            row = conn.execute(
+                "SELECT version FROM signal_archive_quality_active WHERE id = 1"
+            ).fetchone()
+            current = None if row is None else int(row[0])
+            if current == version:
+                return True
+            changed = 0
+            if current is not None and version > current:
+                missing = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM signal_archive_quality old
+                    WHERE old.classifier_version = ? AND NOT EXISTS (
+                        SELECT 1 FROM signal_archive_quality new
+                        WHERE new.symbol = old.symbol AND new.signal_session = old.signal_session
+                          AND new.classifier_version = ?)
+                    """,
+                    (current, version),
+                ).fetchone()[0]
+                if missing:
+                    SYS_LOG.warning(
+                        "classifier_activation_refused from=%s to=%s rows_missing=%d",
+                        current, version, missing,
+                    )
+                    return False
+            if current is not None:
+                changed = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM signal_archive_quality old
+                    JOIN signal_archive_quality new
+                      ON new.symbol = old.symbol AND new.signal_session = old.signal_session
+                    WHERE old.classifier_version = ? AND new.classifier_version = ?
+                      AND new.quality <> old.quality
+                    """,
+                    (current, version),
+                ).fetchone()[0]
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO signal_archive_quality_active VALUES (1, ?, ?)",
+                    (version, datetime.now(timezone.utc).isoformat()),
+                )
+            APP_LOG.info(
+                "classifier_activated from=%s to=%s rows_changed_class=%d", current, version, changed
+            )
+            return True
 
     def publish(self, picks: List["TradeMetrics"], published_at: datetime) -> None:
         """First successful publication wins; reruns cannot rewrite the signal."""

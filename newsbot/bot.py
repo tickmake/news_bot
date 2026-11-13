@@ -17,7 +17,7 @@ from newsbot.commands import (
     run_healthcheck,
 )
 from newsbot.config import SETTINGS, get_missing_required_config
-from newsbot.forward_test import job_settle_forward_test
+from newsbot.forward_test import job_settle_forward_test, prepare_archive
 from newsbot.scores import job_build_scores
 from newsbot.history_store import job_settle_published_picks
 from newsbot.data_checks import job_load_company_numbers_and_check, job_load_prices_and_check
@@ -37,6 +37,8 @@ def main() -> None:
 
     _prepare_telegram_long_polling()
     notify_interrupted_commands()
+    # Before anything else needs it: the dashboard reads a view this creates.
+    prepare_archive()
 
     # A small thread pool with single-instance jobs prevents overlapping runs
     # from racing on shared state, caches, and the state file.

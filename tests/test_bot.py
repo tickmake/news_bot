@@ -22,6 +22,7 @@ class _MainHarness(unittest.TestCase):
             "thread_cls": patch.object(nb_bot.threading, "Thread", return_value=thread),
             "prepare": patch.object(nb_bot, "_prepare_telegram_long_polling"),
             "notify": patch.object(nb_bot, "notify_interrupted_commands"),
+            "archive": patch.object(nb_bot, "prepare_archive"),
             "heartbeat": patch.object(
                 nb_bot, "_touch_heartbeat", new_callable=lambda: MagicMock(name="_touch_heartbeat")
             ),
@@ -128,6 +129,11 @@ class SchedulerWiringTests(_MainHarness):
         mocks["notify"].assert_called_once_with()
         mocks["heartbeat"].assert_called_once_with("scheduler")
         mocks["scheduler"].start.assert_called_once_with()
+
+    def test_the_forward_test_archive_is_prepared_at_startup(self):
+        # The dashboard reads a view the bot creates; it must not wait for the first job.
+        mocks = self.run_main()
+        mocks["archive"].assert_called_once_with()
 
 
 class PollerAndStartupTests(_MainHarness):

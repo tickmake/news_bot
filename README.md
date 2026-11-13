@@ -854,17 +854,41 @@ again.
 The out-of-sample read. `/performance` replays history, so every rule it judges
 was chosen with that data in view; `/forwardtest` judges only signals the bot
 recorded live before their outcome existed (`signal_archive`, never pruned).
-It settles any outcome that has become computable (next-session open entry,
-close after `TRADE_OUTCOME_LOOKBACK_DAYS` sessions, costs and benchmark frozen
-at recording), then compares **qualified** and **top 5 as delivered** with
-**every symbol screened that day**, paired by signal date with dates weighted
+It settles any outcome that has become computable (close after
+`TRADE_OUTCOME_LOOKBACK_DAYS` sessions, costs and benchmark frozen at
+recording), then compares **qualified** and **top 5 as delivered** with
+**every symbol screened**, paired by entry session with sessions weighted
 equally, reporting the standard error and a rough t value.
 
+**Entry is the first open after the signal was recorded.** A signal exists from
+the moment the bot wrote it, not from the close it is dated: the 19:00 run
+records yesterday's Oslo signal after today's Oslo session has opened, so that
+row enters tomorrow. Opening times per exchange are in `newsbot/exchange_hours.py`;
+a symbol on an exchange that is not listed there is never scored.
+
+Rows recorded before this rule (2026-11) could be scored from an open that had
+already happened. They are kept, classified, and shown separately, never mixed
+into the test:
+
+| Class | Meaning |
+|---|---|
+| clean | the entry open came after the signal was recorded |
+| potentially contaminated | it came at or before (rows from before the fix only) |
+| invalid | cannot be evaluated: unsupported exchange, broken timestamp, or settled by an older build |
+| awaiting entry | the next session has not opened yet; "overdue" after 7 days |
+
+Only clean, finished rows recorded under the new rule count toward the test.
+The dashboard reads the same definition (the `signal_archive_evaluated` view),
+so it cannot show a row the Telegram report leaves out.
+`scripts/forward_test_integrity.py` fingerprints the archive before and after a
+deploy and fails if any recorded signal or existing outcome changed. Details:
+`docs/audit/forward-test-fix-plan.md`.
+
 Signals made under different gate thresholds are never mixed: each row carries
-a rule id, and only the current one is reported. Below 60 paired dates the report
-says it cannot conclude anything. The baseline is the bot's own screened set (watchlist
-plus mover discovery, not liquidity-filtered), not the whole market; holds overlap
-and averages are not portfolio returns. Archiving starts at deploy; nothing is
+a rule id, and only the current one is reported. Below 60 paired entry sessions
+the report says it cannot conclude anything. The baseline is the bot's own
+screened set (watchlist plus mover discovery, not liquidity-filtered), not the
+whole market; holds overlap and averages are not portfolio returns. Nothing is
 backfilled.
 
 ### Market-data alerting

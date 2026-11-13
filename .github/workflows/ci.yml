@@ -53,6 +53,10 @@ jobs:
       - name: Build image
         run: docker build -t news-bot-ci .
 
+      - name: Build dashboard image
+        # A separate image with its own requirements; nothing else builds it.
+        run: docker build -t news-bot-dashboard-ci ./streamlit
+
       - name: Entrypoint drops privileges and fixes a root-owned volume
         run: |
           vol="$(mktemp -d)"
