@@ -52,6 +52,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Compose file is valid, with and without the bundled Ollama
+        # The unit tests read docker-compose.yml as text; this has Compose
+        # parse it, so a schema error or a bad interpolation fails here.
+        run: |
+          docker compose config -q
+          docker compose --profile bundled-ollama config -q
+
       - name: Build image
         run: docker build -t news-bot-ci .
 
