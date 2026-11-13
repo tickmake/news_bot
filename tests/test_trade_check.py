@@ -143,6 +143,77 @@ class CheckTests(unittest.TestCase):
         self.metrics["SAP.DE"] = _m("SAP.DE")
         self.assertIn("No EUR/NOK rate", self.check("SAP.DE 1000"))
 
+    # --- a buy price (#172): the stop and every figure from it -----------------
+
+    def test_a_buy_price_of_101_moves_the_stop_and_every_figure_to_it(self):
+        self.metrics["NHY.OL"] = _m("NHY.OL", 100.0)    # ATR 2% = 2.00
+        with patch.object(nb_config.SETTINGS, "risk_stop_atr_multiple", 3.0):
+            text = self.check("NHY.OL 10100 101")
+        self.assertIn("100 shares at your buy price of 101.00 NOK = 10,100 NOK "
+                      "(close of 2026-11-10: 100.00 NOK)", text)
+        self.assertIn("    risk: volatility stop 95.00 NOK, 3×ATR below your 101.00 buy price: 6.00 (5.9%) away"
+                      " · ATR 2.00 (2.0%)", text)
+        self.assertIn("    loss from your 101.00 buy price: 1.20% of your money ≈ 600 NOK at the stop, "
+                      "before costs", text)
+        self.assertIn("if it gaps through: it sells below the stop; how far is not measured", text)
+        self.assertIn("worked out from your 101.00 NOK buy price: 3×ATR below it, with the ATR from the "
+                      "2026-11-10 close", text)
+        # The same risk rule on the same reference: 0.5% / (6.00 / 101) of 50,000.
+        self.assertIn("The risk rule suggests about 4,208 NOK.", text)
+        for absent in ("estimated volatility stop", "signal close:", "isn't known until you buy",
+                       "not from your buy price"):
+            self.assertNotIn(absent, text)
+
+    def test_without_a_buy_price_the_stop_is_an_estimate_from_the_signal_close(self):
+        self.metrics["NHY.OL"] = _m("NHY.OL", 100.0)
+        with patch.object(nb_config.SETTINGS, "risk_stop_atr_multiple", 3.0):
+            text = self.check("NHY.OL 10100")
+        self.assertIn("101 shares at 100.00 NOK = 10,100 NOK (close of 2026-11-10)", text)
+        self.assertIn("    risk: estimated volatility stop 94.00 NOK, 3×ATR below the 100.00 signal close: "
+                      "6.00 (6.0%) away · ATR 2.00 (2.0%). Once bought it is 3×ATR = 6.00 below your buy price",
+                      text)
+        self.assertIn("loss if bought at the 100.00 close: 1.21% of your money ≈ 606 NOK at the stop, before "
+                      "costs; your actual risk isn't known until you buy", text)
+        self.assertIn("sold near 91.42", text)
+        self.assertIn("Add your buy price to work them out from it: /check NHY.OL 10100 PRICE.", text)
+        self.assertIn("The risk rule suggests about 4,167 NOK.", text)
+        self.assertNotIn("your 100.00 buy price", text)
+
+    def test_two_and_three_atr_stops_from_the_same_buy_price(self):
+        self.metrics["NHY.OL"] = _m("NHY.OL", 100.0)
+        for multiple, stop, distance in ((2.0, "97.00", "4.00 (4.0%)"), (3.0, "95.00", "6.00 (5.9%)")):
+            with patch.object(nb_config.SETTINGS, "risk_stop_atr_multiple", multiple):
+                text = self.check("NHY.OL 10100 101")
+            self.assertIn(f"volatility stop {stop} NOK, {multiple:g}×ATR below your 101.00 buy price: "
+                          f"{distance} away", text)
+
+    def test_a_buy_price_is_in_the_stocks_own_currency(self):
+        text = self.check("AAPL 5000 202")             # close 200 USD, ATR 4.00, 2xATR
+        self.assertIn("2 shares at your buy price of 202.00 USD ≈ 2,222.00 NOK = 4,444 NOK "
+                      "(close of 2026-11-10: 200.00 USD)", text)
+        self.assertIn("volatility stop 194.00 USD, 2×ATR below your 202.00 buy price: 8.00 (4.0%) away", text)
+
+    def test_bad_buy_prices_are_refused(self):
+        for price, reason in (("0", "must be a number above 0"), ("-101", "must be a number above 0"),
+                              ("nan", "must be a number above 0"), ("inf", "must be a number above 0"),
+                              ("1e999", "must be a number above 0"), ("abc", "'abc' is not a buy price")):
+            with self.subTest(price=price):
+                text = self.check(f"EQNR.OL 12000 {price}")
+                self.assertIn(reason, text)
+                self.assertIn("Usage: /check", text)
+                self.assertNotIn("risk:", text)
+        self.assertIn("Usage: /check", self.check("EQNR.OL 12000 290 300"))
+        # Far from the close it is more likely a typo, as in /fill; ! uses it anyway.
+        for price, gap in (("2850", "+900%"), ("239", "-16%")):
+            text = self.check(f"EQNR.OL 12000 {price}")
+            self.assertIn(f"Not checked: {price} is {gap} away from the close of 285.00 NOK", text)
+            self.assertNotIn("risk:", text)
+        self.assertIn("below your 330.00 buy price", self.check("EQNR.OL 12000 330 !"))
+
+    def test_a_decimal_comma_and_a_bang_without_a_price(self):
+        self.assertIn("below your 287.50 buy price", self.check("EQNR.OL 12000 287,50"))
+        self.assertIn("estimated volatility stop 273.60 NOK", self.check("EQNR.OL 12000 !"))
+
     def test_reply_goes_to_telegram_only(self):
         with patch.object(nb_messaging, "send_telegram_message", return_value=True) as send, \
              patch.object(nb_messaging, "_broadcast_message") as broadcast, \

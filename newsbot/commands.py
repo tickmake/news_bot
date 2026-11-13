@@ -40,7 +40,8 @@ def _command_help_text() -> str:
         "/portfolio - What I hold now, its value today and profit or loss\n"
         "/deposit AMOUNT_NOK [YYYY-MM-DD] - Save money put in (minus for money taken out)\n"
         "/scorecard - My trades vs the index fund\n"
-        "/check TICKER AMOUNT_NOK - Fees, ASK, dates, overlap, risk and size before I buy (Telegram only)\n"
+        "/check TICKER AMOUNT_NOK [BUY_PRICE] - Fees, ASK, dates, overlap, risk and size before I buy; "
+        "with a buy price the stop is worked out from it (Telegram only)\n"
     )
 
 

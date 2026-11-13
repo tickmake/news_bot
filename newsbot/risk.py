@@ -24,9 +24,14 @@ from newsbot.benchmarks import _backtest_benchmark_for
 from newsbot.logsetup import SYS_LOG
 
 
-# Where the stop is placed: below the close the signal was formed on, not below
-# the buy price (#172). That close is the reference price for every number here.
+# Where the stop is placed before anyone has bought: below the close the signal
+# was formed on. That close is then the reference price for every number here,
+# and the stop is an estimate of where it will be once bought.
 STOP_ANCHOR = "signal_close"
+# Where it is placed once a buy price is known (/check with a price, #172): the
+# same N x ATR, as a price distance, below that buy price. The buy price is then
+# the reference for every number.
+BUY_PRICE_ANCHOR = "buy_price"
 # What the loss figures assume. Nobody has bought when they are worked out, so
 # they are modelled as if bought at the reference price; the actual loss on a
 # position depends on its buy price, which the bot does not have for a signal.
@@ -72,18 +77,21 @@ GAP_STUDIES: Tuple[GapStudy, ...] = (
 )
 
 
-def gap_study(multiple: Optional[float] = None) -> Optional[GapStudy]:
+def gap_study(multiple: Optional[float] = None, anchor: str = STOP_ANCHOR) -> Optional[GapStudy]:
     """The measurement for the stop in use, or None when that stop was never measured."""
     wanted = SETTINGS.risk_stop_atr_multiple if multiple is None else multiple
     for study in GAP_STUDIES:
-        if study.anchor == STOP_ANCHOR and math.isclose(study.multiple, wanted, abs_tol=1e-9):
+        if study.anchor == anchor and math.isclose(study.multiple, wanted, abs_tol=1e-9):
             return study
     return None
 
 
-def gap_note() -> str:
+def gap_note(anchor: str = STOP_ANCHOR) -> str:
     """One sentence on gap risk for the stop in use. Never quotes another stop's numbers."""
-    study = gap_study()
+    study = gap_study(anchor=anchor)
+    if study is None and anchor == BUY_PRICE_ANCHOR:
+        return ("Gap risk has been measured only for stops below the signal close, not below a "
+                "buy price, so no gap estimate is shown; a stop that gaps sells below its price.")
     if study is None:
         return (f"Gap risk has not been measured for a {SETTINGS.risk_stop_atr_multiple:g}×ATR stop, "
                 "so no gap estimate is shown.")
@@ -106,8 +114,13 @@ class PositionSizing:
     amount: Optional[float] = None  # only when RISK_ACCOUNT_SIZE is set
 
 
-def _stop_pct(metrics: TradeMetrics) -> Optional[float]:
-    """Distance from the signal close to the stop, percent. None when there is no usable ATR."""
+def _stop_pct(metrics: TradeMetrics, entry_price: Optional[float] = None) -> Optional[float]:
+    """Distance to the stop, percent of the reference price: the signal close, or
+    `entry_price` when a buy price is known. None when there is no usable ATR or price.
+
+    The stop is N x ATR below the reference, with the ATR a price distance from
+    the signal's bars: stop = reference - N x ATR.
+    """
     atr = metrics.atr_pct
     if atr is None or not math.isfinite(atr) or atr <= 0:
         return None
@@ -115,26 +128,34 @@ def _stop_pct(metrics: TradeMetrics) -> Optional[float]:
         return None
     if SETTINGS.risk_stop_atr_multiple <= 0:
         return None
-    return SETTINGS.risk_stop_atr_multiple * atr
+    if entry_price is None:
+        return SETTINGS.risk_stop_atr_multiple * atr
+    if not math.isfinite(entry_price) or entry_price <= 0:
+        return None
+    # The same N x ATR in price as below the close, in percent of the buy price.
+    stop_pct = SETTINGS.risk_stop_atr_multiple * atr * metrics.last_close / entry_price
+    return stop_pct if stop_pct < 100.0 else None
 
 
-def size_position(metrics: TradeMetrics) -> Optional[PositionSizing]:
+def size_position(metrics: TradeMetrics, entry_price: Optional[float] = None) -> Optional[PositionSizing]:
     """Fixed-fractional sizing from a volatility stop.
 
     Weight = risk budget / stop distance, so a calmer stock gets a larger
     position and a wilder one a smaller one, each losing the same fraction of
     the portfolio if the stop is hit. Gaps can still lose more than the stop.
+    The stop is measured from `entry_price` when given, else from the signal close.
     """
-    stop_pct = _stop_pct(metrics)
+    stop_pct = _stop_pct(metrics, entry_price)
     if stop_pct is None or SETTINGS.risk_per_trade_pct <= 0:
         return None
+    reference = metrics.last_close if entry_price is None else entry_price
     raw_weight = SETTINGS.risk_per_trade_pct / stop_pct * 100.0
     cap = SETTINGS.risk_max_position_pct
     weight = min(raw_weight, cap) if cap > 0 else raw_weight
     amount = SETTINGS.risk_account_size * weight / 100.0 if SETTINGS.risk_account_size > 0 else None
     return PositionSizing(
         stop_pct=stop_pct,
-        stop_price=metrics.last_close * (1.0 - stop_pct / 100.0),
+        stop_price=reference * (1.0 - stop_pct / 100.0),
         weight_pct=weight,
         risk_pct=weight * stop_pct / 100.0,
         capped=weight < raw_weight,
@@ -152,15 +173,16 @@ class TradeRisk:
     be worked out, never a guess.
 
     The loss figures are modelled as if the position were bought at
-    `reference_price`, the signal close (`LOSS_BASIS`). The real buy price is
-    not known when this is worked out, so the actual loss is not: paying more
-    than the reference makes it larger, paying less makes it smaller. The stop
-    price and the gap sale price do not depend on the buy price.
+    `reference_price` (`LOSS_BASIS`). Without `entry_price` that is the signal
+    close and the stop is an estimate: the real buy price is not known, so the
+    actual loss is not, and paying more than the close makes it larger. With
+    `entry_price` (a buy price given to /check) the reference is that price and
+    the stop is N x ATR below it.
     """
 
     symbol: str
-    session: str                         # the close every number is from
-    reference_price: float               # that close: the stop anchor
+    session: str                         # the close the ATR is from
+    reference_price: float               # the stop anchor: the signal close, or entry_price
     atr_pct: float
     atr_price: float
     atr_multiple: float
@@ -187,6 +209,7 @@ class TradeRisk:
     fee_pct: Optional[float]             # of the account
     fx_cost_included: Optional[bool]     # None: no currency exchange is needed
     warnings: Tuple[str, ...] = ()
+    entry_price: Optional[float] = None  # the buy price the stop is from; None: the signal close
 
 
 def round_trip_fee(amount: float) -> float:
@@ -212,13 +235,15 @@ def liquidity_warnings(metrics: TradeMetrics) -> Tuple[str, ...]:
 
 def trade_risk(metrics: TradeMetrics, exposure_nok: Optional[float] = None,
                account_nok: Optional[float] = None, weight_pct: Optional[float] = None,
-               capped: bool = False) -> Optional[TradeRisk]:
+               capped: bool = False, entry_price: Optional[float] = None) -> Optional[TradeRisk]:
     """The risk of holding `exposure_nok` of this stock with the configured stop. Pure.
 
     `weight_pct` gives the account shares when only the weight is known (no
-    account size set). Long positions only: the bot has no short trades.
+    account size set). `entry_price`, when given, is the buy price the stop and
+    the losses are measured from; otherwise they are from the signal close.
+    Long positions only: the bot has no short trades.
     """
-    stop_pct = _stop_pct(metrics)
+    stop_pct = _stop_pct(metrics, entry_price)
     if stop_pct is None:
         return None
     if exposure_nok is not None and (not math.isfinite(exposure_nok) or exposure_nok <= 0):
@@ -237,24 +262,26 @@ def trade_risk(metrics: TradeMetrics, exposure_nok: Optional[float] = None,
                 exposure_pct * loss_pct_of_position / 100.0 if exposure_pct is not None else None)
 
     close = metrics.last_close
-    stop_price = close * (1.0 - stop_pct / 100.0)
+    reference = close if entry_price is None else entry_price
+    stop_price = reference * (1.0 - stop_pct / 100.0)
     # The gap shortfall was measured in percent of the stop price, so the sale
     # price follows from the stop alone; the loss is then from the reference.
-    study = gap_study()
+    # Only a stop with the measured anchor gets an estimate.
+    study = gap_study(anchor=STOP_ANCHOR if entry_price is None else BUY_PRICE_ANCHOR)
     gap_fill = stop_price * (1.0 - study.gap_below_stop_p90_pct / 100.0) if study else None
     stop_loss_nok, stop_loss_pct = share(stop_pct)
-    gap_loss_nok, gap_loss_pct = share((1.0 - gap_fill / close) * 100.0 if gap_fill is not None else None)
+    gap_loss_nok, gap_loss_pct = share((1.0 - gap_fill / reference) * 100.0 if gap_fill is not None else None)
     fee_nok = round_trip_fee(exposure_nok) if exposure_nok is not None else None
     return TradeRisk(
         symbol=metrics.symbol,
         session=metrics.session,
-        reference_price=close,
+        reference_price=reference,
         atr_pct=metrics.atr_pct,
         atr_price=close * metrics.atr_pct / 100.0,
         atr_multiple=SETTINGS.risk_stop_atr_multiple,
         stop_price=stop_price,
         stop_distance_pct=stop_pct,
-        stop_distance_price=close * stop_pct / 100.0,
+        stop_distance_price=reference * stop_pct / 100.0,
         exposure_nok=exposure_nok,
         exposure_pct=exposure_pct,
         account_nok=account_nok,
@@ -270,6 +297,7 @@ def trade_risk(metrics: TradeMetrics, exposure_nok: Optional[float] = None,
         fee_pct=fee_nok / account_nok * 100.0 if fee_nok is not None and account_nok else None,
         fx_cost_included=None if metrics.symbol.upper().endswith(".OL") else False,
         warnings=liquidity_warnings(metrics),
+        entry_price=entry_price,
     )
 
 
@@ -289,8 +317,9 @@ def snapshot(risk: Optional[TradeRisk]) -> Optional[Dict[str, Any]]:
         return None
     # No buy price: a pick is published before anyone buys, so the actual
     # position risk is recorded as unknown rather than guessed.
-    return {"model_version": RISK_MODEL_VERSION, "stop_anchor": STOP_ANCHOR,
-            "loss_basis": LOSS_BASIS, "entry_price": None,
+    return {"model_version": RISK_MODEL_VERSION,
+            "stop_anchor": STOP_ANCHOR if risk.entry_price is None else BUY_PRICE_ANCHOR,
+            "loss_basis": LOSS_BASIS, "entry_price": risk.entry_price,
             **asdict(risk), "warnings": list(risk.warnings)}
 
 
@@ -580,12 +609,21 @@ def _money(pct: Optional[float], nok: Optional[float], whole: str) -> Optional[s
 
 
 def stop_line(trade: TradeRisk, currency: str = "") -> str:
-    """Where the stop is, the reference price it is measured from, and how far away it is."""
+    """Where the stop is, the reference price it is measured from, and how far away it is.
+
+    Without a buy price the stop is an estimate from the signal close, and the
+    line says where it goes once bought: the same distance below the buy price.
+    """
     unit = f" {currency}" if currency else ""
+    distance = (f"{trade.stop_distance_price:,.2f} ({trade.stop_distance_pct:.1f}%) away · "
+                f"ATR {trade.atr_price:,.2f} ({trade.atr_pct:.1f}%)")
+    if trade.entry_price is not None:
+        return (f"    risk: volatility stop {trade.stop_price:,.2f}{unit}, {trade.atr_multiple:g}×ATR below your "
+                f"{trade.reference_price:,.2f} buy price: {distance}")
     return (
-        f"    risk: volatility stop {trade.stop_price:,.2f}{unit}, {trade.atr_multiple:g}×ATR below the "
-        f"{trade.reference_price:,.2f} signal close: {trade.stop_distance_price:,.2f} "
-        f"({trade.stop_distance_pct:.1f}%) away · ATR {trade.atr_price:,.2f} ({trade.atr_pct:.1f}%)"
+        f"    risk: estimated volatility stop {trade.stop_price:,.2f}{unit}, {trade.atr_multiple:g}×ATR below the "
+        f"{trade.reference_price:,.2f} signal close: {distance}. Once bought it is "
+        f"{trade.atr_multiple:g}×ATR = {trade.stop_distance_price:,.2f} below your buy price"
     )
 
 
@@ -602,20 +640,29 @@ def size_line(trade: TradeRisk, whole: str = "the portfolio") -> Optional[str]:
 
 
 def loss_lines(trade: TradeRisk, whole: str = "the portfolio") -> List[str]:
-    """Loss at the stop and in a gap, both modelled from the signal close and said to be.
+    """Loss at the stop and in a gap, from the reference price and said to be.
 
-    The buy price is not known here, so the line says the actual risk is not
-    known yet rather than letting the modelled figure pass for it.
+    Without a buy price they are modelled from the signal close, and the line
+    says the actual risk is not known yet rather than letting the modelled
+    figure pass for it.
     """
     planned = _money(trade.stop_loss_pct, trade.stop_loss_nok, whole)
     if planned is None:
         return []
-    lines = [f"    loss if bought at the {trade.reference_price:,.2f} close: {planned} at the stop, "
-             "before costs; your actual risk isn't known until you buy"]
+    if trade.entry_price is None:
+        lines = [f"    loss if bought at the {trade.reference_price:,.2f} close: {planned} at the stop, "
+                 "before costs; your actual risk isn't known until you buy"]
+        basis = "that close"
+    else:
+        lines = [f"    loss from your {trade.reference_price:,.2f} buy price: {planned} at the stop, before costs"]
+        basis = "your buy price"
     if trade.gap_measured:
         gap = _money(trade.gap_loss_pct, trade.gap_loss_nok, whole)
         lines.append(f"    if it gaps through: sold near {trade.gap_fill_price:,.2f}, about {gap} "
-                     "from that close (estimate, not a maximum)")
+                     f"from {basis} (estimate, not a maximum)")
+    elif trade.entry_price is not None:
+        lines.append("    if it gaps through: it sells below the stop; how far is not measured for a stop "
+                     "below a buy price")
     else:
         lines.append(f"    if it gaps through: not measured for a {trade.atr_multiple:g}×ATR stop")
     return lines
@@ -679,7 +726,9 @@ def portfolio_lines(risk: Optional[PortfolioRisk]) -> List[str]:
         f"    <i>Sizes risk {SETTINGS.risk_per_trade_pct:g}% of the portfolio per pick on a "
         f"{SETTINGS.risk_stop_atr_multiple:g}×ATR stop below the signal close. Losses are modelled as "
         "if bought at that close: the actual risk of a position isn't known until it is bought, and "
-        f"paying more than the close makes it larger.{account} {gap_note()} Fees are estimates; spread, slippage and "
+        "paying more than the close makes it larger. Once bought, the stop is the same distance below "
+        f"the buy price; /check TICKER AMOUNT PRICE works it out.{account} {gap_note()} "
+        "Fees are estimates; spread, slippage and "
         "currency exchange cost are not included. The screen itself has "
         "not been shown to beat holding the same stocks.</i>"
     )

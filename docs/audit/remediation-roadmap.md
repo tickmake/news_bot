@@ -64,6 +64,7 @@ Each task can be done on its own. "Archive?" says whether the task changes histo
 | **Test** | With the next open at 101, the stop is computed from 101. |
 | **Complexity** | S |
 | **Archive?** | No |
+| **Status** | Implemented on `fix/stop-from-actual-fill`, not yet merged or deployed. `/check TICKER AMOUNT PRICE` places the stop N×ATR below the price given. Without a price, every view calls the stop an estimate from the signal close. See `stop-from-buy-price-report.md`. |
 
 ### P1-4: Dashboard on 0.0.0.0 with no login
 
