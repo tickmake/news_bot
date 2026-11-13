@@ -1,4 +1,7 @@
-"""/check TICKER AMOUNT: everything worth knowing before placing an order (#121).
+"""/check TICKER AMOUNT [BUY_PRICE]: everything worth knowing before placing an order (#121).
+
+With a buy price the stop and every loss are worked out from it (#172);
+without one they are an estimate from the signal close, and say so.
 
 It joins pieces the bot already has -- the DNB fee, the ASK rule, the next
 report and ex-dividend dates, overlap with what I hold, the volatility stop,
@@ -17,9 +20,11 @@ from newsbot.config import SETTINGS
 from newsbot.logsetup import SYS_LOG
 
 USAGE = (
-    "Usage: /check TICKER AMOUNT_NOK\n"
-    "Example: /check EQNR.OL 12000\n"
-    "Shows fees, ASK, upcoming dates, overlap with what you hold, risk and size before you buy."
+    "Usage: /check TICKER AMOUNT_NOK [BUY_PRICE] [!]\n"
+    "Example: /check EQNR.OL 12000, or /check EQNR.OL 12000 287.50 with the price you paid\n"
+    "Shows fees, ASK, upcoming dates, overlap with what you hold, risk and size before you buy. "
+    "BUY_PRICE is in the stock's own currency; the stop is then worked out from it. "
+    "Add ! at the end to use a price far from the last close."
 )
 
 # A 2-4 week hold (#122), so anything in the next 4 weeks is inside it.
@@ -30,9 +35,13 @@ FEE_WARN_PCT = 1.0
 SMALL_SIZE_FEE_PCT = 1.5
 
 
-def _parse(argument: str) -> Tuple[str, float]:
+def _parse(argument: str) -> Tuple[str, float, Optional[float], bool]:
+    """(symbol, amount in NOK, buy price or None, whether ! skips the price check)."""
     words = argument.split()
-    if len(words) != 2:
+    forced = bool(words) and words[-1] == "!"
+    if forced:
+        words = words[:-1]
+    if len(words) not in (2, 3):
         raise ValueError(USAGE)
     symbol = words[0].upper()
     try:
@@ -41,7 +50,16 @@ def _parse(argument: str) -> Tuple[str, float]:
         raise ValueError(f"'{words[1]}' is not an amount in NOK.\n\n{USAGE}") from None
     if not math.isfinite(amount) or amount <= 0:
         raise ValueError(f"The amount must be more than 0 NOK.\n\n{USAGE}")
-    return symbol, amount
+    buy_price = None
+    if len(words) == 3:
+        # A decimal comma is a decimal point, as in /fill.
+        try:
+            buy_price = float(words[2].replace(",", "."))
+        except ValueError:
+            raise ValueError(f"'{words[2]}' is not a buy price.\n\n{USAGE}") from None
+        if not math.isfinite(buy_price) or buy_price <= 0:
+            raise ValueError(f"The buy price must be a number above 0.\n\n{USAGE}")
+    return symbol, amount, buy_price, forced
 
 
 def _sector(symbol: str, profile: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -135,7 +153,7 @@ def _account_value() -> Tuple[Optional[float], Optional[float]]:
 
 def build_check(argument: str, today: Optional[date] = None) -> str:
     try:
-        symbol, amount = _parse(argument)
+        symbol, amount, buy_price, forced = _parse(argument)
     except ValueError as exc:
         return escape(str(exc), quote=False)
     today = today or datetime.now().date()
@@ -146,10 +164,19 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     currency = fills.currency_for(symbol)
     if currency is None:
         return f"{escape(symbol)}: this exchange isn't supported yet (no known currency)."
+    if buy_price is not None and not forced:
+        # The same typo check as /fill: a price this far from the close is more likely wrong.
+        gap = (buy_price / metrics.last_close - 1.0) * 100.0
+        if abs(gap) > fills.MAX_PRICE_GAP_PCT:
+            return (f"Not checked: {buy_price:g} is {gap:+.0f}% away from the close of "
+                    f"{metrics.last_close:,.2f} {currency}. Check the price (in {currency}). "
+                    "Add ! at the end to use it anyway.")
     fx = 1.0 if currency == "NOK" else fills._latest_price(f"{currency}NOK=X")
     if fx is None:
         return f"No {currency}/NOK rate available right now, so the size can't be worked out. Try again later."
-    price_nok = metrics.last_close * fx
+    # Every number below is from one reference: the buy price when given, else the signal close.
+    price = metrics.last_close if buy_price is None else buy_price
+    price_nok = price * fx
     shares = math.floor(amount / price_nok)
     if shares < 1:
         return (f"One share of {escape(symbol)} costs about {price_nok:,.0f} NOK, "
@@ -157,15 +184,19 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     cost = shares * price_nok
 
     lines = [f"<b>Check: {escape(symbol)} for {amount:,.0f} NOK</b>", ""]
-    price_text = f"{metrics.last_close:,.2f} {currency}"
+    price_text = f"{price:,.2f} {currency}"
     if currency != "NOK":
         price_text += f" ≈ {price_nok:,.2f} NOK"
-    lines.append(f"{shares} shares at {price_text} = {cost:,.0f} NOK (close of {escape(metrics.session)})")
+    if buy_price is None:
+        lines.append(f"{shares} shares at {price_text} = {cost:,.0f} NOK (close of {escape(metrics.session)})")
+    else:
+        lines.append(f"{shares} shares at your buy price of {price_text} = {cost:,.0f} NOK "
+                     f"(close of {escape(metrics.session)}: {metrics.last_close:,.2f} {currency})")
     lines.append("")
 
     total, cash = _account_value()
     # The same calculation /recommendations uses, for the amount asked about.
-    trade = risk.trade_risk(metrics, exposure_nok=cost, account_nok=total)
+    trade = risk.trade_risk(metrics, exposure_nok=cost, account_nok=total, entry_price=buy_price)
 
     lines.append("<b>Fees</b>")
     lines.append(risk.fee_line(symbol, cost, total))
@@ -191,7 +222,7 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     lines.append("")
 
     lines.append("<b>Risk</b>")
-    sized = risk.size_position(metrics)
+    sized = risk.size_position(metrics, entry_price=buy_price)
     if trade is not None:
         lines.append(risk.stop_line(trade, currency))
         lines.extend(risk.loss_lines(trade, "your money"))
@@ -222,9 +253,16 @@ def build_check(argument: str, today: Optional[date] = None) -> str:
     if cash is not None and cost > cash:
         lines.append(f"    ⚠️ More than your cash ({cash:,.0f} NOK).")
     lines.append("")
-    lines.append(f"<i>The stop and the losses are worked out from the {escape(metrics.session)} close, "
+    if buy_price is None:
+        basis = (f"The stop and the losses are worked out from the {escape(metrics.session)} close, "
                  "not from your buy price, which isn't known yet. Paying more than that close makes "
-                 f"the actual loss larger. {risk.gap_note()} Fees are estimates; spread, slippage and "
+                 f"the actual loss larger. Add your buy price to work them out from it: "
+                 f"/check {escape(symbol)} {amount:.0f} PRICE. {risk.gap_note()}")
+    else:
+        basis = (f"The stop and the losses are worked out from your {buy_price:,.2f} {currency} buy price: "
+                 f"{SETTINGS.risk_stop_atr_multiple:g}×ATR below it, with the ATR from the "
+                 f"{escape(metrics.session)} close. {risk.gap_note(risk.BUY_PRICE_ANCHOR)}")
+    lines.append(f"<i>{basis} Fees are estimates; spread, slippage and "
                  "currency exchange cost are not included.</i>")
     lines.append("<i>Information only, not a buy or sell signal. Prices may be delayed.</i>")
     return "\n".join(lines)

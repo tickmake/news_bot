@@ -475,7 +475,7 @@ After sending `/start` to the bot, you can use:
 - `/diagnostics` - break down historical signal outcomes and compare ranking on matching dates
 - `/pickperformance` - evaluate fixed-session outcomes of successfully delivered stock picks
 - `/health` - send runtime health report
-- `/check TICKER AMOUNT_NOK` - before placing an order, e.g. `/check EQNR.OL 12000`: shares and cost in NOK, the DNB fee and the rise needed to cover it, whether it may go in an Aksjesparekonto, earnings and ex-dividend dates in the next 4 weeks, overlap (same sector or moving together) with what `/fill` says you hold, the volatility stop with its loss at the stop and its gap estimate in NOK and as a share of your money, the fee as a share of your money, how much it can fall over 2 and 4 weeks, and its share of your money. Telegram only. Information, never a buy or sell verdict
+- `/check TICKER AMOUNT_NOK [BUY_PRICE] [!]` - before placing an order, e.g. `/check EQNR.OL 12000`: shares and cost in NOK, the DNB fee and the rise needed to cover it, whether it may go in an Aksjesparekonto, earnings and ex-dividend dates in the next 4 weeks, overlap (same sector or moving together) with what `/fill` says you hold, the volatility stop with its loss at the stop and its gap estimate in NOK and as a share of your money, the fee as a share of your money, how much it can fall over 2 and 4 weeks, and its share of your money. Add the price you paid, in the stock's own currency (`/check EQNR.OL 12000 287.50`), and the stop, every loss and the suggested size are worked out from it instead of the signal close; a price more than 15% from the close is refused as a likely typo unless you end with `!`, as in `/fill`. Telegram only. Information, never a buy or sell verdict
 
 `/morning` and `/evening` (forcing the greeting/tone of the scheduled
 07:00/19:00 briefing on demand) have been removed in favor of the more
@@ -790,8 +790,9 @@ the holding period, so each candidate and `/analyze` now carry:
 
 - **A volatility stop and a position size.** The stop is `RISK_STOP_ATR_MULTIPLE`
   (code default 2; the Pi's `.env` sets 3) times the stock's ATR below the close the
-  signal was formed on, not below your buy price. ATR is the plain average of the last
-  14 true ranges. The size is `RISK_PER_TRADE_PCT` (default 0.5%; the Pi sets 2%) of
+  signal was formed on, and is shown as an **estimate**: once bought, the stop is the same
+  distance (N×ATR, in price) below your buy price, which `/check TICKER AMOUNT PRICE`
+  works out (#172). ATR is the plain average of the last 14 true ranges. The size is `RISK_PER_TRADE_PCT` (default 0.5%; the Pi sets 2%) of
   the portfolio divided by that stop distance, so a calmer stock gets a larger position
   and a wilder one a smaller one, each losing the same fraction if the stop is hit. No
   position exceeds `RISK_MAX_POSITION_PCT` (20%). Set `RISK_ACCOUNT_SIZE` to see

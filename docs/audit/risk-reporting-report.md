@@ -155,7 +155,7 @@ What the new tests cover: the configured multiple and the anchor; the stop price
 
 ## 8. Limitations and assumptions
 
-1. **The stop is still measured from the signal close.** Buying above that close widens the real loss (by 0.07 points on average in the study, wider than stated in 57% of entries). Every loss line now says it is modelled at the close. Moving the anchor to the buy price is #172 and changes what the bot advises, so it is not done here.
+1. **The stop is still measured from the signal close.** Buying above that close widens the real loss (by 0.07 points on average in the study, wider than stated in 57% of entries). Every loss line now says it is modelled at the close. Moving the anchor to the buy price is #172 and changes what the bot advises, so it is not done here. *(Update: done for `/check` with a buy price by P1-3; see `stop-from-buy-price-report.md`.)*
 2. **No actual position risk is shown.** A sent pick has no buy price linked to it (`/fill` records trades separately), so the actual risk is "not known" everywhere. Showing it would need fills linked to picks: a new feature, not a correction.
 3. **The gap figure is an estimate.** It comes from 44 large stocks that still exist, in a rising decade, and uses the 90th percentile of gaps that happened. Smaller or failing companies gap harder. It is never called a maximum.
 4. **The shortfall is one number for every stock.** It is pooled over the basket, so a volatile stock is given the same shortfall below its stop as a quiet one; the stop distance already scales with ATR, the shortfall does not.
