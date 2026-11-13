@@ -11,7 +11,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.11 is what the Docker image runs; 3.14 is what local development uses.
+        # 3.11 is the oldest Python the code supports (ruff.toml targets py311);
+        # 3.14 is what local development uses. The Python production runs is
+        # tested in the docker job, inside the image itself.
         python-version: ["3.11", "3.14"]
     steps:
       - name: Checkout
@@ -52,6 +54,24 @@ jobs:
 
       - name: Build image
         run: docker build -t news-bot-ci .
+
+      - name: Unit tests on the production Python, inside the image
+        # The test job's matrix runs on setup-python interpreters. This runs the
+        # same suite on the image's own interpreter and packages, so whatever the
+        # Dockerfile pins is what gets tested. The image leaves tests out
+        # (.dockerignore), so the checkout is mounted read-only; state and trade
+        # history go to the tmpfs, as they go to the writable checkout in the
+        # test job. As `app`, not root: two file-permission tests skip as root.
+        run: |
+          pinned="$(sed -nE 's/^FROM python:([0-9]+\.[0-9]+)-.*/\1/p' Dockerfile)"
+          image="$(docker run --rm news-bot-ci python -c 'import platform; print(platform.python_version())')"
+          echo "Dockerfile pins python:$pinned; the image runs Python $image"
+          test "${image%.*}" = "$pinned"
+          docker run --rm --read-only --tmpfs /tmp --user app \
+            -v "$PWD":/src:ro -w /src \
+            -e STATE_FILE=/tmp/news_bot_state.json \
+            -e TRADE_HISTORY_DB_FILE=/tmp/news_bot_trade_history.db \
+            news-bot-ci python -W error::ResourceWarning -m unittest -v
 
       - name: Build dashboard image
         # A separate image with its own requirements; nothing else builds it.

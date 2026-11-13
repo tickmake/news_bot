@@ -1039,13 +1039,14 @@ source .venv/bin/activate
 python -m unittest -v
 ```
 
-CI (`.github/workflows/ci.yml`) runs on Python 3.11 (the Docker image) and 3.14:
+CI (`.github/workflows/ci.yml`) runs on Python 3.11 (the oldest supported) and 3.14:
 ruff with the rules in `ruff.toml` (pyflakes plus bugbear, bandit security
 checks and a few others; style-only families are left out), `pip-audit` on the
 pinned requirements, and the suite under coverage with `ResourceWarning` treated as
 an error. Coverage has a floor of 95% (`.coveragerc`); it is about 97% today, with
-`benchmarks.py` and `history_store.py` (90%) the weakest. A separate job builds the Docker image and
-checks the hardened runtime below.
+`benchmarks.py` and `history_store.py` (90%) the weakest. A separate job builds the Docker image,
+runs the same suite inside it on the image's own Python (whatever the Dockerfile
+pins, 3.15 today), and checks the hardened runtime below.
 
 ## Docker
 
