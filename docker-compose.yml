@@ -247,6 +247,10 @@ services:
     mem_limit: 768m
     volumes:
       - news_bot_data:/bot-data:ro
+      # The login's own state: one random value, the session epoch, so a logout
+      # still holds after a restart or redeploy (streamlit/auth.py). Removing
+      # the volume only logs everyone out.
+      - dashboard_state:/app/state
     ports:
       - "${DASHBOARD_STREAMLIT_PORT:-8002}:8501"
     logging:
@@ -274,3 +278,6 @@ volumes:
   # Trade-history SQLite DB and news dedup state. Survives recreates; the
   # history is only as deep as TRADE_HISTORY_RETENTION_DAYS (14 by default).
   news_bot_data:
+  # The dashboard login's session epoch (see dashboard-streamlit). Not the bot's
+  # volume: the dashboard keeps that one read-only.
+  dashboard_state:

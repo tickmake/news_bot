@@ -7,6 +7,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY .streamlit ./.streamlit
 COPY app.py archive_views.py auth.py serve.py ./
+# The login's one file, the session epoch (auth.py STATE_FILE), lives on a volume
+# mounted here (docker-compose.yml). A new volume takes this directory's owner,
+# so `nobody` can write it although the root filesystem is read-only.
+RUN mkdir -m 700 /app/state && chown nobody:nogroup /app/state
 
 USER nobody
 ENV HOME=/tmp

@@ -152,7 +152,7 @@ The pages themselves are only the Streamlit shell. Every number is sent over the
 | Concern | Effect |
 |---|---|
 | Service, image, port, volume | Unchanged. The image gains two Python files and runs `streamlit run serve.py` instead of `app.py`. |
-| Read-only root and `nobody` user | The middleware writes nothing; its state (failure counts, logout time) is kept in memory. |
+| Read-only root and `nobody` user | Planned: the middleware writes nothing and keeps its state in memory. **Corrected in the implementation:** a logout kept only in memory did not survive a restart, so the session epoch is now written to a small volume of the dashboard's own (implementation report, section 7). Failure counts stay in memory. |
 | New settings | `DASHBOARD_PASSWORD_HASH` (required), `DASHBOARD_SESSION_SECRET` (recommended), `DASHBOARD_SESSION_HOURS` (optional). They are passed from the host `.env` by a new `environment:` block. |
 | Auto-deploy | A merge rebuilds the dashboard within 5 minutes. **The hash must be in the Pi's `.env` before the merge.** Otherwise the dashboard answers 503 until it is set and the container is recreated. |
 | Health | `/_stcore/health` stays open. A Docker HEALTHCHECK on it is added to the dashboard image (urllib, since the image has no curl). `deploy.sh` waits only for the bot and is unchanged. |
