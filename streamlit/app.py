@@ -660,4 +660,6 @@ pages = [
     st.Page(what_if, title="What-if filters", icon="🎛️", url_path="what-if"),
     *DATA_PAGES,
 ]
+# Served by the login in front of the app (auth.py), not by a page.
+st.sidebar.link_button("Log out", "/logout")
 st.navigation(pages).run()

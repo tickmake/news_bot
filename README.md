@@ -1105,11 +1105,33 @@ per stock (price, key numbers, yearly company numbers, the bot's history with
 it), data collected per day, your `/fill` trades and holdings, and a what-if
 tool for the screen's filters. Built with Streamlit + Plotly; every page is in
 `streamlit/app.py`. It reads the bot's database read-only, with queries cached
-for a minute. No login, so keep the port on the home network / VPN.
+for a minute.
+
+**Login.** `streamlit/serve.py` puts `streamlit/auth.py` in front of every page,
+file and websocket: one password, then a signed session cookie (HttpOnly,
+SameSite=Lax, 12 hours by default), with "Log out" in the sidebar. Only
+`/_stcore/health` answers without a session, for the Docker health check. Five
+wrong passwords from one address lock it out for 15 minutes. Set it up once in
+the Pi's `.env`, **before** the change is deployed. Until a hash is set, every
+page answers 503:
+
+```bash
+python3 streamlit/auth.py hash     # type the password twice; prints the hash
+python3 streamlit/auth.py secret   # prints a session key
+# .env:
+DASHBOARD_PASSWORD_HASH=pbkdf2_sha256:600000:...
+DASHBOARD_SESSION_SECRET=...       # without it, every restart (so every deploy) logs you out
+DASHBOARD_SESSION_HOURS=12
+```
+
+The page is still plain HTTP. The password crosses the network once per login,
+and the cookie crosses it with every request. So keep the port on the home
+network / VPN. Security review: `docs/audit/dashboard-security-assessment.md`.
 
 Deploy on the Pi: `git pull && docker compose up -d --build dashboard-streamlit`.
 
-To work on it locally, copy a backup DB next to the app and point the app at it:
+To work on it locally, copy a backup DB next to the app and point the app at it
+(`app.py` alone runs without the login; `serve.py` runs with it):
 
 ```bash
 cd streamlit

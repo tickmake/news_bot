@@ -1,7 +1,8 @@
 [server]
 headless = true
 port = 8501
-enableCORS = false
+# enableCORS stays at its default (true): set to false, Streamlit accepts a
+# websocket from any web page's origin and the page could read the dashboard.
 fileWatcherType = "none"
 
 [browser]
