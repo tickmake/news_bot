@@ -392,10 +392,69 @@ class RecordedAtTests(StoreCase):
         shifted = signal_row("AAA", "2026-11-09", "2026-11-10T19:00:00+01:00")
         self.assertEqual(entry_date(plain, history), entry_date(shifted, history))
 
-    def test_recorded_before_the_signal_session_was_over(self):
-        row = signal_row("AAA", "2026-11-09", utc("2026-11-09T22:30"))  # still 11-09 in New York
-        self.assertEqual(nb_quality.static_defect(row), "recorded_before_signal_closed")
+    def test_recorded_on_the_signal_date_is_valid(self):
+        # 17:30 in New York on the signal date itself: after the close, same calendar day.
+        after_close = signal_row("AAA", "2026-11-09", utc("2026-11-09T22:30"))
+        self.assertIsNone(nb_quality.static_defect(after_close))
+        history = bars("2026-11-02", 15, "America/New_York")
+        self.assertEqual(entry_date(after_close, history), "2026-11-10")
+        self.assertEqual(nb_quality.entry_quality(after_close, date(2026, 11, 10))[0], "clean")
+        # A later date is valid too.
         self.assertIsNone(nb_quality.static_defect(signal_row("AAA", "2026-11-09", utc("2026-11-10T05:00"))))
+
+    def test_same_day_at_1900_new_york_enters_the_next_session(self):
+        # 19:00 EST on Mon 2026-11-09 is 00:00 UTC on the 10th: still the signal date in New York.
+        row = signal_row("AAA", "2026-11-09", utc("2026-11-10T00:00"))
+        self.assertEqual(utc("2026-11-10T00:00").astimezone(nb_hours.exchange_for("AAA").zone).isoformat(),
+                         "2026-11-09T19:00:00-05:00")
+        self.assertIsNone(nb_quality.static_defect(row))
+        outcome = nb_forward.forward_outcome(row, bars("2026-11-02", 15, "America/New_York"), None)
+        self.assertEqual(outcome["entry_session"], "2026-11-10")
+        self.assertEqual(outcome["entry_open_at"], "2026-11-10T09:30:00-05:00")
+        self.assertGreater(datetime.fromisoformat(outcome["entry_open_at"]), utc("2026-11-10T00:00"))
+
+    def test_the_previous_exchange_local_date_is_invalid(self):
+        # 23:00 in New York on Sun 11-08 is already 04:00 UTC on the 9th. The exchange's
+        # date decides, not the UTC date: this is the day before the signal session.
+        row = signal_row("AAA", "2026-11-09", utc("2026-11-09T04:00"))
+        self.assertEqual(utc("2026-11-09T04:00").date().isoformat(), "2026-11-09")
+        self.assertEqual(nb_quality.static_defect(row), "recorded_before_signal_session")
+        # One hour later it is midnight on the signal date in New York: valid.
+        self.assertIsNone(nb_quality.static_defect(signal_row("AAA", "2026-11-09", utc("2026-11-09T05:00"))))
+        # The same for Oslo, where the local date runs ahead of UTC instead of behind.
+        self.assertEqual(
+            nb_quality.static_defect(signal_row("EQNR.OL", "2026-11-09", utc("2026-11-08T22:59"))),
+            "recorded_before_signal_session")
+        self.assertIsNone(nb_quality.static_defect(signal_row("EQNR.OL", "2026-11-09", utc("2026-11-08T23:00"))))
+
+    def test_same_day_after_the_oslo_close_enters_the_next_oslo_session(self):
+        # 17:30 in Oslo on the signal date; Oslo stops trading before that.
+        recorded = utc("2026-11-09T16:30")
+        row = signal_row("EQNR.OL", "2026-11-09", recorded)
+        self.assertIsNone(nb_quality.static_defect(row))
+        outcome = nb_forward.forward_outcome(row, bars("2026-11-02", 15, "Europe/Oslo"), None)
+        self.assertEqual(outcome["entry_session"], "2026-11-10")
+        self.assertEqual(outcome["entry_open_at"], "2026-11-10T09:00:00+01:00")
+        self.assertGreater(datetime.fromisoformat(outcome["entry_open_at"]), recorded)
+
+    def test_a_same_day_signal_is_classified_clean_and_settled_through_the_job(self):
+        self.archive("AAA", "2026-11-09", utc("2026-11-09T22:30"))       # 17:30 New York, signal date
+        self.archive("EQNR.OL", "2026-11-09", utc("2026-11-09T16:30"))   # 17:30 Oslo, signal date
+        self.archive("EARLY", "2026-11-09", utc("2026-11-09T04:00"))     # the day before, New York time
+        self.histories["AAA"] = bars("2026-11-02", 15, "America/New_York")
+        self.histories["EQNR.OL"] = bars("2026-11-02", 15, "Europe/Oslo")
+        self.histories["EARLY"] = bars("2026-11-02", 15, "America/New_York")
+        self.assertEqual(self.settle(), (2, 0))
+        rows = self.view()
+        for symbol in ("AAA", "EQNR.OL"):
+            row = rows[(symbol, "2026-11-09")]
+            self.assertEqual((row["quality"], row["settled"], row["entry_session"]), ("clean", 1, "2026-11-10"))
+            self.assertGreater(datetime.fromisoformat(row["entry_open_at"]),
+                               datetime.fromisoformat(row["recorded_at"]))
+        early = rows[("EARLY", "2026-11-09")]
+        self.assertEqual((early["quality"], early["quality_reason"], early["settled"]),
+                         ("invalid", "recorded_before_signal_session", 0))
+        self.assertNotIn("EARLY", self.fetched)
 
     def test_other_static_defects(self):
         ok = utc("2026-11-10T06:00")
