@@ -7,7 +7,9 @@ it sees every request, the websocket included, before Streamlit does. Only
 `/_stcore/health` is let through without a session, for the Docker health
 check.
 
-Standard library only, so the tests run without Streamlit installed.
+Standard library only, so the tests run without Streamlit installed. It
+writes one file, the session epoch (`STATE_FILE`), so a logout outlives a
+restart (`Sessions`).
 
     python3 auth.py hash      # type a password; prints a DASHBOARD_PASSWORD_HASH value
     python3 auth.py secret    # prints a DASHBOARD_SESSION_SECRET value
@@ -19,14 +21,18 @@ login and the cookie with every request. TLS would fix that; this does not.
 import asyncio
 import base64
 import binascii
+import contextlib
 import getpass
 import hashlib
 import hmac
 import html
 import logging
 import os
+import re
 import secrets
 import sys
+import tempfile
+import threading
 import time
 from collections import deque
 from urllib.parse import parse_qs, urlsplit
@@ -37,6 +43,10 @@ COOKIE_NAME = "fjord_session"
 HEALTH_PATH = "/_stcore/health"
 LOGIN_PATH = "/login"
 LOGOUT_PATH = "/logout"
+# The session epoch, on the dashboard's own volume (docker-compose.yml): the one
+# file the login writes, so that a logout outlives a restart.
+STATE_FILE = "/app/state/session-epoch"
+_EPOCH = re.compile(r"[A-Za-z0-9_-]{43}")  # secrets.token_urlsafe(32)
 
 SCHEME = "pbkdf2_sha256"
 ITERATIONS = 600_000          # OWASP's figure for PBKDF2-HMAC-SHA256
@@ -94,18 +104,115 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(candidate, digest)
 
 
-class Sessions:
-    """Signed, expiring session tokens: `issued_ms.expires_ms.nonce.signature`.
+def _write_atomically(path: str, text: str) -> None:
+    """Replace `path` with `text`: after a crash it holds the old text or the new, never half."""
+    directory = os.path.dirname(path) or "."
+    fd, temp = tempfile.mkstemp(dir=directory, prefix=".session-epoch.")  # mode 0600
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+    # The rename must reach the disk too, or a power cut could bring the old epoch back.
+    # Best effort: the new epoch is already in place, and a failure here must not undo it.
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as error:
+        LOG.warning("session_state_not_synced path=%s error=%s", path, error)
 
-    Nothing is stored per session. Logging out moves `not_before` forward, so
-    every token issued earlier is refused, on every device.
+
+def _exists(path: str) -> bool:
+    """False only when `path` is certainly not there."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+class Sessions:
+    """Signed, expiring session tokens: `epoch.issued_ms.expires_ms.nonce.signature`.
+
+    Nothing is stored per session. A token is accepted only in the epoch it was
+    issued in, and logging out starts a new epoch, so every token issued
+    earlier is refused, on every device.
+
+    The epoch is a random value kept in `state_path`, so that a logout outlives
+    a restart: the signing key comes from .env and survives one, which an
+    in-memory logout would not. Whenever that file cannot be trusted to hold
+    the latest logout (missing, unreadable, not an epoch, not writable), a new
+    epoch is used instead. Trouble with the file can end every session; it
+    cannot bring an old one back. Without a `state_path`, every start is a new
+    epoch.
     """
 
-    def __init__(self, secret: bytes, max_age_seconds: int, clock=time.time):
+    def __init__(self, secret: bytes, max_age_seconds: int, clock=time.time, state_path=None):
         self._secret = secret
         self.max_age = max_age_seconds
         self._clock = clock
-        self._not_before_ms = 0
+        self._state_path = state_path
+        self._lock = threading.Lock()
+        self.ready = True  # False: an old epoch is stuck on disk; the gate then answers 503
+        self.epoch = self._load_epoch()
+
+    def _load_epoch(self) -> str:
+        path = self._state_path
+        if path is None:
+            return secrets.token_urlsafe(32)
+        stored, found = "", "created"
+        try:
+            with open(path, encoding="ascii") as handle:
+                stored = handle.read(256).strip()
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:  # ValueError: not ASCII
+            LOG.error("session_state_unreadable path=%s error=%s: every session ends", path, error)
+        else:
+            if _EPOCH.fullmatch(stored):
+                found = "loaded"
+            else:
+                LOG.error("session_state_invalid path=%s: every session ends", path)
+                stored = ""
+        epoch = stored or secrets.token_urlsafe(32)
+        # Writing it back proves that a logout could be saved too.
+        outcome = self._save(epoch)
+        if outcome == "saved":
+            LOG.info("session_state_%s path=%s", found, path)
+        elif outcome == "stale":
+            LOG.error("session_state_stuck path=%s: cannot write or remove it, so a logout could "
+                      "not be kept; every page answers 503 until the volume is writable", path)
+            self.ready = False
+        return epoch
+
+    def _save(self, epoch: str) -> str:
+        """'saved'; 'cleared' when it could not be, but no older epoch is left on
+        disk either (a restart then starts a new one); 'stale' when the older one
+        is still there, which a restart would trust."""
+        try:
+            _write_atomically(self._state_path, epoch + "\n")
+            return "saved"
+        except OSError as error:
+            LOG.error("session_state_unwritable path=%s error=%s: sessions end at the next restart",
+                      self._state_path, error)
+        try:
+            os.unlink(self._state_path)
+        except OSError as error:
+            # A read-only filesystem refuses even to remove a file that is not there.
+            if _exists(self._state_path):
+                LOG.error("session_state_not_removed path=%s error=%s", self._state_path, error)
+                return "stale"
+        return "cleared"
 
     def _now_ms(self) -> int:
         return int(self._clock() * 1000)
@@ -115,7 +222,7 @@ class Sessions:
 
     def issue(self) -> str:
         issued = self._now_ms()
-        body = f"{issued}.{issued + self.max_age * 1000}.{secrets.token_urlsafe(12)}"
+        body = f"{self.epoch}.{issued}.{issued + self.max_age * 1000}.{secrets.token_urlsafe(12)}"
         return f"{body}.{self._sign(body)}"
 
     def valid(self, token: str) -> bool:
@@ -125,15 +232,24 @@ class Sessions:
         if not hmac.compare_digest(signature.encode("utf-8"), self._sign(body).encode("ascii")):
             return False
         try:
-            issued_text, expires_text, _nonce = body.split(".")
+            epoch, issued_text, expires_text, _nonce = body.split(".")
             issued, expires = int(issued_text), int(expires_text)
         except ValueError:
             return False
-        now = self._now_ms()
-        return self._not_before_ms <= issued <= now < expires
+        if not hmac.compare_digest(epoch, self.epoch):
+            return False
+        return issued <= self._now_ms() < expires
 
-    def revoke_all(self) -> None:
-        self._not_before_ms = self._now_ms() + 1
+    def revoke_all(self) -> bool:
+        """End every session issued so far.
+
+        In force in this process before the file is touched. False when it could
+        not be saved and the old epoch is still on disk, where a restart would
+        trust it again.
+        """
+        with self._lock:
+            self.epoch = secrets.token_urlsafe(32)
+            return self._state_path is None or self._save(self.epoch) != "stale"
 
 
 class FailureLimiter:
@@ -301,12 +417,13 @@ async def _read_body(receive, limit: int):
 class LoginGate:
     """ASGI middleware: every request needs a valid session, except the health check.
 
-    Without a usable `password_hash` it fails closed: 503 for everything but the
+    Without a usable `password_hash`, or when a logout could not be kept across
+    a restart (`Sessions.ready`), it fails closed: 503 for everything but the
     health check.
     """
 
     def __init__(self, app, password_hash: str = "", session_secret: str = "",
-                 session_hours: float = DEFAULT_SESSION_HOURS, clock=time.time):
+                 session_hours: float = DEFAULT_SESSION_HOURS, clock=time.time, state_path=None):
         self.app = app
         self._hash = password_hash.strip()
         self.configured = parse_hash(self._hash) is not None
@@ -320,9 +437,13 @@ class LoginGate:
         else:
             LOG.warning("dashboard_session_secret_unset: sessions end when the dashboard restarts")
             key = secrets.token_bytes(32)
-        self.sessions = Sessions(key, int(session_hours * 3600), clock)
+        if state_path is None:
+            LOG.warning("dashboard_session_state_unset: sessions end when the dashboard restarts")
+        self.sessions = Sessions(key, int(session_hours * 3600), clock, state_path)
         self.limiter = FailureLimiter(clock=clock)
         self.limiter_all = FailureLimiter(limit=MAX_FAILURES_ALL, clock=clock)
+        self._closed = (b"Dashboard login is not configured.\n" if not self.configured else
+                        b"Dashboard login cannot save its sessions.\n" if not self.sessions.ready else None)
 
     def _has_session(self, headers: dict) -> bool:
         token = _cookie(headers, COOKIE_NAME)
@@ -335,10 +456,10 @@ class LoginGate:
         path = scope.get("path", "")
         if kind == "http" and path == HEALTH_PATH:
             return await self.app(scope, receive, send)
-        if not self.configured:
+        if self._closed:
             if kind == "websocket":
                 return await _refuse_websocket(receive, send)
-            return await _respond(send, 503, b"Dashboard login is not configured.\n")
+            return await _respond(send, 503, self._closed)
 
         headers = _headers(scope)
         if kind == "websocket":
@@ -412,18 +533,27 @@ class LoginGate:
         if not _form_post_allowed(headers):
             LOG.warning("logout_refused reason=cross_origin client=%s", _client(scope))
             return await _respond(send, 403, b"Cross-site logout refused.\n")
+        cookie = (b"set-cookie", f"{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".encode("ascii"))
         # Only a signed-in browser ends every session; anyone else just loses
         # their own (invalid) cookie, so a forged form cannot log the owner out.
         if self._has_session(headers):
-            self.sessions.revoke_all()
+            # Synchronous on purpose: no request is checked between the new epoch
+            # and its write to disk, and the answer goes out only once it is saved.
+            kept = self.sessions.revoke_all()
             LOG.info("logout client=%s", _client(scope))
-        cookie = f"{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
-        return await _respond(send, 303, b"", extra=[(b"location", LOGIN_PATH.encode()),
-                                                     (b"set-cookie", cookie.encode("ascii"))])
+            if not kept:
+                return await _respond(send, 500, b"Logged out, but the dashboard could not save the logout: "
+                                      b"a restart could let old sessions back in. To end them for certain, "
+                                      b"change DASHBOARD_SESSION_SECRET and restart the dashboard. "
+                                      b"See the dashboard log.\n", extra=[cookie])
+        return await _respond(send, 303, b"", extra=[(b"location", LOGIN_PATH.encode()), cookie])
 
 
 def settings_from_env(environ=os.environ) -> dict:
-    """LoginGate's keyword arguments, from DASHBOARD_PASSWORD_HASH and friends."""
+    """LoginGate's keyword arguments, from DASHBOARD_PASSWORD_HASH and friends.
+
+    The state file is not a setting: it lives where compose mounts the volume.
+    """
     hours_text = environ.get("DASHBOARD_SESSION_HOURS", "").strip()
     try:
         hours = float(hours_text) if hours_text else DEFAULT_SESSION_HOURS
@@ -436,6 +566,7 @@ def settings_from_env(environ=os.environ) -> dict:
         "password_hash": environ.get("DASHBOARD_PASSWORD_HASH", "").strip(),
         "session_secret": environ.get("DASHBOARD_SESSION_SECRET", "").strip(),
         "session_hours": hours,
+        "state_path": STATE_FILE,
     }
 
 

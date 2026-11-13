@@ -3,15 +3,23 @@
 `LoginGate` is driven with plain ASGI messages (no HTTP client, no Streamlit),
 so these run in the bot's CI. The app behind the gate records every call: a
 request that reaches it unauthenticated is a hole, whatever status comes back.
+
+A restart is a new `LoginGate` with the same hash, secret and state file, as
+the container gets after a redeploy. State files live in a temporary folder.
 """
 
 import ast
 import asyncio
+import errno
 import importlib.util
 import io
 import logging
 import os
 import re
+import stat
+import tempfile
+import threading
+import time
 import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -45,6 +53,17 @@ PROTECTED = ["/", "/my-money", "/money-put-in", "/sent-picks", "/_stcore/metrics
              "/_stcore/host-config", "/_stcore/script-health-check", "/media/abc.png",
              "/static/js/index.js", "/component/x/index.html", "/_stcore/agent/openapi.json",
              "/_stcore/upload_file/session/file", "/auth/login", "/oauth2callback"]
+
+_STATE_ROOT = tempfile.TemporaryDirectory()
+
+
+def tearDownModule():
+    _STATE_ROOT.cleanup()
+
+
+def new_state_path():
+    """A state file alone in its folder, like the one on the dashboard's volume."""
+    return os.path.join(tempfile.mkdtemp(dir=_STATE_ROOT.name), "session-epoch")
 
 
 class Clock:
@@ -131,11 +150,12 @@ def websocket(gate, headers=None, path="/_stcore/stream"):
     return "accepted" if first["type"] == "websocket.accept" else first["code"]
 
 
-def make_gate(password_hash=HASH, secret=SECRET, hours=12, clock=None):
+def make_gate(password_hash=HASH, secret=SECRET, hours=12, clock=None, state_path=None):
+    """A gate with its own state file, unless given one: the same file again is a restart."""
     inner = Inner()
-    with mock.patch.object(auth.LOG, "warning"), mock.patch.object(auth.LOG, "error"):
-        gate = auth.LoginGate(inner, password_hash=password_hash, session_secret=secret,
-                              session_hours=hours, clock=clock or Clock())
+    gate = auth.LoginGate(inner, password_hash=password_hash, session_secret=secret,
+                          session_hours=hours, clock=clock or Clock(),
+                          state_path=state_path or new_state_path())
     return gate, inner
 
 
@@ -145,15 +165,32 @@ def login(gate, password=PASSWORD, next_path="/", headers=None, client=LAN, sche
                 client=client, scheme=scheme)
 
 
+def logout(gate, cookie):
+    return http(gate, "/logout", "POST", headers={**cookie, "origin": ORIGIN})
+
+
 def session_cookie(response):
     match = re.match(r"fjord_session=([^;]*)", response.header("set-cookie") or "")
     return match.group(1) if match else None
 
 
-def signed_in(gate):
-    response = login(gate)
+def signed_in(gate, client=LAN):
+    response = login(gate, client=client)
     assert response.status == 303, response.status
     return {"cookie": f"fjord_session={session_cookie(response)}"}
+
+
+EPOCH_FILE = re.compile(rb"[A-Za-z0-9_-]{43}\n")
+
+
+def read_state(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def write_state(path, content):
+    with open(path, "wb") as handle:
+        handle.write(content)
 
 
 class PasswordHashTests(unittest.TestCase):
@@ -355,11 +392,12 @@ class SessionTests(unittest.TestCase):
         other_gate, _ = make_gate(secret="t" * 40)
         foreign = signed_in(other_gate)["cookie"].split("=", 1)[1]
         body, _, signature = token.rpartition(".")
-        issued, expires, nonce = body.split(".")
-        longer = f"{issued}.{int(expires) + 10**9}.{nonce}"
+        epoch, issued, expires, nonce = body.split(".")
+        longer = f"{epoch}.{issued}.{int(expires) + 10**9}.{nonce}"
+        other_epoch = f"{'A' * 43}.{issued}.{expires}.{nonce}"
         flipped = signature[:-1] + ("B" if signature.endswith("A") else "A")
-        for value in ["", ".", "a.b.c.d", "ø.ø", foreign, f"{body}.{flipped}",
-                      f"{longer}.{signature}", token + "x", "x" + token]:
+        for value in ["", ".", "a.b.c.d", "a.b.c.d.e", "ø.ø", foreign, f"{body}.{flipped}",
+                      f"{longer}.{signature}", f"{other_epoch}.{signature}", token + "x", "x" + token]:
             with self.subTest(value=value):
                 self.assertEqual(http(gate, "/", headers={"cookie": f"fjord_session={value}"}).status, 401)
         self.assertEqual(inner.calls, [])
@@ -383,18 +421,17 @@ class SessionTests(unittest.TestCase):
 
 class LogoutTests(unittest.TestCase):
     def test_logging_out_ends_every_session(self):
-        clock = Clock()
-        gate, _ = make_gate(clock=clock)
+        gate, _ = make_gate()
         laptop, phone = signed_in(gate), signed_in(gate)
         self.assertEqual(http(gate, "/logout", headers=laptop).status, 200)  # the confirm page changes nothing
         self.assertEqual(http(gate, "/", headers=laptop).status, 200)
-        response = http(gate, "/logout", "POST", headers={**laptop, "origin": ORIGIN})
+        response = logout(gate, laptop)
         self.assertEqual(response.status, 303)
         self.assertEqual(response.header("location"), "/login")
         self.assertIn("Max-Age=0", response.header("set-cookie"))
         self.assertEqual(http(gate, "/", headers=laptop).status, 401)
         self.assertEqual(http(gate, "/", headers=phone).status, 401)
-        clock.now += 0.01
+        # Even in the same millisecond: the logout is an epoch, not a time.
         self.assertEqual(http(gate, "/", headers=signed_in(gate)).status, 200)
 
     def test_a_forged_logout_changes_nothing(self):
@@ -404,6 +441,310 @@ class LogoutTests(unittest.TestCase):
         # Same origin but no session (a LAN client forging the header): no revocation.
         self.assertEqual(http(gate, "/logout", "POST", headers={"origin": ORIGIN}).status, 303)
         self.assertEqual(http(gate, "/", headers=cookie).status, 200)
+
+
+class StateTestCase(unittest.TestCase):
+    """One state file per test. `restart()` is a new gate on that file with the same settings."""
+
+    def setUp(self):
+        self.state = new_state_path()
+
+    def restart(self, **settings):
+        return make_gate(state_path=self.state, **settings)[0]
+
+    def assertOpen(self, gate, cookie):
+        self.assertEqual(http(gate, "/", headers=cookie).status, 200)
+        self.assertEqual(websocket(gate, {**cookie, "origin": ORIGIN}), "accepted")
+
+    def assertRefused(self, gate, cookie, status=401):
+        self.assertEqual(http(gate, "/", headers=cookie).status, status)
+        self.assertEqual(websocket(gate, {**cookie, "origin": ORIGIN}), 1008)
+
+    def assertRecovers(self, gate):
+        """A new login works, and the next restart keeps it."""
+        cookie = signed_in(gate)
+        self.assertOpen(gate, cookie)
+        self.assertOpen(self.restart(), cookie)
+
+
+class LogoutAcrossRestartsTests(StateTestCase):
+    """The signing key outlives a restart, so the logout has to as well."""
+
+    def test_a_session_survives_a_restart_when_nobody_logged_out(self):
+        cookie = signed_in(self.restart())
+        self.assertOpen(self.restart(), cookie)
+        self.assertOpen(self.restart(), cookie)
+        self.assertRefused(self.restart(secret="t" * 40), cookie)  # a different key is not a restart
+
+    def test_a_logout_still_holds_after_restarts(self):
+        first = self.restart()
+        laptop = signed_in(first, client=("192.168.4.10", 1))
+        phone = signed_in(first, client=("192.168.4.20", 1))
+        tablet = signed_in(first, client=("10.1.1.30", 1))
+        self.assertEqual(logout(first, phone).status, 303)
+        for gate in (first, self.restart(), self.restart()):
+            for cookie in (laptop, phone, tablet):
+                self.assertRefused(gate, cookie)
+
+    def test_signing_in_again_after_logout_and_restart(self):
+        first = self.restart()
+        old = signed_in(first)
+        logout(first, old)
+        between = signed_in(first)  # after the logout, before the restart
+        second = self.restart()
+        new = signed_in(second)
+        for gate in (second, self.restart()):
+            self.assertOpen(gate, between)
+            self.assertOpen(gate, new)
+            self.assertRefused(gate, old)
+
+    def test_expired_sessions_stay_expired_across_restarts(self):
+        clock = Clock()
+        cookie = signed_in(self.restart(clock=clock, hours=1))
+        self.assertOpen(self.restart(clock=clock, hours=1), cookie)
+        clock.now += 3600
+        self.assertRefused(self.restart(clock=clock, hours=1), cookie)
+        # A longer setting after the restart does not stretch it: the expiry is signed into the token.
+        self.assertRefused(self.restart(clock=clock, hours=24), cookie)
+
+    def test_a_refused_logout_changes_nothing_on_disk(self):
+        first = self.restart()
+        cookie = signed_in(first)
+        before = read_state(self.state)
+        self.assertEqual(http(first, "/logout", "POST", headers={**cookie, "origin": "http://evil.example"}).status,
+                         403)
+        self.assertEqual(http(first, "/logout", "POST", headers={"origin": ORIGIN}).status, 303)  # no session
+        self.assertEqual(read_state(self.state), before)
+        self.assertOpen(self.restart(), cookie)
+
+    def test_the_file_holds_one_random_value_and_nothing_else(self):
+        first = self.restart()
+        cookie = signed_in(first)
+        logout(first, cookie)
+        content = read_state(self.state)
+        self.assertTrue(EPOCH_FILE.fullmatch(content), content)
+        for secret in (PASSWORD, HASH, SECRET, cookie["cookie"].split("=", 1)[1]):
+            self.assertNotIn(secret.encode(), content)
+        self.assertEqual(stat.S_IMODE(os.stat(self.state).st_mode), 0o600)
+        self.assertEqual(os.listdir(os.path.dirname(self.state)), ["session-epoch"])  # no temp file left
+
+
+class ConcurrentLogoutTests(StateTestCase):
+    def test_no_check_during_the_save_accepts_the_old_session(self):
+        gate = self.restart()
+        cookie = signed_in(gate)
+        token = cookie["cookie"].split("=", 1)[1]
+        seen = []
+        real_write = auth._write_atomically
+
+        def write(path, text):
+            seen.append(gate.sessions.valid(token))  # another request, while the file is written
+            real_write(path, text)
+
+        with mock.patch.object(auth, "_write_atomically", write):
+            self.assertEqual(logout(gate, cookie).status, 303)
+        self.assertEqual(seen, [False])
+
+    def test_two_logouts_at_once_leave_the_newer_epoch_on_disk(self):
+        sessions = self.restart().sessions
+        real_write = auth._write_atomically
+        writes, first_writing = [], threading.Event()
+
+        def write(path, text):
+            writes.append(text)
+            if len(writes) == 1:
+                first_writing.set()
+                # Give the second logout every chance to overtake this write. Without
+                # the lock, the older epoch would reach the disk last.
+                deadline = time.monotonic() + 0.5
+                while sessions.epoch + "\n" == text and time.monotonic() < deadline:
+                    time.sleep(0.005)
+            real_write(path, text)
+
+        with mock.patch.object(auth, "_write_atomically", write):
+            first = threading.Thread(target=sessions.revoke_all)
+            first.start()
+            self.assertTrue(first_writing.wait(5))
+            second = threading.Thread(target=sessions.revoke_all)
+            second.start()
+            first.join()
+            second.join()
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(read_state(self.state).decode().strip(), sessions.epoch)
+        self.assertEqual(self.restart().sessions.epoch, sessions.epoch)
+
+    def test_a_login_that_ends_after_a_logout_cannot_carry_the_old_epoch(self):
+        gate = self.restart()
+        old = signed_in(gate)
+        real_verify = auth.verify_password
+
+        def verify_during_a_logout(password, stored):
+            gate.sessions.revoke_all()  # lands while the password is being checked
+            return real_verify(password, stored)
+
+        with mock.patch.object(auth, "verify_password", verify_during_a_logout):
+            new = signed_in(gate)
+        for restarted in (gate, self.restart()):
+            self.assertRefused(restarted, old)
+            self.assertOpen(restarted, new)  # the password was right, after the logout
+
+
+class BadStateTests(StateTestCase):
+    """Whatever happens to the file, an old session never comes back."""
+
+    def signed_in_then(self, damage):
+        """Sign in, damage the state, restart: (the old cookie, the new gate, its log).
+
+        `damage` gets the file as it was, so it can leave the old epoch within reach.
+        """
+        cookie = signed_in(self.restart())
+        damage(read_state(self.state))
+        with self.assertLogs(auth.LOG, "INFO") as logs:
+            gate = self.restart()
+        return cookie, gate, "\n".join(logs.output)
+
+    def test_damaged_content_ends_every_session(self):
+        # Most of these still contain the old epoch: a reader that took the first
+        # 43 characters, the first line or the ASCII part would let the session back.
+        damages = {"empty": lambda old: b"", "blank line": lambda old: b"\n",
+                   "not an epoch": lambda old: b"not an epoch", "huge": lambda old: b"A" * 10_000,
+                   "one short": lambda old: old[:-2] + b"\n", "one extra": lambda old: old[:-1] + b"!\n",
+                   "twice": lambda old: old + old, "prefixed": lambda old: b"junk " + old,
+                   "not ASCII": lambda old: old[:-1] + b"\xff\n"}
+        for name, damage in damages.items():
+            with self.subTest(damage=name):
+                self.state = new_state_path()
+                cookie, gate, logged = self.signed_in_then(lambda old, damage=damage: write_state(self.state, damage(old)))
+                self.assertRegex(logged, r"session_state_(invalid|unreadable)")
+                self.assertRefused(gate, cookie)
+                self.assertTrue(EPOCH_FILE.fullmatch(read_state(self.state)))  # replaced
+                self.assertRecovers(gate)
+
+    def test_a_deleted_file_ends_every_session(self):
+        cookie, gate, logged = self.signed_in_then(lambda old: os.unlink(self.state))
+        self.assertIn("session_state_created", logged)
+        self.assertRefused(gate, cookie)
+        self.assertRecovers(gate)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads any file")
+    def test_an_unreadable_file_ends_every_session(self):
+        cookie, gate, logged = self.signed_in_then(lambda old: os.chmod(self.state, 0))
+        self.assertIn("session_state_unreadable", logged)
+        self.assertRefused(gate, cookie)
+        self.assertRecovers(gate)
+
+    def test_state_that_can_be_neither_saved_nor_removed_fails_closed(self):
+        def directory_in_the_way(_old):
+            os.unlink(self.state)
+            os.mkdir(self.state)
+
+        cookie, gate, logged = self.signed_in_then(directory_in_the_way)
+        self.assertIn("session_state_stuck", logged)
+        self.assertRefused(gate, cookie, status=503)
+        self.assertEqual(login(gate).status, 503)
+        self.assertEqual(http(gate, "/_stcore/health").status, 200)
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes anywhere")
+    def test_a_read_only_state_folder_fails_closed(self):
+        folder = os.path.dirname(self.state)
+
+        def read_only(_old):
+            os.chmod(folder, 0o500)
+            self.addCleanup(os.chmod, folder, 0o700)
+
+        cookie, gate, logged = self.signed_in_then(read_only)
+        self.assertIn("session_state_stuck", logged)
+        self.assertRefused(gate, cookie, status=503)
+
+    def test_without_the_volume_sessions_end_at_each_restart(self):
+        self.state = os.path.join(_STATE_ROOT.name, "not-mounted", "session-epoch")
+        with self.assertLogs(auth.LOG, "ERROR") as logs:
+            first = self.restart()
+        self.assertIn("session_state_unwritable", "\n".join(logs.output))
+        cookie = signed_in(first)
+        self.assertOpen(first, cookie)
+        self.assertEqual(logout(first, cookie).status, 303)  # nothing on disk could undo it
+        self.assertRefused(first, cookie)
+        later = signed_in(first)
+        self.assertRefused(self.restart(), later)
+
+    def test_a_read_only_root_without_the_volume_is_not_stuck_state(self):
+        # Linux answers EROFS, not "not found", when asked to remove a missing file there.
+        read_only = OSError(errno.EROFS, "Read-only file system")
+        with mock.patch.object(auth, "_write_atomically", side_effect=read_only), \
+                mock.patch.object(auth.os, "unlink", side_effect=read_only), \
+                self.assertLogs(auth.LOG, "ERROR") as logs:
+            first = self.restart()
+            cookie = signed_in(first)
+            self.assertOpen(first, cookie)
+            self.assertEqual(logout(first, cookie).status, 303)
+            later = signed_in(first)
+            restarted = self.restart()
+        self.assertNotIn("session_state_stuck", "\n".join(logs.output))
+        self.assertRefused(first, cookie)
+        self.assertRefused(restarted, cookie)
+        self.assertRefused(restarted, later)  # nothing was saved, so a restart is a new epoch
+
+    def test_without_a_state_file_every_start_is_a_new_epoch(self):
+        with self.assertLogs(auth.LOG, "WARNING") as logs:
+            first = auth.LoginGate(Inner(), password_hash=HASH, session_secret=SECRET)
+        self.assertIn("dashboard_session_state_unset", "\n".join(logs.output))
+        cookie = signed_in(first)
+        self.assertRefused(auth.LoginGate(Inner(), password_hash=HASH, session_secret=SECRET), cookie)
+
+    def test_a_logout_that_cannot_be_saved_removes_the_old_epoch(self):
+        gate = self.restart()
+        laptop, phone = signed_in(gate), signed_in(gate, client=("192.168.4.20", 1))
+        disk_full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(auth, "_write_atomically", side_effect=disk_full), \
+                self.assertLogs(auth.LOG, "ERROR") as logs:
+            self.assertEqual(logout(gate, laptop).status, 303)
+        self.assertIn("session_state_unwritable", "\n".join(logs.output))
+        self.assertFalse(os.path.exists(self.state))
+        for restarted in (gate, self.restart()):
+            self.assertRefused(restarted, laptop)
+            self.assertRefused(restarted, phone)
+        self.assertRecovers(self.restart())
+
+    def test_a_failed_rename_leaves_neither_a_temp_file_nor_the_old_epoch(self):
+        gate = self.restart()
+        cookie = signed_in(gate)
+        with mock.patch.object(auth.os, "replace", side_effect=OSError(errno.EIO, "Input/output error")), \
+                self.assertLogs(auth.LOG, "ERROR"):
+            self.assertEqual(logout(gate, cookie).status, 303)
+        self.assertEqual(os.listdir(os.path.dirname(self.state)), [])
+        self.assertRefused(self.restart(), cookie)
+
+    def test_a_failed_folder_sync_keeps_the_new_epoch(self):
+        gate = self.restart()
+        old = signed_in(gate)
+        unsupported = OSError(errno.EINVAL, "Invalid argument")
+        with mock.patch.object(auth.os, "fsync", side_effect=[None, unsupported]), \
+                self.assertLogs(auth.LOG, "WARNING") as logs:
+            self.assertEqual(logout(gate, old).status, 303)  # the file's fsync works, the folder's fails
+        self.assertIn("session_state_not_synced", "\n".join(logs.output))
+        self.assertEqual(read_state(self.state).decode().strip(), gate.sessions.epoch)
+        new = signed_in(gate)
+        restarted = self.restart()
+        self.assertRefused(restarted, old)
+        self.assertOpen(restarted, new)
+
+    def test_a_logout_that_can_be_neither_saved_nor_undone_says_so(self):
+        gate = self.restart()
+        cookie = signed_in(gate)
+        read_only = OSError(errno.EROFS, "Read-only file system")
+        with mock.patch.object(auth, "_write_atomically", side_effect=read_only), \
+                mock.patch.object(auth.os, "unlink", side_effect=read_only), \
+                self.assertLogs(auth.LOG, "ERROR") as logs:
+            response = logout(gate, cookie)
+            restarted = self.restart()  # still read-only when the dashboard comes back
+        self.assertEqual(response.status, 500)
+        self.assertIn("could not save the logout", response.text)
+        self.assertIn("change DASHBOARD_SESSION_SECRET", response.text)
+        self.assertIn("Max-Age=0", response.header("set-cookie"))
+        self.assertIn("session_state_not_removed", "\n".join(logs.output))
+        self.assertRefused(gate, cookie)
+        self.assertRefused(restarted, cookie, status=503)
 
 
 class NotConfiguredTests(unittest.TestCase):
@@ -450,7 +791,8 @@ class SettingsTests(unittest.TestCase):
         env = {"DASHBOARD_PASSWORD_HASH": f" {HASH} ", "DASHBOARD_SESSION_SECRET": SECRET,
                "DASHBOARD_SESSION_HOURS": "8"}
         self.assertEqual(auth.settings_from_env(env),
-                         {"password_hash": HASH, "session_secret": SECRET, "session_hours": 8.0})
+                         {"password_hash": HASH, "session_secret": SECRET, "session_hours": 8.0,
+                          "state_path": "/app/state/session-epoch"})
 
     def test_bad_hours_fall_back_to_twelve(self):
         for hours in ("abc", "0", "-1", "100000"):
@@ -523,6 +865,21 @@ class DeploymentWiringTests(unittest.TestCase):
         self.assertIn("news_bot_data:/bot-data:ro", dashboard)
         self.assertEqual(compose.count("DASHBOARD_PASSWORD_HASH="), 1)
         self.assertIn("DASHBOARD_PASSWORD_HASH=", self.read(".env.example"))
+
+    def test_the_state_file_is_on_a_volume_of_the_dashboards_own(self):
+        compose = self.read("docker-compose.yml")
+        dashboard = compose[compose.index("  dashboard-streamlit:"):compose.index("\nnetworks:")]
+        folder = os.path.dirname(auth.STATE_FILE)
+        self.assertIn(f"- dashboard_state:{folder}\n", dashboard)
+        self.assertIn("\n  dashboard_state:\n", compose[compose.index("\nvolumes:"):])
+        self.assertEqual(compose.count("dashboard_state:"), 2)  # that mount and the declaration
+        self.assertEqual(auth.settings_from_env({})["state_path"], auth.STATE_FILE)
+
+    def test_the_image_lets_nobody_write_the_state_folder(self):
+        dockerfile = self.read("streamlit", "Dockerfile")
+        folder = os.path.dirname(auth.STATE_FILE)
+        made = dockerfile.index(f"RUN mkdir -m 700 {folder} && chown nobody:nogroup {folder}")
+        self.assertLess(made, dockerfile.index("USER nobody"))
 
 
 if __name__ == "__main__":
