@@ -129,6 +129,8 @@ Each task can be done on its own. "Archive?" says whether the task changes histo
 | **Fix** | Add 3.15 to the test matrix, or run the unit tests inside the built image in the docker job. |
 | **Complexity** | S |
 | **Archive?** | No |
+| **Status** | Implemented on `ci/test-production-python-version`, not yet merged. CI-only, so nothing to deploy. The docker job runs the whole unit suite inside the production image it has just built, on the image's own Python and packages: `python -W error::ResourceWarning -m unittest -v` as the `app` user, read-only root filesystem, tmpfs at `/tmp`, checkout mounted read-only. The step first compares the image's Python with the Dockerfile's `FROM python:X.Y` tag and fails on a mismatch. The 3.11 and 3.14 matrix is unchanged. Cause of the gap: Dependabot moved the image from 3.11 to 3.15 (`af1e358`) and nothing tied the CI matrix to the Dockerfile. |
+| **Verified** | Locally, on a clean copy of the branch and the exact step script from `ci.yml`: image Python 3.15.2, 1173 tests, OK, 2 skipped (the Streamlit-only live tests, which the dashboard image runs). An injected failing test and a `ResourceWarning` both fail the step; a Dockerfile tag that does not match the image fails it too. A probe test inside the run saw `/usr/local/bin/python` 3.15.2, uid 10001, and a read-only `/src`. 3.11 and 3.14: ruff clean, 1173 tests OK, coverage 97%. Dashboard image builds and its 2 live tests pass. |
 
 ## P2: docs, observability, data quality
 
