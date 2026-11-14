@@ -30,6 +30,7 @@ from newsbot import market_data as md
 from newsbot import reports as nb_reports
 from newsbot import risk, trade_check
 from newsbot import screener as nb_screener
+from tests.store_isolation import use_throwaway_store
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TODAY = date(2026, 11, 13)
@@ -490,11 +491,7 @@ class StoreCase(LiveSettingsCase):
     def setUp(self):
         super().setUp()
         self.path = os.path.join(tempfile.mkdtemp(), "h.db")
-        self.store = nb_history_store.TradeHistoryStore(self.path)
-        self.addCleanup(self.store.close)
-        patcher = patch.object(nb_history_store, "TRADE_HISTORY", self.store)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.store = use_throwaway_store(self.addCleanup, self.path)
 
     def table(self):
         with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)) as conn:

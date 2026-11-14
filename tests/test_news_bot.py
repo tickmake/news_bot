@@ -39,6 +39,7 @@ from newsbot import (
     state as nb_state,
     util as nb_util,
 )
+from tests.store_isolation import use_throwaway_store
 
 
 def setUpModule():
@@ -46,23 +47,21 @@ def setUpModule():
     # call, real sqlite writes included, regardless of whether an individual
     # test mocks `_compute_trade_metrics`. Point it at a throwaway file for
     # the whole test run so tests never touch (or depend on) a real
-    # `.news_bot_trade_history.db` in the working directory.
-    global _ORIGINAL_TRADE_HISTORY, _ORIGINAL_RISK_ENABLED
-    _ORIGINAL_TRADE_HISTORY = nb_history_store.TRADE_HISTORY
+    # `.news_bot_trade_history.db` in the working directory. That goes for
+    # every module holding the store: /analyze reads company numbers and
+    # prices through their own name for it (P2-4).
+    global _ORIGINAL_RISK_ENABLED
     # Risk analytics look up earnings dates and sectors over the network. These
     # tests predate it and must never reach yfinance; tests of the feature itself
     # (test_risk.py) switch it on and mock the lookups.
     _ORIGINAL_RISK_ENABLED = nb_config.SETTINGS.risk_analytics_enabled
     nb_config.SETTINGS.risk_analytics_enabled = False
-    nb_history_store.TRADE_HISTORY = nb_history_store.TradeHistoryStore(
-        os.path.join(tempfile.mkdtemp(), "test_trade_history.db")
-    )
+    use_throwaway_store(unittest.addModuleCleanup,
+                        os.path.join(tempfile.mkdtemp(), "test_trade_history.db"))
 
 
 def tearDownModule():
     nb_config.SETTINGS.risk_analytics_enabled = _ORIGINAL_RISK_ENABLED
-    nb_history_store.TRADE_HISTORY.close()
-    nb_history_store.TRADE_HISTORY = _ORIGINAL_TRADE_HISTORY
 
 
 class NewsBotTests(unittest.TestCase):

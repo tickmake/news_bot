@@ -18,6 +18,7 @@ from newsbot import risk
 from newsbot import risk_forecast as nb_risk_forecast
 from newsbot import screener as nb_screener
 from newsbot import state as nb_state
+from tests.store_isolation import use_throwaway_store
 
 TODAY = date(2026, 10, 5)
 
@@ -397,13 +398,10 @@ class EventProfileLookupTests(unittest.TestCase):
 class IntegrationTests(SettingsCase):
     def setUp(self):
         super().setUp()
-        # Rendering a candidate reads its qualifying streak from the trade history;
-        # give it a throwaway store so no real database is opened or leaked.
-        store = nb_history_store.TradeHistoryStore(os.path.join(tempfile.mkdtemp(), "h.db"))
-        self.addCleanup(store.close)
-        patcher = patch.object(nb_history_store, "TRADE_HISTORY", store)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # Rendering a candidate reads its qualifying streak from the trade history,
+        # and /analyze reads company numbers; give every module a throwaway store
+        # so no real database is opened or leaked.
+        use_throwaway_store(self.addCleanup)
 
     def test_candidate_block_includes_risk_lines(self):
         context = risk.assess([_m("AAA")], {}, [], TODAY)
