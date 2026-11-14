@@ -61,7 +61,7 @@ Portainer (8000/9443) and poster-bot (8080) on the same Pi are exposed in the sa
 
 ## D6: Promote `docs/audit/proposed-CLAUDE.md` to the root `CLAUDE.md`
 
-**Status:** open.
+**Status:** decided 2026-11-14 (P2-1). The root `CLAUDE.md` is authoritative. It applies the changes the independent review asked for before promotion: costs are stated as a rule, not as a per-market fact; the forward-test entry rule and the supported exchanges are listed. The proposal stays in place as history.
 
 ## D7: Survivorship-free data
 

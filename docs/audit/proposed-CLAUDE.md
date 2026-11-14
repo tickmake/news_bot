@@ -1,5 +1,10 @@
 # news_bot: project instructions (proposed)
 
+> **Superseded.** This is the audit's proposal, kept as history. The authoritative
+> instructions are in the root [`CLAUDE.md`](../../CLAUDE.md). One statement below
+> is not true of the code: costs are not yet per market and versioned (P1-1 is
+> open). Follow the root file, not this one.
+
 This is a personal swing-trading **research assistant** for US, Norway and EU equities. It is not a trading bot and never places orders.
 
 ## Ground truth

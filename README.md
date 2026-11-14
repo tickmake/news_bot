@@ -12,6 +12,11 @@ Automated Telegram briefing bot that sends curated daily updates with:
 
 The bot is built in Python and scheduled with APScheduler.
 
+**A research assistant, not a trading system.** The bot has no broker connection
+and never places orders. Its screen has shown no edge over simply holding the
+same stocks (see [Limitations](#limitations)), so everything it sends is
+information to look at, never a buy or sell call.
+
 ## Features
 
 - **Telegram delivery** using Bot API with HTML formatting.
@@ -26,8 +31,9 @@ The bot is built in Python and scheduled with APScheduler.
 - **Relevance-ranked headlines** by importance, topic weight, and recency — not raw feed order.
 - **Cross-outlet and cross-day deduplication**, so one story appears once.
 - **Local LLM ranking** via Ollama — no API key, no data leaves your network — with a deterministic heuristic fallback.
-- **Telegram command support** (`/now`, `/news`, `/recommendations`, `/stocks`, `/watchlist`, `/analyze`, `/performance`, `/diagnostics`, `/pickperformance`, `/forwardtest`, `/health`).
-- **Optional Slack mirror** of every outbound message via an incoming webhook, alongside Telegram.
+- **Telegram commands** for briefings, the screen, single-stock analysis, backtests, the forward test, a before-you-buy check and a log of your own trades (see [Telegram Commands](#telegram-commands)).
+- **Optional Slack mirror** of briefings and report replies via an incoming webhook, alongside Telegram. Your own trades and holdings stay on Telegram.
+- **Web dashboard** (Fjord Signals) behind a password login, reading the bot's database read-only.
 - **Health ping** support for runtime monitoring.
 - **CI test workflow** via GitHub Actions.
 
@@ -37,20 +43,32 @@ The bot is built in Python and scheduled with APScheduler.
 - `newsbot/` - the application, one module per concern:
   - `config`, `state`, `logsetup`, `util` - settings, persisted state and caches, banded logging, shared helpers
   - `messaging` - Telegram and Slack delivery
-  - `news_feeds`, `market_data` - news collection and ranking; live quotes and price history
-  - `indicators`, `ranking`, `benchmarks`, `history_store`, `screener`, `charts` - the trade screener
+  - `news_feeds`, `market_data`, `catalysts` - news collection and ranking; live quotes and price history; headlines that mention a pick
+  - `indicators`, `ranking`, `benchmarks`, `screener`, `charts` - the trade screen and its charts
+  - `history_store` - the SQLite store: screening history, the published-pick ledger and the signal archive
+  - `risk`, `risk_forecast`, `relative_strength`, `trade_check` - stop, size and loss figures; how far a stock can fall; strength against its market; `/check`
   - `backtest`, `backtest_reports` - the walk-forward engine and the `/performance` and `/diagnostics` reports
-  - `reports`, `briefing`, `commands`, `bot` - weekly picks and analysis, the briefing and scheduled jobs, command routing and polling, startup
-- `tests/` - unit tests (`python -m unittest`)
+  - `forward_test`, `archive_quality`, `exchange_hours` - `/forwardtest`, the class of each archived signal, and when each supported exchange opens
+  - `stock_list`, `price_store`, `company_numbers`, `snapshots`, `data_checks`, `data_health` - the stock list, the bot's own daily prices, annual-report numbers, the nightly Yahoo snapshot, checks on those loads, and the market-data alert
+  - `score_inputs`, `scores`, `report_card` - the four company scores and the plain-English report card in `/analyze`
+  - `fills`, `holding_alerts`, `scorecard` - your own trades (`/fill`, `/portfolio`, `/deposit`), the evening alert for stocks you hold, and the monthly scorecard
+  - `backup` - nightly checked copies of the database
+  - `reports`, `briefing`, `commands`, `bot` - weekly picks, analysis and the health report; the briefing and its jobs; command routing and polling; startup and the schedule
+- `tests/` - unit tests (see [Testing](#testing))
+- `streamlit/` - the web dashboard, Fjord Signals (Streamlit + Plotly): pages in `app.py`, the login in `auth.py` and `serve.py`
+- `scripts/` - `deploy.sh` and `install_autodeploy.sh` (deploying on the Pi), `pull_backups.sh`, `forward_test_integrity.py`, `build_stock_list.py`
+- `deploy/systemd/` - the timer and service that `install_autodeploy.sh` installs
+- `research/` - one-off research scripts, not run by the bot (see [research/README.md](./research/README.md))
+- `docs/` - research findings (`docs/research/`) and the audit, roadmap and open decisions (`docs/audit/`)
+- `stock_list.csv` - every stock the bot keeps prices and company numbers for
 - `evaluation_universe.csv` - the fixed `broad-v1` evaluation basket
-- `requirements.txt` - Python dependencies
-- `Dockerfile` - container image definition
-- `docker-compose.yml` - service orchestration
-- `streamlit/` - the web dashboard, Fjord Signals (Streamlit + Plotly): every page is in `streamlit/app.py`
+- `requirements.txt` - Python dependencies of the bot (`streamlit/requirements.txt` for the dashboard)
+- `Dockerfile`, `docker-entrypoint.sh`, `docker-compose.yml` - the bot's image, its entrypoint and the services
+- `CLAUDE.md` - instructions for Claude Code working in this repository; `PROJECT_MEMORY.md` - a short snapshot of the project
 
 ## Requirements
 
-- Python `3.11+` recommended
+- Python `3.11` or newer. The Docker images, and so production, run `3.15`; CI also tests `3.11` and `3.14`
 - Telegram bot token
 - Telegram chat ID
 
@@ -78,11 +96,11 @@ TELEGRAM_CHAT_ID=your_chat_id
 
 Tip: you can copy from `.env.example` and fill in your secrets.
 
-4. Run a one-off briefing:
+4. Run a one-off briefing (it is sent to the configured chat):
 
 ```bash
 set -a && . ./.env && set +a
-python -c "import news_bot; print(news_bot.job_daily_briefing())"
+python -c "from newsbot.briefing import job_daily_briefing; print(job_daily_briefing())"
 ```
 
 5. Run scheduler mode:
@@ -110,12 +128,14 @@ python news_bot.py
 - `COMMAND_POLL_INTERVAL_MINUTES` - **deprecated**, retained for compatibility but unused (long-polling replaced interval polling)
 - `SEND_STARTUP_BRIEFING` - run one immediate briefing on container start (default `false`)
 - `HEALTH_PING_ENABLED` - enable daily health ping (default `true`)
-- `HEALTH_PING_CHAT_ID` - optional separate chat for health pings
+- `HEALTH_PING_CHAT_ID` - optional separate chat for health pings and market-data alerts; commands are accepted from this chat too
+- `REQUEST_TIMEOUT_SECONDS` - timeout for Telegram and Slack requests (default `15`)
+- `TRUSTED_NEWS_DOMAINS`, `BLOCKED_NEWS_DOMAINS` - comma-separated allowlist and blocklist for headline links (defaults in `.env.example`)
 - `NEWS_API_KEY` - optional NewsAPI key for structured news fetch
 - `FREENEWS_API_KEY` - optional FreeNews API key
-- `FREEN_EWS_API_KEY` - backward-compatible alias for existing envs
+- `FREEN_EWS_API_KEY` - older, misspelled name for the same key, still read by the bot: used only when `FREENEWS_API_KEY` is empty
 - `FINNHUB_API_KEY` - Finnhub API key (recommended primary quote source)
-- `FINHUB_API_KEY` - backward-compatible alias for existing envs
+- `FINHUB_API_KEY` - older, misspelled name for the same key, still read by the bot: used only when `FINNHUB_API_KEY` is empty
 - `NEWS_FETCH_PRIORITY` - provider order, e.g. `newsapi,freenews,rss`
 - `FREENEWS_API_URL` - FreeNews endpoint URL (default `https://freenewsapi.com/api/v1/news`)
 - `FINNHUB_API_URL` - Finnhub base URL (default `https://finnhub.io/api/v1`)
@@ -134,6 +154,18 @@ python news_bot.py
 - `FINNHUB_MAX_SYMBOLS_PER_REFRESH` - max symbols per section refreshed via Finnhub (default `16`)
 - `SLACK_WEBHOOK_URL` - optional Slack incoming webhook URL; mirrors every outbound message to Slack alongside Telegram (see [Slack Integration](#slack-integration))
 - `SLACK_MESSAGE_MAX_CHARS` - chunk size per Slack message (default `3900`)
+- `TRADE_BACKUP_HOST_DIR` - host folder for the nightly database copies under docker compose (default `./backups`); `TRADE_BACKUP_KEEP` - how many to keep (default `14`). Outside compose, set `TRADE_BACKUP_DIR`; empty means no backup runs
+- `BROKER_FEE_MIN_NOK`, `BROKER_FEE_PCT` - the broker fee shown with each pick and in `/check` (defaults `59` and `0.12`)
+- `HOLDING_ALERT_DROP_PCT` - evening alert when a stock you hold is this far below your average buy price (default `15`)
+- `BENCHMARK_FUND_SYMBOL`, `BENCHMARK_FUND_NAME` - the index fund `/scorecard` compares your trades with
+- `SNAPSHOT_MAX_SYMBOLS` - stocks in the nightly Yahoo snapshot (default `120`)
+
+`.env.example` lists the settings with a comment on each. The sections below cover the
+rest by topic.
+
+Under docker compose the bot reads `.env` through `env_file`, so a setting in
+`.env` reaches the container. Three paths are fixed by the compose file and
+ignore `.env`: `STATE_FILE`, `TRADE_HISTORY_DB_FILE` and `TRADE_BACKUP_DIR`.
 
 ### Logging
 
@@ -376,8 +408,12 @@ universe variables above).
 
 #### How qualifying candidates are ordered
 
-Everything that passes the gates is shown; ranking only decides the order.
-Two quality tiers sort first, then the original ordinal rule:
+Ranking decides which five qualifiers are shown, charted and recorded as
+delivered picks, and the rank is saved for `/forwardtest`. It is **not** shown as
+an order: the message groups the picks as *Move confirmed by volume*, *Move not
+confirmed by volume* and *Extended (RSI 70+)*, alphabetically inside each group,
+and says how many more passed. The internal rank sorts on two quality tiers
+first, then the original ordinal rule:
 
 1. **Not overbought** — RSI 14 below 70 sorts above anything at or over it.
 2. **Volume confirmed** — at or above `TRADE_MIN_VOLUME_RATIO` sorts above
@@ -385,7 +421,7 @@ Two quality tiers sort first, then the original ordinal rule:
 3. 5-day momentum, then volume ratio, then qualifying streak, then lower ATR,
    then symbol (so identical metrics always render identically).
 
-Tiers 1 and 2 are new. RSI was measured and displayed but read by nothing, so
+RSI was measured and displayed but read by nothing, so
 a name at RSI 85 — extended, and the worst moment to open a swing position —
 sorted above a healthy pullback purely on momentum, which is exactly the
 number a blow-off top maximises. Volume had the mirror-image problem: as a raw
@@ -499,23 +535,35 @@ unconfirmed rather than assuming a neutral `1.0×` ratio.
 
 ## Scheduling
 
-The bot schedules:
+All times are in `TZ` (default `Europe/Oslo`). The schedule is set in
+`newsbot/bot.py`:
 
-- **07:00 local time**
-- **19:00 local time**
+| When | Job | What it does |
+|---|---|---|
+| 07:00 and 19:00 daily | `job_scheduled_briefing` | The briefing |
+| At startup | `job_catchup_briefing` | Sends a briefing whose slot was missed in the last 3 hours because the bot was down |
+| 12:00 daily | `job_health_ping` | The `/health` report, once a day (`HEALTH_PING_ENABLED`) |
+| 22:30 Monday-Friday | `job_holding_alerts` | Telegram alert for stocks you hold: a big fall, earnings coming up, or a headline. Each alert is sent once |
+| 08:00 on the 1st | `job_monthly_scorecard` | Your trades against the index fund, on Telegram. Silent until there are trades |
+| 06:30 and 18:30 daily | `job_settle_forward_test` | Works out forward-test outcomes that have become computable |
+| 06:45 and 18:45 daily | `job_settle_published_picks` | The same for delivered picks |
+| 06:00 Tuesday-Saturday | `job_load_prices_and_check` | Loads daily prices for the stock list, then checks them |
+| 05:00 Sunday | `job_load_company_numbers_and_check` | Loads annual-report numbers, then checks them |
+| 07:30 Sunday | `job_build_scores` | Rebuilds the score inputs and the four company scores |
+| 02:30 daily | `job_save_snapshots` | Saves what Yahoo says about each stock today |
+| 04:00 daily | `job_backup_trade_history` | A checked copy of the database |
+| Every minute | heartbeat | Feeds the container health check |
 
-Configured in:
-
-```python
-scheduler.add_job(job_daily_briefing, "cron", hour="7,19", minute=0)
-```
-
-Additional jobs:
-
-- daily health ping (`12:00`)
-- Telegram command handling runs in a background long-polling thread (near-instant response)
+Problems found by the two data loads are sent to Slack only, so they need
+`SLACK_WEBHOOK_URL`. Telegram commands are handled by a separate long-polling
+thread and answer almost at once.
 
 ## Telegram Commands
+
+Commands are accepted only from `TELEGRAM_CHAT_ID` and `HEALTH_PING_CHAT_ID`;
+other chats are ignored. Anything the bot does not recognise, `/start` included,
+gets the list of commands. A command that is already running is not started a
+second time.
 
 After sending `/start` to the bot, you can use:
 
@@ -528,8 +576,20 @@ After sending `/start` to the bot, you can use:
 - `/performance` - run a walk-forward test of current trade rules against market benchmarks
 - `/diagnostics` - break down historical signal outcomes and compare ranking on matching dates
 - `/pickperformance` - evaluate fixed-session outcomes of successfully delivered stock picks
+- `/forwardtest` - out-of-sample results of every signal the bot recorded live
 - `/health` - send runtime health report
+- `/fill BUY|SELL TICKER SHARES PRICE FEE_NOK [YYYY-MM-DD] [!]` - save a trade you placed at your broker, e.g. `/fill BUY EQNR.OL 40 285.40 59`. The price is in the stock's own currency. A price more than 15% from that day's close, or a sale of more shares than the log holds, is refused unless you end with `!`
+- `/fills` - list the last 20 saved trades
+- `/unfill` - delete the last saved trade
+- `/portfolio` - what the saved trades say you hold now, its value today and profit or loss
+- `/deposit AMOUNT_NOK [YYYY-MM-DD]` - save money put into the account (a minus amount for money taken out)
+- `/scorecard` - your saved trades against the index fund
 - `/check TICKER AMOUNT_NOK [BUY_PRICE] [!]` - before placing an order, e.g. `/check EQNR.OL 12000`: shares and cost in NOK, the DNB fee and the rise needed to cover it, whether it may go in an Aksjesparekonto, earnings and ex-dividend dates in the next 4 weeks, overlap (same sector or moving together) with what `/fill` says you hold, the volatility stop with its loss at the stop and its gap estimate in NOK and as a share of your money, the fee as a share of your money, how much it can fall over 2 and 4 weeks, and its share of your money. Add the price you paid, in the stock's own currency (`/check EQNR.OL 12000 287.50`), and the stop, every loss and the suggested size are worked out from it instead of the signal close; a price more than 15% from the close is refused as a likely typo unless you end with `!`, as in `/fill`. Telegram only. Information, never a buy or sell verdict
+
+`/fill`, `/fills`, `/unfill`, `/portfolio`, `/deposit`, `/scorecard` and `/check`
+answer on Telegram only and are never mirrored to Slack. They record and report
+what you did; the bot places no orders. An edited `/fill`, `/unfill` or
+`/deposit` message is ignored, so a trade is never saved twice.
 
 `/morning` and `/evening` (forcing the greeting/tone of the scheduled
 07:00/19:00 briefing on demand) have been removed in favor of the more
@@ -1027,8 +1087,11 @@ backtest; live recommendation thresholds are unchanged.
 ## Slack Integration
 
 Set `SLACK_WEBHOOK_URL` to a Slack [incoming webhook](https://api.slack.com/messaging/webhooks)
-URL to mirror every outbound message — scheduled briefings, the health ping,
-and every `/command` reply above — to a Slack channel alongside Telegram.
+URL to mirror scheduled briefings, the health ping, market-data alerts and the
+replies to the briefing, screen and report commands to a Slack channel alongside
+Telegram. Replies about your own trades (`/fill`, `/portfolio`, `/check` and the
+rest of that group), the evening holding alert and the monthly scorecard are
+never sent to Slack.
 Leave it blank (the default) to disable Slack entirely; nothing changes for
 Telegram-only setups.
 
@@ -1061,14 +1124,11 @@ missing scope or an uninvited bot would read as success.
 - `SLACK_BOT_TOKEN` - bot token with `files:write` (default empty, disabled)
 - `SLACK_CHANNEL_ID` - channel ID to upload into (default empty, disabled)
 
-Under docker compose, setting it in `.env` is not enough on its own — the
-variable must also be listed in the `news-notifier` service's `environment:`
-block in `docker-compose.yml` (it is). The image ships no `.env` of its own,
-so any variable missing from that list is simply unset in the container, and
-an unset webhook makes the mirror return early *without logging anything* —
-the symptom is Slack silently never receiving messages while Telegram works
-fine. `/health` reports `Slack mirror: configured` / `not configured`, which
-is the quickest way to tell which side of this you are on.
+An unset webhook makes the mirror return early *without logging anything*: the
+symptom is Slack silently never receiving messages while Telegram works fine.
+`/health` reports `Slack mirror: configured` / `not configured`, which is the
+quickest way to tell which side of this you are on. Under docker compose the
+value comes from the `.env` next to `docker-compose.yml`.
 
 This is a one-way broadcast, not a second control surface: an incoming
 webhook can only *post* to Slack, so `/commands` still have to be sent from
@@ -1087,12 +1147,20 @@ truth for all of that; Slack is best-effort.
 
 ## Testing
 
-Run unit tests:
+Run the unit tests, and the same lint and coverage checks CI runs:
 
 ```bash
 source .venv/bin/activate
 python -m unittest -v
+
+pip install ruff coverage
+ruff check news_bot.py newsbot tests streamlit research scripts
+python -W error::ResourceWarning -m coverage run -m unittest -v
+python -m coverage report
 ```
+
+The tests never use the network. Two tests need Streamlit and are skipped unless
+it is installed; CI runs them inside the dashboard image.
 
 CI (`.github/workflows/ci.yml`) runs on Python 3.11 (the oldest supported) and 3.14:
 ruff with the rules in `ruff.toml` (pyflakes plus bugbear, bandit security
@@ -1111,7 +1179,20 @@ Build and run with Compose:
 docker compose up -d --build
 ```
 
-Ensure environment values are provided in your shell or an env file before launch.
+Put the settings in a `.env` next to `docker-compose.yml` first. This starts two
+services: the bot (`news-notifier`, container `daily_news_bot`) and the dashboard
+(`dashboard-streamlit`, see [Dashboard](#dashboard)). A bundled Ollama is a third,
+optional profile (see [News ranking](#news-ranking)). Both images run Python 3.15.
+
+The bot's data (database and state) lives on the `news_bot_data` volume, and
+the nightly database copies go to `TRADE_BACKUP_HOST_DIR` on the host.
+
+**Health check.** The bot touches a heartbeat file every minute from the
+scheduler and after every successful Telegram poll. `python news_bot.py
+--healthcheck` fails when the scheduler's is older than 15 minutes or the
+poller's older than 5, and Docker then marks the container unhealthy. It does not
+restart it. A healthy container can still be getting no market data; `/health`
+shows that (see [Market-data alerting](#market-data-alerting)).
 
 **Hardening.** The base image is pinned by digest (Dependabot proposes updates)
 and `.dockerignore` keeps `.env`, databases and tests out of the build context.
@@ -1140,7 +1221,12 @@ It stops at the first failure. In order, it:
 4. waits for the bot to be healthy, then shows the new commit and any log errors;
 5. prints the one command that rolls back.
 
-With nothing new on `main` it does nothing; `FORCE=1` rebuilds anyway.
+With nothing new on `main` it does nothing; `FORCE=1` rebuilds anyway. The result
+is reported on Telegram (`NOTIFY=0` turns that off).
+
+`scripts/install_autodeploy.sh` installs a systemd user timer that runs
+`deploy.sh` every 5 minutes. Where it is installed, **a merge to `main` deploys
+itself**. Stop it with `systemctl --user disable --now news-bot-deploy.timer`.
 
 ## Backups off the Pi
 
@@ -1176,10 +1262,16 @@ ends every session, and stays in force across restarts and redeploys: the
 dashboard keeps one random value on a small volume of its own
 (`dashboard_state`). Dashboards already open, on any device, are disconnected
 at the logout, and each one is disconnected when its session expires; nothing
-more reaches them, and a reload shows the login page. Only `/_stcore/health` answers without a session, for the
-Docker health check. Five wrong passwords from one address lock it out for 15
-minutes. Set it up once in the Pi's `.env`, **before** the change is deployed.
-Until a hash is set, every page answers 503:
+more reaches them, and a reload shows the login page. Five wrong passwords from
+one address lock it out for 15 minutes.
+
+**Health check.** Only `/_stcore/health` answers without a session. The
+dashboard image's own Docker health check requests it every minute, so the
+container shows healthy while Streamlit answers, with or without a password
+set. It says nothing about how fresh the data is.
+
+**Setup.** Set the login up once in the Pi's `.env`. Until a hash is set, every
+page answers 503:
 
 ```bash
 python3 streamlit/auth.py hash     # type the password twice; prints the hash
@@ -1191,7 +1283,9 @@ DASHBOARD_SESSION_HOURS=12
 ```
 
 The page is still plain HTTP. The password crosses the network once per login,
-and the cookie crosses it with every request. So keep the port on the home
+and the cookie crosses it with every request. Compose publishes the port on
+every interface of the host (`DASHBOARD_STREAMLIT_PORT`, default `8002`; a value
+like `192.168.1.20:8002` binds one address). So keep the port on the home
 network / VPN. Security review: `docs/audit/dashboard-security-assessment.md`.
 
 Deploy on the Pi: `git pull && docker compose up -d --build dashboard-streamlit`.
@@ -1214,9 +1308,40 @@ Each briefing includes:
 3. Early Morning Norway News
 4. Global News
 5. Top Business Stories
-6. Market Watch (live stock movers table)
-7. Mutual Funds/ETFs (live movers table)
-8. Short-Term Trade Candidates (informational table)
+6. Live Stock Movers (table)
+7. Live Funds & ETFs (table)
+8. Short-Term Trade Candidates (up to five, grouped, with risk lines)
+
+A section that fails or runs out of time is replaced by a one-line notice (see
+[Briefing resilience](#briefing-resilience)).
+
+## Limitations
+
+- **No orders.** The bot has no broker connection. `/fill` only records trades
+  you placed yourself.
+- **No demonstrated edge.** Ten years of tests found no edge in the screen, in
+  any of 3,456 gate settings, in simple price and earnings signals or in the four
+  company scores. Results and caveats:
+  [docs/research/2026-10-analytics-findings.md](./docs/research/2026-10-analytics-findings.md).
+- **Survivorship.** Every test basket is made of stocks that can still be priced
+  today; delisted stocks are missing, which flatters the results.
+- **The forward test cannot conclude yet.** It needs 60 paired entry sessions
+  before it says anything, and those sessions overlap (each hold is 20
+  sessions), so 60 is far fewer independent observations. The stricter protocol
+  in [docs/audit/decision-log.md](./docs/audit/decision-log.md) (D4) is proposed,
+  not in force.
+- **Costs are simplified.** Backtests and the forward test use one flat cost per
+  side (`TRADE_BACKTEST_COST_BPS`) for every market. The risk lines add the
+  broker fee. Spread, slippage and currency exchange are not included.
+- **Risk figures are estimates.** The stop and the losses are modelled from the
+  signal close unless you give `/check` your buy price. The gap estimate exists
+  only for the stop multiples that were measured (2 and 3 × ATR below the signal
+  close); any other setting prints "not measured". Nothing simulates a stop
+  order.
+- **Indicators** use simple averages, not Wilder smoothing (see
+  [Indicator methodology](#indicator-methodology)).
+- Open work is tracked in
+  [docs/audit/remediation-roadmap.md](./docs/audit/remediation-roadmap.md).
 
 ## Important Notes
 
