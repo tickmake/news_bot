@@ -85,6 +85,19 @@ class ScoreInputTests(unittest.TestCase):
         self.assertEqual((rows[0][0], rows[-1][0]), ("2023-04-30", "2025-02-28"))
         self.assertEqual(json.loads(rows[-1][2])["net_profit"], 12.0)
 
+    def test_a_month_that_loses_its_numbers_loses_its_row(self):
+        # The 2022 report's date moves from 2023-04-30 to 2023-06-15 (P1-8): with
+        # no price before 2024-11, April and May 2023 had nothing known after all.
+        today = date(2025, 3, 15)
+        si.build(["EQNR.OL"], today, self.fx)
+        conn = cn._connection()
+        with conn:
+            conn.execute("UPDATE company_numbers SET known_from = '2023-06-15' WHERE year_end = '2022-12-31'")
+        self.assertEqual(si.build(["EQNR.OL"], today, self.fx), 21)
+        with price_store.TRADE_HISTORY_LOCK:
+            first = si._connection().execute("SELECT MIN(month_end), COUNT(*) FROM score_inputs").fetchone()
+        self.assertEqual(first, ("2023-06-30", 21))
+
     def test_an_old_exchange_rate_is_not_used(self):
         stale = lambda pair: pd.Series([10.0], index=[date(2025, 1, 1)])  # noqa: E731
         self.assertIsNone(si.inputs_for("EQNR.OL", date(2025, 12, 31), fx_closes=stale)["fx"])

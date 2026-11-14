@@ -102,6 +102,15 @@ class BuildTests(unittest.TestCase):
             self.assertNotIn(word, text.lower())
         self.assertIn("no scores for this stock yet", "\n".join(scores.build_scores_section("X")))
 
+    def test_scores_go_with_their_inputs(self):
+        scores.build()
+        conn = scores._connection()
+        with conn:
+            conn.execute("DELETE FROM score_inputs WHERE symbol = 'S4.OL'")
+        self.assertEqual(scores.build(), 4)
+        left = conn.execute("SELECT symbol FROM company_scores ORDER BY symbol").fetchall()
+        self.assertEqual(left, [("S0.OL",), ("S1.OL",), ("S2.OL",), ("S3.OL",)])
+
     def test_estimate_change_from_snapshots(self):
         conn = scores._connection()
         with conn:

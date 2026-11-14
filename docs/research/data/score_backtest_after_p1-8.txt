@@ -1,0 +1,58 @@
+97 stocks; fee 0.98% round trip per hold
+
+QUALITY  (2021-05-31 to 2026-09-30)
+                              months  top net %  all net %  bottom net %  top - all     t  top - bottom  top beats all, % of months
+all months                      65.0      -0.20       0.06         -0.09      -0.26 -1.11         -0.11                       35.38
+first part (to 2024-01-31)      32.0      -0.98      -0.70         -1.04      -0.28 -0.72          0.07                       37.50
+check part (from 2024-01-31)    33.0       0.55       0.79          0.83      -0.24 -0.89         -0.27                       33.33
+  by region (each ranked within its own stocks):
+      months  top - all     t  top - bottom
+  Oslo    54.0      -0.75 -2.16         -0.81
+  EU      65.0      -0.12 -0.48          0.06
+  US      33.0       0.18  0.28         -0.30
+
+VALUE  (2023-04-30 to 2026-09-30)
+                              months  top net %  all net %  bottom net %  top - all     t  top - bottom  top beats all, % of months
+all months                      42.0       0.97       0.59          0.16       0.38  1.77          0.81                       61.90
+first part (to 2025-01-31)      21.0       0.13       0.19          0.16      -0.06 -0.20         -0.03                       47.62
+check part (from 2025-01-31)    21.0       1.81       0.99          0.16       0.82  2.74          1.65                       76.19
+  by region (each ranked within its own stocks):
+      months  top - all     t  top - bottom
+  Oslo    41.0      -0.18 -0.51          0.79
+  EU      42.0       0.78  2.22          1.28
+  US      33.0      -0.02 -0.04         -1.05
+
+PERFORMANCE  (2022-04-30 to 2026-09-30)
+                              months  top net %  all net %  bottom net %  top - all     t  top - bottom  top beats all, % of months
+all months                      54.0       0.43       0.73          1.04      -0.30 -1.23         -0.61                       42.59
+first part (to 2024-07-31)      27.0       0.38       0.57          0.88      -0.19 -0.55         -0.50                       40.74
+check part (from 2024-07-31)    27.0       0.48       0.89          1.20      -0.41 -1.17         -0.73                       44.44
+  by region (each ranked within its own stocks):
+      months  top - all     t  top - bottom
+  Oslo    41.0      -0.63 -1.50         -1.34
+  EU      54.0      -0.15 -0.54         -0.36
+  US      21.0      -0.99 -0.99         -0.70
+
+MOMENTUM  (2017-11-30 to 2026-09-30)
+                              months  top net %  all net %  bottom net %  top - all     t  top - bottom  top beats all, % of months
+all months                     107.0       0.30       0.12         -0.02       0.18  0.97          0.32                       51.40
+first part (to 2022-04-30)      53.0      -0.08      -0.17         -0.27       0.08  0.30          0.19                       49.06
+check part (from 2022-04-30)    54.0       0.68       0.41          0.23       0.27  1.13          0.45                       53.70
+  by region (each ranked within its own stocks):
+      months  top - all     t  top - bottom
+  Oslo   107.0       0.21  0.77          0.68
+  EU     107.0       0.16  0.70          0.25
+  US     107.0       0.15  0.42          0.43
+
+COMBINED  (2023-04-30 to 2026-09-30)
+                              months  top net %  all net %  bottom net %  top - all     t  top - bottom  top beats all, % of months
+all months                      42.0       0.18       0.59          0.58      -0.40 -1.61         -0.40                       42.86
+first part (to 2025-01-31)      21.0      -0.39       0.16          0.84      -0.55 -1.51         -1.23                       38.10
+check part (from 2025-01-31)    21.0       0.75       1.01          0.31      -0.26 -0.73          0.44                       47.62
+  by region (each ranked within its own stocks):
+      months  top - all     t  top - bottom
+  Oslo    40.0      -1.09 -2.70         -1.15
+  EU      42.0       0.19  0.60          0.38
+  US      21.0       0.18  0.21         -0.34
+
+WORKS BY THE RULES SET BEFOREHAND: {'quality': False, 'value': False, 'performance': False, 'momentum': False, 'combined': False}

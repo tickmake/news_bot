@@ -78,6 +78,12 @@ class DataCheckTests(unittest.TestCase):
             data_checks.job_load_company_numbers_and_check()
         self.assertIn("SAP.DE: company numbers could not be loaded", messaging.send_slack_message.call_args.args[0])
 
+    def test_unchecked_esef_dates_warn(self):
+        with patch.object(data_checks.company_numbers, "job_load_company_numbers",
+                          return_value={"saved": 0, "failed": [], "esef_dates_unchecked": 7}):
+            data_checks.job_load_company_numbers_and_check()
+        self.assertIn("7 annual-report numbers could not be matched", messaging.send_slack_message.call_args.args[0])
+
     def test_failed_slack_send_is_retried(self):
         messaging.send_slack_message.return_value = False
         self.assertEqual(data_checks.warn("t", [("k", "x")]), 0)

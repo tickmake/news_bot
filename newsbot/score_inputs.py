@@ -136,8 +136,10 @@ def build(symbols: Optional[List[str]] = None, today: Optional[date] = None,
 
     Every run rebuilds every month: numbers loaded later (a new stock, a
     filing read late) can still have been public back then, and `known_from`
-    is what decides, not when the bot fetched them. ~100 stocks x ~25 months
-    is a few seconds.
+    is what decides, not when the bot fetched them. A stock's old rows go in
+    the same transaction, so a month that no longer has anything known (a
+    `known_from` moved later, P1-8) keeps no row from before. ~100 stocks x
+    ~25 months is a few seconds.
     """
     today = today or date.today()
     symbols = symbols if symbols is not None else stock_list.tickers()
@@ -161,6 +163,7 @@ def build(symbols: Optional[List[str]] = None, today: Optional[date] = None,
         with TRADE_HISTORY_LOCK:
             conn = _connection()
             with conn:
+                conn.execute("DELETE FROM score_inputs WHERE symbol = ?", (symbol,))
                 conn.executemany(
                     "INSERT OR REPLACE INTO score_inputs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [(r["symbol"], r["month_end"], r["price_date"], r["close"], r["close_1m"],

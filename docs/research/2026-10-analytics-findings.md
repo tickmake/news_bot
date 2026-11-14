@@ -357,6 +357,85 @@ others next month. The 6-month forward test (#79) is not worth running on the sc
 they are. If anything is followed up, it is value in the EU, re-tested in 2027 with
 another year of data.
 
+### 10b. Rerun with ESEF numbers dated by their filing (P1-8, 2026-11-14)
+
+The table above used ESEF numbers whose `known_from` was capped at year end + 120
+days. A report that filings.xbrl.org added later therefore counted as known up to
+several months, or in one case years, before it was on file. P1-8 dates each number by
+its filing's `date_added`, and uses year end + 120 days only when that date is missing
+or unusable. The table above is kept as it was. Its output, regenerated from the same
+database, is in `docs/research/data/score_backtest_before_p1-8.txt`.
+
+**Method:**
+- Two copies were made of the Pi's 2026-11-14 database backup.
+  1. **Before:** left as it was.
+  2. **After:** re-dated with `research/esef_dates_rerun.py redate`. This runs the bot's
+     own `company_numbers._check_saved_dates` against the live filings.xbrl.org metadata
+     and loads nothing new.
+- Both copies were rebuilt with `score_inputs` and `company_scores` as of 2026-11-14,
+  using one cached set of exchange rates.
+- `research/score_backtest.py` then ran on each copy.
+- The "before" rerun matches the original output line for line. So the only difference
+  between the two runs is the corrected `known_from`, not prices, exchange rates,
+  code or stock list.
+- Outputs:
+  - `docs/research/data/score_backtest_after_p1-8.txt`
+  - `docs/research/data/esef_dates_p1-8_compare.txt`
+
+**What the correction changed in the data:**
+- **Rows re-dated:** 1,150 of 2,920 ESEF rows, every one of them later, none earlier.
+  - The median move is 9 days.
+  - 717 moved by less than a month, and 6 by more than five years. Santander's 2020
+    report was added to filings.xbrl.org on 2026-10-20, so its numbers now count from
+    that day.
+- **No row was guessed.**
+  - Every row of a listed stock was matched to its filing. 2,832 rows now record theirs.
+  - The 88 rows of the four stocks dropped in #152 (ACA.PA, G.MI, PST.MI, WKL.AS) are
+    left unchecked. Nothing scores them.
+- **Unchanged:** Yahoo rows, values, currencies and fetch times.
+- **Availability:** ESEF rows known at month ends, summed over all month ends, fell from
+  96,634 to 92,934 (−3.8%).
+- **`score_inputs`:**
+  - Stock-months with any numbers fell from 5,118 to 5,013.
+  - 426 stock-months changed their numbers, and 104 of those changed which year is the
+    newest.
+  - One stock-month (CMBTO.OL, 2021-04-30) had nothing known any more and lost its row.
+- **Scores present:**
+  - Quality 5,056 → 4,678, value 4,109 → 3,786, performance 3,878 → 3,611, momentum
+    unchanged at 9,772.
+  - Quality changed in 1,305 stock-months, value in 1,006, performance in 941.
+  - Coverage falls partly because, between a year's deadline and its late `date_added`,
+    a stock can have that year's Yahoo items but not yet its ESEF items. The newest year
+    is then incomplete, and some metrics drop out. That is point-in-time correct, just
+    thinner.
+
+| Score | Months | Top third vs all (first part, check part) | t | Top vs bottom | Top beats all, % of months | Passes |
+|---|---|---|---|---|---|---|
+| Quality, before | 66 | -0.31 (-0.36, -0.26) | -1.33 | -0.43 | 35% | no |
+| Quality, after | 65 (from 2021-05) | -0.26 (-0.28, -0.24) | -1.11 | -0.11 | 35% | no |
+| Value, before | 42 | +0.32 (-0.03, +0.67) | 1.64 | +0.82 | 62% | no |
+| Value, after | 42 | +0.38 (-0.06, +0.82) | 1.77 | +0.81 | 62% | no |
+| Performance, before | 54 | -0.29 (-0.14, -0.43) | -1.17 | -0.51 | 41% | no |
+| Performance, after | 54 | -0.30 (-0.19, -0.41) | -1.23 | -0.61 | 43% | no |
+| Momentum, before and after | 107 | +0.18 (+0.08, +0.27) | 0.97 | +0.32 | 51% | no |
+| All four, before | 42 | -0.41 (-0.45, -0.36) | -1.74 | -0.47 | 40% | no |
+| All four, after | 42 | -0.40 (-0.55, -0.26) | -1.61 | -0.40 | 43% | no |
+
+**What changes in the conclusions:**
+- **Still no score passes.** Every verdict is the same, and so is the conclusion above.
+- **Quality is less clearly backwards.**
+  - Top vs bottom is -0.11, against -0.43 before.
+  - The Oslo result is now slightly stronger the wrong way: top vs all -0.75, t -2.16.
+  - Part of the earlier "backwards" result rested on numbers used before they were filed.
+- **Value is still the only near-miss, and still fails rule 1.** Its first part stays
+  negative. The check part is a little stronger (+0.82, t 2.74), and the EU result is
+  unchanged (+0.78, t 2.22).
+- **Momentum uses no company numbers,** so it is identical.
+
+The two runs are comparable only as a pair from the same database. They are not
+comparable with any future run on new data. The original section-10 numbers above were
+computed with back-dated ESEF numbers, and they stay only as the record of that run.
+
 ## 11. Gap risk for the stop the bot actually places (issue #161, November 2026)
 
 Section 7 measured a 2xATR stop placed below the **buy price**. The bot places its stop

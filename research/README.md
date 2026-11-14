@@ -34,6 +34,11 @@ python research/hold_exit_study.py /tmp/stock_list_10y.pkl                 # 5/1
 # 7. The four company scores on history (Phase 3a, #79). Needs a copy of the bot's database
 #    with 10 years of prices (PR #156): see "Backups off the Pi" in the main README.
 python research/score_backtest.py /tmp/news_bot.db                          # top third vs all vs bottom third
+#    Section 10b: the same with ESEF numbers dated by their filing (P1-8). Copies only; see the script.
+python research/esef_dates_rerun.py redate  /tmp/after.db                   # the bot's own re-dating, needs filings.xbrl.org
+python research/esef_dates_rerun.py rebuild /tmp/before.db /tmp/fx.pkl      # score_inputs + company_scores, cached FX
+python research/esef_dates_rerun.py rebuild /tmp/after.db  /tmp/fx.pkl
+python research/esef_dates_rerun.py compare /tmp/before.db /tmp/after.db
 
 # 6. Portfolio rules for 4 stocks held at once (issue #125)
 python research/portfolio_rules_study.py /tmp/stock_list_10y.pkl /tmp/earnings_dates.pkl   # sector / earnings / correlation
