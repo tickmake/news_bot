@@ -53,13 +53,45 @@ Nothing enforces these; they are rules for the work.
 
 Built into the code today. Keep them that way.
 
-- `signal_archive` and `published_picks` are written once: the first observation
-  of a symbol and session wins. Never rewrite, backfill or delete these rows.
-  Add recalculated figures alongside. `scripts/forward_test_integrity.py`
-  compares the archive before and after a change.
-- The forward test never enters before a signal was recorded, and only scores
-  exchanges listed in `newsbot/exchange_hours.py` (US, `.OL`, `.DE`, `.PA`,
-  `.AS`, `.BR`, `.MI`, `.MC`).
+- **The original snapshot of a signal is immutable.** In `signal_archive` the
+  first observation of a symbol and session wins (`archive_signal` inserts with
+  `ON CONFLICT DO NOTHING`): the measurements, `qualified`, `failed_gate`,
+  `rule_id`, `horizon_sessions`, `cost_bps_per_side`, `benchmark_symbol`,
+  `recorded_at` and `entry_policy` are never updated. In `published_picks` the
+  same holds for `published_at`, the horizon, cost and benchmark, and
+  `snapshot_json` (rank, metrics, gates and the risk lines as sent). Never
+  rewrite, backdate, backfill or delete any of these, and never give an old
+  pick a risk snapshot it was not sent with.
+- **Two lifecycle fields are filled in later, once each.** `rank` (the delivered
+  order, `archive_ranks`) and `outcome_json` (settlement, `complete_archive_row`
+  and `complete_pick`) are written only while still NULL. Recording a rank and
+  settling an outcome are normal operation. Changing either after it is set is
+  not.
+- **Derived and recalculated results are stored beside the row, never over
+  it.** The data-quality class of a signal lives in `signal_archive_quality`,
+  insert-only per classifier version; a new classifier adds rows under a new
+  version and `activate_classifier` moves the pointer. Recalculated research
+  figures (a new cost model, a rerun) follow the same pattern: a new column,
+  table or output file. `scripts/forward_test_integrity.py` compares the
+  archive before and after a change and fails if a recorded signal or an
+  existing outcome changed.
+- **The forward test has two entry rules, and each row keeps its own.**
+  - Rows with `entry_policy = 'after-recorded-v1'`
+    (`ENTRY_POLICY_AFTER_RECORDED`, every row archived since the entry fix):
+    entry is the first session after the signal date whose exchange open is
+    strictly after `recorded_at`. Only exchanges in `newsbot/exchange_hours.py`
+    are scored (US, `.OL`, `.DE`, `.PA`, `.AS`, `.BR`, `.MI`, `.MC`); any other
+    is classed invalid and never settled.
+  - Legacy rows with `entry_policy` NULL (archived before the fix): entry stays
+    the first session after the signal date, whatever time the row was
+    recorded. Some of these could enter at an open that had already happened.
+    That is not hidden and not repaired: the classifier marks each one clean,
+    potentially contaminated or invalid, and they are reported as a separate
+    historical series, never mixed into the test.
+  - Do not claim that every archived row satisfies the recording-time rule. Do
+    not set `entry_policy` on a legacy row, re-settle it under the new rule, or
+    change its class in place: its outcome was computed under the old rule and
+    must keep that meaning.
 - Risk text quotes gap measurements only for the **configured** stop multiple
   (`risk.GAP_STUDIES`, checked by a test against `docs/research/data/`). Any
   other multiple prints "not measured". Never borrow another stop's numbers.

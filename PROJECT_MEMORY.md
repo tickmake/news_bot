@@ -50,12 +50,17 @@ ranked 1-5. The underlying rank is still archived so `/forwardtest` can test it.
 
 ## Safeguards that matter
 
-- `signal_archive` and `published_picks` are write-once and never pruned. A
-  published pick keeps the risk lines it was sent with; older picks have none
-  and are never given one.
-- The forward test enters at the first open after a signal was recorded, on
-  listed exchanges only. Each row carries a rule id (gates plus hold, `-h20`);
-  rows from before the hold joined the id keep their old id.
+- `signal_archive` and `published_picks` are never pruned, and what a signal or
+  pick was when first recorded is never rewritten. Only the delivered rank and
+  the settled outcome are added later, once each. A published pick keeps the
+  risk lines it was sent with; older picks have none and are never given one.
+- Forward-test rows archived since the entry fix (`entry_policy`
+  `after-recorded-v1`) enter at the first exchange open strictly after the
+  signal was recorded, on listed exchanges only. Older rows have no entry
+  policy and keep the rule they were scored under (first session after the
+  signal date); they are classified and reported separately, not converted.
+- Each row carries a rule id (gates plus hold, `-h20`); rows from before the
+  hold joined the id keep their old id.
 - Gap-risk text exists only for measured stop multiples (`risk.GAP_STUDIES`: 2
   and 3 x ATR below the signal close); anything else prints "not measured".
 - The stop is `RISK_STOP_ATR_MULTIPLE` x ATR: code default 2, `.env.example` 3.
