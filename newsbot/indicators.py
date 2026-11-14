@@ -12,6 +12,15 @@ from newsbot.logsetup import SYS_LOG
 
 
 def _compute_atr_percent(history: Any) -> Optional[float]:
+    """14-period simple-average ATR, as a percentage of the latest close.
+
+    True Range of a session is the largest of high - low, |high - previous
+    close| and |low - previous close|. ATR here is the arithmetic mean of the
+    latest 14 True Range values. It is not Wilder's ATR: there is no recursive
+    smoothing, so a session older than the last 14 has no weight at all.
+    Charting platforms that use Wilder smoothing can show a different value
+    for the same bars.
+    """
     try:
         high = history["High"].dropna()
         low = history["Low"].dropna()
@@ -39,10 +48,16 @@ def _compute_atr_percent(history: Any) -> Optional[float]:
 
 
 def _compute_rsi_14(close_series: Any) -> Optional[float]:
-    """14-period RSI using a simple (not Wilder-smoothed) average of gains and
-    losses, matching the plain 14-bar averaging `_compute_atr_percent` already
-    uses above -- one averaging convention for the whole module rather than
-    two silently different ones.
+    """14-period Cutler's RSI (simple-average RSI).
+
+    Gains and losses are the close-to-close changes; RSI is
+    100 - 100 / (1 + average gain / average loss), where each average is the
+    arithmetic mean over the latest 14 changes. It is not Wilder's RSI: there
+    is no Wilder smoothing, so charting platforms that use it can show a
+    different value for the same closes. This matches the plain 14-bar
+    averaging `_compute_atr_percent` uses above -- one averaging convention
+    for the whole module rather than two silently different ones. A zero
+    average loss gives 100.
     """
     try:
         if len(close_series) < 15:
@@ -64,10 +79,11 @@ def _compute_rsi_14(close_series: Any) -> Optional[float]:
 
 
 def _rsi_series(close_series: Any) -> Any:
-    """RSI 14 as a series, for plotting.
+    """14-period Cutler's RSI (simple-average RSI) as a series, for plotting.
 
-    Same simple-average convention as `_compute_rsi_14` above, so the last
-    point of this series equals that function's scalar -- a chart that
+    The same convention as `_compute_rsi_14` above -- a 14-period rolling
+    arithmetic mean of gains and of losses, no Wilder smoothing -- so the last
+    point of this series equals that function's scalar: a chart that
     disagreed with the RSI printed next to it would be worse than no chart.
     A zero average loss maps to 100 (unbroken gains), matching it too.
     """

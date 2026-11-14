@@ -397,6 +397,22 @@ Both are deliberately tiers rather than gates: they sort a name **down**, not
 out, so nothing that qualifies today stops qualifying. Make them hard
 disqualifiers only if you're willing to have days with zero picks.
 
+### Indicator methodology
+
+How the two indicators above are calculated (`newsbot/indicators.py`), so a value
+can be reproduced:
+
+| Indicator | Current calculation |
+|---|---|
+| ATR | 14-period arithmetic mean of True Range (the largest of high − low, \|high − previous close\| and \|low − previous close\|), shown as a percentage of the latest close |
+| RSI | 14-period Cutler's RSI: 100 − 100 / (1 + average gain / average loss), with simple averages of the last 14 close-to-close gains and losses |
+| Wilder smoothing | Not used by either implementation |
+
+Many charting platforms use Wilder-smoothed ATR and RSI by default, so their
+values can differ from the bot's for the same prices. Neither convention is the
+"right" one; this only says which one the bot uses. The RSI line on the charts and
+the indicators in the built-in backtest use the same simple averages.
+
 ### Trade Candidate Performance
 
 Candidate analysis fetches per-symbol history from yfinance. These controls keep a briefing (and `/now`) responsive on a cold cache:
@@ -463,7 +479,8 @@ before screener movers.
 
 Each qualifying candidate's block also shows:
 
-- **RSI(14)**, flagged `(overbought)` at 70+ or `(oversold)` at 30 or below.
+- **RSI(14)** (Cutler's simple-average RSI, see [Indicator methodology](#indicator-methodology)),
+  flagged `(overbought)` at 70+ or `(oversold)` at 30 or below.
 - **Volume trend** — the last 5 sessions' average volume vs. the 15 before
   that, as `rising`, `falling`, `flat`, or `unknown` when data is insufficient.
 - **Session streak** — how many recent sessions running (today included)
