@@ -274,7 +274,11 @@ Caveats: today's list only (failed companies are missing, which flatters every r
 and "no stop" most); the levels include ten years of a rising market, so compare rules
 with each other, not with zero; entries 5 sessions apart overlap on 10- and 20-session
 holds, so there are fewer independent results than rows; currency exchange fees on
-non-NOK stocks are not included.
+non-NOK stocks are not included in the table above. A later sensitivity (P2-5) adds them
+at 0, 10, 25 and 50 bps per conversion, as illustrative levels and not a broker's prices:
+the order of the rules and holds stays the same, and the levels fall for EUR and USD stocks
+(the 20-session "time" mean goes from +0.51 to +0.39, +0.21 and -0.09). See
+`docs/audit/remediation-roadmap.md` (P2-5) and `data/hold_exit_study_fx.txt`.
 
 ## 9. Portfolio rules for 4 stocks held at once (issue #125, November 2026)
 
