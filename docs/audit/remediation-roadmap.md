@@ -144,10 +144,21 @@ Each task can be done on its own. "Archive?" says whether the task changes histo
 | P2-1 | `README.md`, `PROJECT_MEMORY.md` | Update the job and command lists, module list and Python version. Point the authoritative instructions to `CLAUDE.md`. |
 | P2-2 | `docker-compose.yml` | Remove the misspelled `FREEN_EWS_API_KEY` and `FINHUB_API_KEY` after confirming nothing reads them. Delete `.coveragerc.bak`. |
 | P2-3 | `streamlit/app.py`, compose | Add a dashboard healthcheck, plus banners showing data age per table. |
-| P2-4 | `tests/` | Find and close the leaked SQLite connection that triggers the shutdown `ResourceWarning`. |
+| P2-4 | `tests/` | Find and close the leaked SQLite connection that triggers the shutdown `ResourceWarning`. **Done on `fix/sqlite-resourcewarning-leak`, not yet merged; see below.** |
 | P2-5 | `research/gap_risk.py`, `hold_exit_study.py` | Add FX cost to the scripts. Record results per cost scenario. |
 | P2-6 | `newsbot/indicators.py`, README | Label ATR and RSI as simple-average (Cutler) variants. |
 | P2-7 | `ruff`, CI | Lint `streamlit/`, `research/` and `scripts/`. |
+
+### P2-4: A test left the bot's database open
+
+| | |
+|---|---|
+| **Files** | `tests/store_isolation.py` (new), `tests/test_store_isolation.py` (new), `tests/test_news_bot.py`, `tests/test_risk.py`, `tests/test_risk_reporting.py`. No production code. |
+| **Root cause** | The leaked connection was the one inside the process-wide `history_store.TRADE_HISTORY`, opened on the configured `TRADE_HISTORY_DB_FILE`. Four modules take their own name for that store at import (`from newsbot.history_store import TRADE_HISTORY`): `company_numbers`, `price_store`, `fills` and `snapshots`. The fixtures swapped only `history_store.TRADE_HISTORY` for a throwaway store and closed that one. `/analyze` builds its report card through `company_numbers._connection()` and `price_store._connection()`, so seven tests that call `build_ticker_analysis` opened the real store behind the fixture (two in `test_news_bot.TickerAnalysisTests`, four in `test_risk.IntegrationTests`, one in `test_risk_reporting.OneStopTests`). Nothing closed it, and Python reported it while shutting down, where a warning-as-error cannot fail the run. The same tests also created the configured database file. |
+| **Fix** | `use_throwaway_store` in `tests/store_isolation.py` puts one temporary store in all five modules that hold the name, and registers its `close()` and the un-patching as cleanups. The three fixtures above now use it. No warning filter was added and the CI command is unchanged. |
+| **Tests** | Four in `tests/test_store_isolation.py`: every `newsbot` module holding a `TRADE_HISTORY` is on the helper's list (a new holder fails this test); swapping `history_store` alone still leaves `/analyze` on the other store (the old fixture, shown with stand-in stores); with the helper `/analyze` reads only the throwaway store, which is closed afterwards and every name restored; commits and rollbacks on the store behave as before. They read the store's own `_conn`, never the garbage collector. |
+| **Verified** | Before, on `main` (`8c556de`), Python 3.14.10: `python -W error::ResourceWarning -m unittest` ran 1232 tests OK and printed `ResourceWarning: unclosed database` at shutdown. A tracing run named the connection and the seven tests. After: 1236 tests, OK, 2 skipped (the Streamlit-only live tests), no warning, on 3.11.11, 3.14.10 and 3.15.2, and on 3.15.2 inside the production image with the CI step's own command (`--read-only`, `--user app`). The same trace finds no test reaching the process-wide store, no connection left open, and the configured database file is no longer created. `ruff check news_bot.py newsbot tests` is clean; coverage 97%. |
+| **Limits** | The four modules still take the store by name, so a new test that reaches them without the helper would open the real store again. The listing test only catches a new module, not a new test. `tests/test_dashboard_websocket_live.py` runs only in the dashboard image and was not run here. |
 
 ## P3: features (only after P0/P1)
 
