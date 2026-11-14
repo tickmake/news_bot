@@ -146,7 +146,7 @@ Each task can be done on its own. "Archive?" says whether the task changes histo
 | P2-3 | `streamlit/app.py`, compose | Add a dashboard healthcheck, plus banners showing data age per table. |
 | P2-4 | `tests/` | Find and close the leaked SQLite connection that triggers the shutdown `ResourceWarning`. **Done on `fix/sqlite-resourcewarning-leak`, not yet merged; see below.** |
 | P2-5 | `research/gap_risk.py`, `hold_exit_study.py` | Add FX cost to the scripts. Record results per cost scenario. **Done on `feat/research-fx-cost-modelling`, not yet merged; see below.** |
-| P2-6 | `newsbot/indicators.py`, README | Label ATR and RSI as simple-average (Cutler) variants. |
+| P2-6 | `newsbot/indicators.py`, README | Label ATR and RSI as simple-average (Cutler) variants. **Done on `docs/indicator-methodology`, not yet merged.** Docstrings only in `indicators.py` (the code is identical apart from docstrings, compared as parsed code): ATR is the 14-period arithmetic mean of True Range as a percentage of the latest close; RSI is 14-period Cutler's RSI (simple averages of gains and losses); neither uses Wilder smoothing; `_rsi_series` uses the same convention as `_compute_rsi_14`. README has a new "Indicator methodology" section. 1259 tests pass on 3.11, 3.14 and 3.15 (2 skipped); ruff is clean. Found and not fixed: `_compute_atr_percent` drops missing High, Low and Close values separately, so a bar missing only one of them shifts the columns against each other (a missing close in the last 14 bars gave 2.36% where dropping the whole bar gives 2.60%, on a test series; a missing high gives no ATR). Not known to occur in Yahoo's data. |
 | P2-7 | `ruff`, CI | Lint `streamlit/`, `research/` and `scripts/`. |
 
 ### P2-4: A test left the bot's database open
