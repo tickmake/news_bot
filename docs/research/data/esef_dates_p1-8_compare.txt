@@ -1,0 +1,11 @@
+company-number rows available, summed over month ends (source, rows):
+  before [('esef', 96634), ('yahoo', 56462)]
+  after  [('esef', 92934), ('yahoo', 56462)]
+rows with a new known_from: 1150; later: 1150, earlier: 0; days later: median 9, max 1999
+score_inputs rows: before 10843, after 10842; with numbers: before 5118, after 5013
+score_inputs rows whose numbers changed: 426; newest year changed: 104
+scores present (quality, value, performance, momentum): before (5056, 4109, 3878, 9772) after (4678, 3786, 3611, 9772)
+  quality: stock-months with a different score: 1305
+  value: stock-months with a different score: 1006
+  performance: stock-months with a different score: 941
+  momentum: stock-months with a different score: 0

@@ -178,6 +178,9 @@ def build(today: Optional[date] = None) -> int:
     with TRADE_HISTORY_LOCK:
         conn = _connection()
         with conn:
+            # A month whose inputs are gone (nothing known then any more) loses its scores too.
+            conn.execute("DELETE FROM company_scores WHERE NOT EXISTS (SELECT 1 FROM score_inputs i "
+                         "WHERE i.symbol = company_scores.symbol AND i.month_end = company_scores.month_end)")
             conn.executemany("INSERT OR REPLACE INTO company_scores VALUES (?, ?, ?, ?, ?, ?, ?, ?)", written)
     return len(written)
 

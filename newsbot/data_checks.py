@@ -113,6 +113,11 @@ def job_load_company_numbers_and_check() -> bool:
     try:
         problems = [(f"numbers:{symbol}:{_today()}", f"{escape(symbol)}: company numbers could not be loaded")
                     for symbol in summary.get("failed", [])]
+        if summary.get("esef_dates_unchecked"):
+            problems.append((f"numbers:esef-dates:{_today()}",
+                             f"{summary['esef_dates_unchecked']} annual-report numbers could not be matched to "
+                             "their ESEF filing, so their known-from date is unchecked and may be too early. "
+                             "See esef_dates_unchecked in the bot logs."))
         if not summary:
             problems = [("crash:numbers:" + _today(), "The company-number load stopped with an error. See the bot logs.")]
         warned = warn("Weekly company-number load: problems found", problems)

@@ -2,15 +2,22 @@
 
 Source order, per #73:
 1. The EU annual-report database (ESEF, filings.xbrl.org). Free, official,
-   and has the date each report was added to it. That is often months after
-   the report came out, so `known_from` is that date or the legal deadline
-   for publishing (4 months after the year end), whichever is earlier.
+   and has the date each report was added to it (`date_added`), which is
+   `known_from`. Only when a filing has no usable `date_added` does the legal
+   publishing deadline, 4 months after the year end, stand in (P1-8):
+
+       known_from = date_added if valid and available, else year_end + 120 days
+
+   The deadline never moves a later `date_added` earlier. A report added
+   after the deadline may have been public before it was added, but the bot
+   only knows it was on file from that day; counting it earlier is look-ahead.
 2. Yahoo's yearly financials for what ESEF lacks (German companies, items a
    company tags its own way, US stocks). Yahoo has no publication date, so
    `known_from` is set to 4 months after the year end, a conservative guess.
 
 `known_from` exists so a later test cannot use a number before it was public.
-Nothing reads this table yet; Phase 2 will.
+Each ESEF row's filing is kept in `esef_number_filings`, so its date can be
+checked against that filing again.
 """
 
 import time
@@ -67,10 +74,10 @@ YAHOO_ROWS = {
     "gross_profit": ("income_stmt", "Gross Profit"),
 }
 YAHOO_KNOWN_AFTER = timedelta(days=120)
-# EU listed companies must publish the annual report within 4 months of the
-# year end (Transparency Directive, art. 4). filings.xbrl.org often adds it
-# months later, which would hold a number back long after it was public.
-ESEF_KNOWN_BY = timedelta(days=120)
+# For an ESEF filing without a usable `date_added` only: EU listed companies
+# must publish the annual report within 4 months of the year end (Transparency
+# Directive, art. 4). Never used to move a known `date_added` earlier (P1-8).
+ESEF_UNDATED_KNOWN_AFTER = timedelta(days=120)
 # ESEF filing started with the 2020 accounts; earlier years are not there.
 YEARS_WANTED = 7
 _HEADERS = {"User-Agent": "news-bot (github.com/tickmake/news_bot)", "Accept": "application/json"}
@@ -93,10 +100,23 @@ _TABLES = (
     # ESEF filings already read, so the weekly run only downloads new ones.
     "CREATE TABLE IF NOT EXISTS esef_filings_read (filing_id TEXT PRIMARY KEY, symbol TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS company_numbers_version (version INTEGER NOT NULL)",
+    # The filing each ESEF row came from, with its `date_added` as received, so
+    # `known_from` can be checked without asking filings.xbrl.org again (P1-8).
+    # An ESEF row without one was saved before version 4 and is not yet checked.
+    """
+    CREATE TABLE IF NOT EXISTS esef_number_filings (
+        symbol TEXT NOT NULL,
+        year_end TEXT NOT NULL,
+        item TEXT NOT NULL,
+        filing_id TEXT NOT NULL,
+        date_added TEXT,
+        PRIMARY KEY (symbol, year_end, item)
+    )
+    """,
 )
 
 # Bump when saved rows were read wrongly, and say in _migrate what is redone.
-VERSION = 3
+VERSION = 4
 
 
 def _migrate(conn) -> None:
@@ -105,7 +125,12 @@ def _migrate(conn) -> None:
     Version 2 (#111): ESEF profit and equity were the totals including minority
     owners. Those rows go, and every filing is read again on the next run, which
     only adds what is missing. Share counts from Yahoo had a currency by mistake.
-    Version 3: ESEF `known_from` is capped at the 4-month publishing deadline.
+    Version 3 capped ESEF `known_from` at the 4-month deadline. That back-dated
+    late filings (P1-8), so it no longer runs.
+    Version 4 (P1-8): saved ESEF rows are re-dated by the filing they came from.
+    That needs the filing list from filings.xbrl.org, so it cannot happen here:
+    `esef_number_filings` (created above) starts empty, every saved ESEF row
+    counts as unchecked, and `load_esef` dates them on its next run.
     """
     row = conn.execute("SELECT MAX(version) FROM company_numbers_version").fetchone()
     if row[0] is not None and row[0] >= VERSION:
@@ -115,8 +140,6 @@ def _migrate(conn) -> None:
             conn.execute("DELETE FROM company_numbers WHERE source = 'esef' AND item IN ('net_profit', 'equity')")
             conn.execute("DELETE FROM esef_filings_read")
             conn.execute("UPDATE company_numbers SET currency = NULL WHERE item = 'shares_outstanding'")
-        conn.execute("UPDATE company_numbers SET known_from = MIN(known_from, DATE(year_end, ?)) "
-                     "WHERE source = 'esef'", (f"+{ESEF_KNOWN_BY.days} days",))
         conn.execute("DELETE FROM company_numbers_version")
         conn.execute("INSERT INTO company_numbers_version VALUES (?)", (VERSION,))
     APP_LOG.info("company_numbers_migrated version=%d", VERSION)
@@ -195,19 +218,162 @@ def esef_values(doc: Dict[str, Any], period_end: str) -> Tuple[Dict[str, Tuple[f
 
 
 def _save(symbol: str, year_end: str, values: Dict[str, Tuple[float, Optional[str]]],
-          source: str, known_from: str) -> int:
-    """Insert items not already saved for that year. Returns how many were new."""
+          source: str, known_from: str, filing: Optional[Tuple[str, Any]] = None) -> int:
+    """Insert items not already saved for that year. Returns how many were new.
+
+    `filing` is an ESEF filing's (id, date_added); it is recorded for each row
+    this filing supplied, not for rows an earlier filing already saved.
+    """
     fetched = datetime.now(timezone.utc).isoformat()
     with TRADE_HISTORY_LOCK:
         conn = _connection()
-        before = conn.total_changes
+        saved = 0
         with conn:
-            conn.executemany(
-                "INSERT OR IGNORE INTO company_numbers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [(symbol, year_end, item, value, currency, source, known_from, fetched)
-                 for item, (value, currency) in values.items()],
-            )
-        return conn.total_changes - before
+            for item, (value, currency) in values.items():
+                cursor = conn.execute("INSERT OR IGNORE INTO company_numbers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                      (symbol, year_end, item, value, currency, source, known_from, fetched))
+                if cursor.rowcount != 1:
+                    continue
+                saved += 1
+                if filing is not None:
+                    conn.execute("INSERT OR REPLACE INTO esef_number_filings VALUES (?, ?, ?, ?, ?)",
+                                 (symbol, year_end, item, filing[0], _text(filing[1])))
+        return saved
+
+
+def _text(value: Any) -> Optional[str]:
+    return None if value is None else str(value)
+
+
+def esef_known_from(year_end: str, date_added: Any) -> str:
+    """The day an ESEF filing's numbers count as known (P1-8).
+
+    `date_added`, the day filings.xbrl.org added the filing, when it is a date
+    on or after the year end. Missing, unreadable or earlier than the year end
+    (impossible for a real filing): year end + 120 days. Never the earlier of
+    the two: that would date a late filing before it was on file.
+    """
+    end = date.fromisoformat(year_end)
+    try:
+        added = date.fromisoformat(str(date_added)[:10]) if date_added else None
+    except ValueError:
+        added = None
+    if added is None or added < end:
+        added = end + ESEF_UNDATED_KNOWN_AFTER
+    return added.isoformat()
+
+
+MAX_FILING_PAGES = 20
+
+
+def esef_filings(lei: str) -> List[Dict[str, Any]]:
+    """Every filing listed for a company, following the API's pages."""
+    url: Optional[str] = f"https://filings.xbrl.org/api/entities/{lei}/filings?page%5Bsize%5D=50"
+    filings: List[Dict[str, Any]] = []
+    for _ in range(MAX_FILING_PAGES):
+        if not url:
+            return filings
+        data = _get_json(url)
+        filings += data.get("data") or []
+        url = (data.get("links") or {}).get("next")
+        if url and not url.startswith("https://filings.xbrl.org/"):
+            raise RuntimeError(f"unexpected next page {url}")
+    raise RuntimeError(f"more than {MAX_FILING_PAGES} pages of filings for {lei}")
+
+
+def _ingestion_order(filings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Oldest added first, so the first version of a year's report wins.
+
+    A filing without `date_added` comes last: it only supplies what the dated
+    ones lack, so its fallback date never wins over a real one (P1-8). Checking
+    saved rows replays this order.
+    """
+    def key(item: Dict[str, Any]) -> Tuple[bool, str]:
+        added = item["attributes"].get("date_added")
+        return not added, str(added or "")
+    return sorted(filings, key=key)
+
+
+def _check_saved_dates(symbol: str, filings: List[Dict[str, Any]]) -> int:
+    """Date ESEF rows saved before version 4 by the filing they came from (P1-8).
+
+    The filing is found the way it was chosen when saved: the year's filings
+    read for this stock are read again in `_ingestion_order`, and the first
+    that has the item supplied it, if its value and currency are the ones
+    saved. Anything else is left as it is and stays unchecked, never guessed:
+    no filing for the year, a value that does not match, or a read filing that
+    is no longer listed or no longer has a report (it may have been the one).
+    If the real supplier was read later than this order says, an earlier filing
+    with the same number takes the row; that number was on file from its date.
+    Only `known_from` changes. Returns how many stay unchecked.
+    """
+    with TRADE_HISTORY_LOCK:
+        conn = _connection()
+        rows = conn.execute(
+            "SELECT n.year_end, n.item, n.value, n.currency, n.known_from FROM company_numbers n "
+            "LEFT JOIN esef_number_filings f USING (symbol, year_end, item) "
+            "WHERE n.symbol = ? AND n.source = 'esef' AND f.filing_id IS NULL", (symbol,)).fetchall()
+        read = {row[0] for row in conn.execute(
+            "SELECT filing_id FROM esef_filings_read WHERE symbol = ?", (symbol,))}
+    if not rows:
+        return 0
+    usable = {filing["id"] for filing in filings
+              if filing["attributes"].get("json_url") and filing["attributes"].get("period_end")}
+    gone = read - usable
+    if gone:
+        SYS_LOG.warning("esef_dates_unchecked symbol=%s rows=%d reason=read_filings_gone ids=%s",
+                        symbol, len(rows), ",".join(sorted(gone)))
+        return len(rows)
+    by_year: Dict[str, List[Dict[str, Any]]] = {}
+    for filing in _ingestion_order(filings):
+        attrs = filing["attributes"]
+        if filing["id"] in read and attrs.get("json_url") and attrs.get("period_end"):
+            by_year.setdefault(attrs["period_end"], []).append(filing)
+    documents: Dict[str, Dict[str, Tuple[float, Optional[str]]]] = {}
+
+    def values_in(filing: Dict[str, Any]) -> Dict[str, Tuple[float, Optional[str]]]:
+        if filing["id"] not in documents:
+            attrs = filing["attributes"]
+            doc = _get_json("https://filings.xbrl.org" + attrs["json_url"])
+            documents[filing["id"]] = esef_values(doc, attrs["period_end"])[0]
+        return documents[filing["id"]]
+
+    dated = []
+    for year_end, item, value, currency, known_from in rows:
+        source = None
+        for filing in by_year.get(year_end, []):
+            found = values_in(filing).get(item)
+            if found is not None:
+                source = filing if found == (value, currency) else None
+                break
+        if source is None:
+            continue
+        added = source["attributes"].get("date_added")
+        dated.append((esef_known_from(year_end, added), known_from, year_end, item, source["id"], _text(added)))
+    with TRADE_HISTORY_LOCK:
+        conn = _connection()
+        with conn:
+            for new, _old, year_end, item, filing_id, added in dated:
+                conn.execute("UPDATE company_numbers SET known_from = ? "
+                             "WHERE symbol = ? AND year_end = ? AND item = ? AND source = 'esef'",
+                             (new, symbol, year_end, item))
+                conn.execute("INSERT INTO esef_number_filings VALUES (?, ?, ?, ?, ?)",
+                             (symbol, year_end, item, filing_id, added))
+    changed = sum(1 for new, old, *_ in dated if new != old)
+    left = len(rows) - len(dated)
+    APP_LOG.info("esef_dates_checked symbol=%s dated=%d changed=%d unchecked=%d", symbol, len(dated), changed, left)
+    if left:
+        SYS_LOG.warning("esef_dates_unchecked symbol=%s rows=%d reason=no_matching_filing", symbol, left)
+    return left
+
+
+def unchecked_esef_rows(symbols: Optional[List[str]] = None) -> int:
+    """ESEF rows not yet dated by their filing, for these stocks (all if None)."""
+    with TRADE_HISTORY_LOCK:
+        rows = _connection().execute(
+            "SELECT n.symbol FROM company_numbers n LEFT JOIN esef_number_filings f "
+            "USING (symbol, year_end, item) WHERE n.source = 'esef' AND f.filing_id IS NULL").fetchall()
+    return sum(1 for (symbol,) in rows if symbols is None or symbol in symbols)
 
 
 def load_esef(symbol: str, isin: str) -> int:
@@ -215,15 +381,17 @@ def load_esef(symbol: str, isin: str) -> int:
     lei = lei_for_isin(isin)
     if not lei:
         return 0
-    filings = _get_json(f"https://filings.xbrl.org/api/entities/{lei}/filings?page%5Bsize%5D=50").get("data") or []
+    filings = esef_filings(lei)
+    try:
+        _check_saved_dates(symbol, filings)
+    except Exception as exc:  # rows stay unchecked and are tried again next week
+        SYS_LOG.warning("esef_dates_check_failed symbol=%s detail=%s", symbol, exc)
     with TRADE_HISTORY_LOCK:
         read = {row[0] for row in _connection().execute(
             "SELECT filing_id FROM esef_filings_read WHERE symbol = ?", (symbol,))}
     cutoff = date.today().replace(month=1, day=1) - timedelta(days=365 * YEARS_WANTED)
-    # Oldest added first, so the first version of a year's report wins.
-    filings.sort(key=lambda item: item["attributes"].get("date_added") or "")
     saved = 0
-    for filing in filings:
+    for filing in _ingestion_order(filings):
         attrs = filing["attributes"]
         if filing["id"] in read or not attrs.get("json_url") or not attrs.get("period_end"):
             continue
@@ -231,10 +399,11 @@ def load_esef(symbol: str, isin: str) -> int:
             continue
         doc = _get_json("https://filings.xbrl.org" + attrs["json_url"])
         values, year_end = esef_values(doc, attrs["period_end"])
-        added = (attrs.get("date_added") or attrs.get("processed") or "")[:10]
-        deadline = (date.fromisoformat(year_end) + ESEF_KNOWN_BY).isoformat()
-        known_from = min(added, deadline) if added else deadline
-        saved += _save(symbol, year_end, values, "esef", known_from)
+        # Only `date_added`: `processed` is when filings.xbrl.org last ran its
+        # checks (Equinor 2021: added 2022-03-29, processed 2023-01-18), and
+        # `published` is not what P1-8 dates by.
+        known_from = esef_known_from(year_end, attrs.get("date_added"))
+        saved += _save(symbol, year_end, values, "esef", known_from, (filing["id"], attrs.get("date_added")))
         with TRADE_HISTORY_LOCK:
             conn = _connection()
             with conn:
@@ -290,6 +459,9 @@ def load_company_numbers(rows: Optional[List[Dict[str, str]]] = None) -> Dict[st
             yahoo_ok = False
         if not esef_ok and not yahoo_ok:
             summary["failed"].append(row["ticker"])
+    # Saved before version 4 and not matched to a filing yet (P1-8): their
+    # `known_from` may still be the old, too early deadline date.
+    summary["esef_dates_unchecked"] = unchecked_esef_rows([row["ticker"] for row in rows])
     return summary
 
 
@@ -314,5 +486,6 @@ def job_load_company_numbers() -> Dict[str, Any]:
     except Exception as exc:
         SYS_LOG.error("company_numbers_crashed detail=%s", exc)
         return {}
-    APP_LOG.info("company_numbers saved=%d failed=%d", summary["saved"], len(summary["failed"]))
+    APP_LOG.info("company_numbers saved=%d failed=%d esef_dates_unchecked=%d", summary["saved"],
+                 len(summary["failed"]), summary["esef_dates_unchecked"])
     return summary
