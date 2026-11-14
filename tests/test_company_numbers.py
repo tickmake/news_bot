@@ -221,6 +221,55 @@ class KnownFromTests(unittest.TestCase):
                 self.assertEqual(cn.esef_known_from("2025-12-31", added), "2026-04-30")
 
 
+class IngestionOrderTests(unittest.TestCase):
+    """Filings are ordered by the same date `esef_known_from` would use."""
+
+    def _order(self, *filings):
+        return [f["id"] for f in cn._ingestion_order(list(filings))]
+
+    def test_a_usable_date_is_the_one_known_from_uses(self):
+        for added in ("2026-05-19", "2026-05-19 11:12:47", "2026-05-19 11:12:47.5", "2026-05-19T11:12:47+00:00",
+                      "2025-12-31 00:00:00"):   # the year end itself
+            with self.subTest(added=added):
+                self.assertEqual(cn._added_at("2025-12-31", added).date().isoformat(),
+                                 cn.esef_known_from("2025-12-31", added))
+        for added in (None, "", "not a date", "2026-13-45 00:00:00", "19.05.2026", 12345, "2025-06-30 00:00:00"):
+            with self.subTest(added=added):
+                self.assertIsNone(cn._added_at("2025-12-31", added))
+        self.assertIsNone(cn._added_at(None, "2026-05-19"))   # no year end to check it against
+
+    def test_valid_dates_are_ordered_by_time_not_by_text(self):
+        # As text, "2026-05-19 09..." sorts before "2026-05-19T08...".
+        self.assertEqual(self._order(_filing("late", "2026-09-01 10:00:00"),
+                                     _filing("nine", "2026-05-19 09:00:00"),
+                                     _filing("eight", "2026-05-19T08:00:00"),
+                                     _filing("march", "2026-03-15")),
+                         ["march", "eight", "nine", "late"])
+
+    def test_missing_malformed_and_early_dates_come_after_every_valid_one(self):
+        # Each of these sorts before "2026-..." as text, or is not text at all.
+        self.assertEqual(self._order(_filing("none", None),
+                                     _filing("dots", "19.05.2026"),
+                                     _filing("early", "2025-06-30 00:00:00"),
+                                     _filing("number", 12345),
+                                     _filing("empty", ""),
+                                     _filing("b", "2026-09-01 10:00:00"),
+                                     _filing("a", "2026-05-19 10:00:00")),
+                         ["a", "b", "none", "dots", "early", "number", "empty"])   # the rest as listed
+
+    def test_a_date_is_checked_against_its_own_filings_year_end(self):
+        # 2025-06-30 is before the 2025 year end, but a real date for the 2024 report.
+        self.assertEqual(self._order(_filing("y2025", "2025-06-30"),
+                                     _filing("y2024", "2025-06-30", period_end="2024-12-31"),
+                                     _filing("no_year", "2025-01-01", period_end=None)),
+                         ["y2024", "y2025", "no_year"])
+
+    def test_equal_dates_keep_the_listed_order(self):
+        same = "2026-05-19 10:00:00"
+        self.assertEqual(self._order(_filing("c", same), _filing("a", same), _filing("b", same)), ["c", "a", "b"])
+        self.assertEqual(self._order(_filing("b", "2026-05-19"), _filing("a", "2026-05-19 00:00:00")), ["b", "a"])
+
+
 class StoredDateTests(unittest.TestCase):
     def setUp(self):
         for p in (patch.object(cn.time, "sleep"), patch.object(cn, "YEARS_WANTED", 50)):
@@ -376,6 +425,72 @@ class StoredDateTests(unittest.TestCase):
         numbers = {r[2]: r[6] for r in self._numbers()}
         self.assertEqual(numbers, {"revenue": "2026-09-01", "cash": "2026-04-30"})
         self.assertEqual({k[2]: v[0] for k, v in self._filings_of().items()}, {"revenue": "f1", "cash": "f2"})
+
+    def test_a_malformed_date_never_beats_a_valid_one(self):
+        # "19.05.2026" sorts before "2026-..." as text, and would date revenue at day 120.
+        api = FakeEsef([_filing("f2", "19.05.2026"), _filing("f1", "2026-09-01 10:00:00")],
+                       {"/f1.json": _doc(revenue=10.0), "/f2.json": _doc(revenue=10.0, cash=5.0)})
+        self._load(api)
+        self.assertEqual({r[2]: r[6] for r in self._numbers()}, {"revenue": "2026-09-01", "cash": "2026-04-30"})
+        self.assertEqual(self._filings_of(), {("ACA.PA", "2025-12-31", "revenue"): ("f1", "2026-09-01 10:00:00"),
+                                              ("ACA.PA", "2025-12-31", "cash"): ("f2", "19.05.2026")})
+
+    def test_a_date_before_the_year_end_never_beats_a_valid_one(self):
+        api = FakeEsef([_filing("f2", "2025-06-30 00:00:00"), _filing("f1", "2026-09-01 10:00:00")],
+                       {"/f1.json": _doc(revenue=10.0), "/f2.json": _doc(revenue=11.0, cash=5.0)})
+        self._load(api)
+        self.assertEqual({r[2]: (r[3], r[6]) for r in self._numbers()},
+                         {"revenue": (10.0, "2026-09-01"), "cash": (5.0, "2026-04-30")})
+        self.assertEqual({k[2]: v[0] for k, v in self._filings_of().items()}, {"revenue": "f1", "cash": "f2"})
+
+    def test_two_valid_dates_are_read_oldest_first_whatever_their_format(self):
+        api = FakeEsef([_filing("f2", "2026-05-19 09:00:00"), _filing("f1", "2026-05-19T08:00:00")],
+                       {"/f1.json": _doc(revenue=10.0), "/f2.json": _doc(revenue=11.0)})
+        self._load(api)
+        self.assertEqual(api.downloads, ["/f1.json", "/f2.json"])
+        self.assertEqual([(r[3], r[6]) for r in self._numbers()], [(10.0, "2026-05-19")])
+        self.assertEqual(self._filings_of()[("ACA.PA", "2025-12-31", "revenue")][0], "f1")
+
+    def test_filings_added_at_the_same_time_are_read_as_listed(self):
+        same = "2026-05-19 10:00:00"
+        api = FakeEsef([_filing("f2", same), _filing("f1", same)],
+                       {"/f1.json": _doc(revenue=10.0), "/f2.json": _doc(revenue=11.0)})
+        self._load(api)
+        self.assertEqual(api.downloads, ["/f2.json", "/f1.json"])
+        self.assertEqual(self._numbers()[0][3], 11.0)
+
+    def _saved_rows_follow_the_valid_filing(self, bad):
+        # Both filings hold the saved revenue. The valid one supplied it; the
+        # other, listed first, must not date it at day 120.
+        self._version_3_db([
+            ("ACA.PA", "2025-12-31", "revenue", 10.0, "EUR", "esef", "2026-04-30", "t"),
+            ("ACA.PA", "2025-12-31", "cash", 5.0, "EUR", "esef", "2026-04-30", "t")], read=("f1", "f2"))
+        api = FakeEsef([_filing("f2", bad), _filing("f1", "2026-09-01 10:00:00")],
+                       {"/f1.json": _doc(revenue=10.0), "/f2.json": _doc(revenue=10.0, cash=5.0)})
+        with patch.object(cn, "_get_json", side_effect=api):
+            self.assertEqual(cn._check_saved_dates("ACA.PA", api.filings), 0)
+        self.assertEqual({r[2]: r[6] for r in self._numbers()}, {"revenue": "2026-09-01", "cash": "2026-04-30"})
+        self.assertEqual(self._filings_of(), {("ACA.PA", "2025-12-31", "revenue"): ("f1", "2026-09-01 10:00:00"),
+                                              ("ACA.PA", "2025-12-31", "cash"): ("f2", bad)})
+
+    def test_saved_rows_are_not_matched_to_a_malformed_date_first(self):
+        self._saved_rows_follow_the_valid_filing("19.05.2026")
+
+    def test_saved_rows_are_not_matched_to_a_date_before_the_year_end_first(self):
+        self._saved_rows_follow_the_valid_filing("2025-06-30 00:00:00")
+
+    def test_saved_rows_are_not_matched_to_an_undated_filing_first(self):
+        self._saved_rows_follow_the_valid_filing(None)
+
+    def test_saved_rows_are_matched_oldest_first_whatever_the_format(self):
+        self._version_3_db([("ACA.PA", "2025-12-31", "revenue", 10.0, "EUR", "esef", "2026-04-30", "t")],
+                           read=("f1", "f2"))
+        api = FakeEsef([_filing("f2", "2026-05-19 09:00:00"), _filing("f1", "2026-05-19T08:00:00")],
+                       {"/f1.json": _doc(revenue=10.0), "/f2.json": _doc(revenue=11.0)})
+        with patch.object(cn, "_get_json", side_effect=api):
+            self.assertEqual(cn._check_saved_dates("ACA.PA", api.filings), 0)
+        self.assertEqual(self._filings_of()[("ACA.PA", "2025-12-31", "revenue")][0], "f1")
+        self.assertEqual(api.downloads, ["/f1.json"])
 
     def test_a_failed_check_does_not_stop_new_filings(self):
         api = FakeEsef([_filing("f1", "2026-05-19 10:00:00")], {"/f1.json": _doc(revenue=10.0)})

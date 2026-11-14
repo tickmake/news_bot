@@ -245,6 +245,30 @@ def _text(value: Any) -> Optional[str]:
     return None if value is None else str(value)
 
 
+def _added_at(year_end: Any, date_added: Any) -> Optional[datetime]:
+    """When a filing was added, if `date_added` is usable, else None (P1-8).
+
+    Usable means it starts with an ISO date on or after the year end; anything
+    else (missing, unreadable, or before the year end, impossible for a real
+    filing) is not a date at all. `esef_known_from` and `_ingestion_order` both
+    decide by this, so a filing dated by the fallback is never ordered by the
+    text it was given. The time of day is kept when it can be read, so two
+    filings added the same day stay in the order they were added.
+    """
+    text = str(date_added)
+    try:
+        day = date.fromisoformat(text[:10])
+        if day < date.fromisoformat(str(year_end)[:10]):
+            return None
+    except ValueError:
+        return None
+    try:
+        at = datetime.fromisoformat(text).time().replace(tzinfo=None)
+    except ValueError:
+        at = datetime.min.time()
+    return datetime.combine(day, at)
+
+
 def esef_known_from(year_end: str, date_added: Any) -> str:
     """The day an ESEF filing's numbers count as known (P1-8).
 
@@ -253,14 +277,10 @@ def esef_known_from(year_end: str, date_added: Any) -> str:
     (impossible for a real filing): year end + 120 days. Never the earlier of
     the two: that would date a late filing before it was on file.
     """
-    end = date.fromisoformat(year_end)
-    try:
-        added = date.fromisoformat(str(date_added)[:10]) if date_added else None
-    except ValueError:
-        added = None
-    if added is None or added < end:
-        added = end + ESEF_UNDATED_KNOWN_AFTER
-    return added.isoformat()
+    added = _added_at(year_end, date_added)
+    if added is None:
+        return (date.fromisoformat(year_end) + ESEF_UNDATED_KNOWN_AFTER).isoformat()
+    return added.date().isoformat()
 
 
 MAX_FILING_PAGES = 20
@@ -284,13 +304,16 @@ def esef_filings(lei: str) -> List[Dict[str, Any]]:
 def _ingestion_order(filings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Oldest added first, so the first version of a year's report wins.
 
-    A filing without `date_added` comes last: it only supplies what the dated
-    ones lack, so its fallback date never wins over a real one (P1-8). Checking
-    saved rows replays this order.
+    A filing without a usable `date_added` (see `_added_at`) comes last: it
+    only supplies what the dated ones lack, so its fallback date never wins
+    over a real one (P1-8). Filings added at the same time, and the undated
+    ones, keep the order they were listed in. Checking saved rows replays this
+    order.
     """
-    def key(item: Dict[str, Any]) -> Tuple[bool, str]:
-        added = item["attributes"].get("date_added")
-        return not added, str(added or "")
+    def key(item: Dict[str, Any]) -> Tuple[bool, datetime]:
+        attrs = item["attributes"]
+        added = _added_at(attrs.get("period_end"), attrs.get("date_added"))
+        return added is None, added or datetime.min
     return sorted(filings, key=key)
 
 
