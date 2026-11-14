@@ -145,7 +145,7 @@ Each task can be done on its own. "Archive?" says whether the task changes histo
 | P2-2 | `docker-compose.yml` | Remove the misspelled `FREEN_EWS_API_KEY` and `FINHUB_API_KEY` after confirming nothing reads them. Delete `.coveragerc.bak`. |
 | P2-3 | `streamlit/app.py`, compose | Add a dashboard healthcheck, plus banners showing data age per table. |
 | P2-4 | `tests/` | Find and close the leaked SQLite connection that triggers the shutdown `ResourceWarning`. **Done on `fix/sqlite-resourcewarning-leak`, not yet merged; see below.** |
-| P2-5 | `research/gap_risk.py`, `hold_exit_study.py` | Add FX cost to the scripts. Record results per cost scenario. |
+| P2-5 | `research/gap_risk.py`, `hold_exit_study.py` | Add FX cost to the scripts. Record results per cost scenario. **Done on `feat/research-fx-cost-modelling`, not yet merged; see below.** |
 | P2-6 | `newsbot/indicators.py`, README | Label ATR and RSI as simple-average (Cutler) variants. |
 | P2-7 | `ruff`, CI | Lint `streamlit/`, `research/` and `scripts/`. |
 
@@ -159,6 +159,48 @@ Each task can be done on its own. "Archive?" says whether the task changes histo
 | **Tests** | Four in `tests/test_store_isolation.py`: every `newsbot` module holding a `TRADE_HISTORY` is on the helper's list (a new holder fails this test); swapping `history_store` alone still leaves `/analyze` on the other store (the old fixture, shown with stand-in stores); with the helper `/analyze` reads only the throwaway store, which is closed afterwards and every name restored; commits and rollbacks on the store behave as before. They read the store's own `_conn`, never the garbage collector. |
 | **Verified** | Before, on `main` (`8c556de`), Python 3.14.10: `python -W error::ResourceWarning -m unittest` ran 1232 tests OK and printed `ResourceWarning: unclosed database` at shutdown. A tracing run named the connection and the seven tests. After: 1236 tests, OK, 2 skipped (the Streamlit-only live tests), no warning, on 3.11.11, 3.14.10 and 3.15.2, and on 3.15.2 inside the production image with the CI step's own command (`--read-only`, `--user app`). The same trace finds no test reaching the process-wide store, no connection left open, and the configured database file is no longer created. `ruff check news_bot.py newsbot tests` is clean; coverage 97%. |
 | **Limits** | The four modules still take the store by name, so a new test that reaches them without the helper would open the real store again. The listing test only catches a new module, not a new test. `tests/test_dashboard_websocket_live.py` runs only in the dashboard image and was not run here. |
+
+### P2-5: FX cost in the gap and hold research
+
+Research only. Nothing the bot runs was changed.
+
+| | |
+|---|---|
+| **Files** | `research/fx_costs.py` (new, shared), `research/gap_risk.py`, `research/hold_exit_study.py`, `tests/test_research_fx_costs.py` (new), `research/README.md`, `docs/research/2026-10-analytics-findings.md` (pointers only), three new output files in `docs/research/data/`. |
+| **Before** | Neither script converted currency or charged for it. `gap_risk.py` had no costs at all: its returns are price ratios in the stock's own currency. `hold_exit_study.py` had one cost, the broker fee: `net = gross - 2 x 0.49%` (the 59 NOK minimum on 12,000 NOK, each way), also on returns in the stock's own currency. So there was nothing to count twice. |
+| **Convention** | A stock not priced in NOK needs two conversions: NOK to its currency to buy, and back after the sale. Each loses `bps` of the amount converted. With `c = bps / 10,000` and an own-currency return `r`, the cost in percent of the NOK put in is `(1 + r) x (2c - c²) x 100`: the second conversion is on the sale proceeds. NOK stocks pay nothing. A stock with an unknown currency is charged as foreign and counted in the output (0 in both runs). The cost comes off once, after the script's own costs: `gap_risk` realised return minus FX; `hold_exit_study` `net` minus FX. The fee constants and the `net` column are untouched. Every scenario starts from the same pre-FX number, and a table that already has FX columns is refused. |
+| **Scenarios** | Per conversion: 0 bps (baseline), 10 (low), 25 (medium), 50 (high). **These are illustrative round numbers for a sensitivity table. They are not DNB's or any broker's verified pricing.** Defined once, in `fx_costs.FX_SCENARIOS`. |
+| **Output** | Both scripts print everything they printed before, unchanged, and then an "FX COST SENSITIVITY" section: the assumption, trades by currency, and per scenario the gross return, the return after existing trading costs, the FX cost (mean and total), the return after FX and the change against 0 bps. The old output files were not replaced. |
+| **Tests** | 23 in `tests/test_research_fx_costs.py`, on fixed numbers, no network: 0 bps is exactly no cost and reproduces the old `net` table; NOK stocks are never charged; both legs are charged, checked against a hand walk-through (100 NOK, 25 bps, +10% leaves a cost of 0.5493125); more cost never leaves more; a frame cannot be charged twice and scenarios do not stack; the fee is taken once and is what it was; unknown and missing currencies; both scripts share one scenario table and one model. Full suite: 1259 tests, OK, 2 skipped (the Streamlit-only live tests), on Python 3.11.11, 3.14.10 and 3.15.2 with `-W error::ResourceWarning`, and on 3.15.2 inside the production image with the CI step's command; coverage 97%. `ruff check news_bot.py newsbot tests` is clean, and so are the three research files (not part of the CI lint). |
+| **Runs** | Both on the saved data of the original runs, not refetched. `gap_risk.py` at 3xATR and 2xATR below the signal close reproduces `gap_risk_3.0x_signal-close.txt` and `gap_risk_2.0x_signal-close.txt` line for line before the new section. `hold_exit_study.py` reproduces its old output line for line (and section 8's table). A second run gives the same output. New files: `gap_risk_3.0x_signal-close_fx.txt`, `gap_risk_2.0x_signal-close_fx.txt`, `hold_exit_study_fx.txt`. |
+| **Limits** | The cost levels are assumptions until the broker's real FX pricing is checked, including whether it is a flat percentage, has a minimum, or can be avoided with a currency account. The exchange rate's own move during the hold is still not modelled; returns stay in the stock's own currency. The broker fee is still the Norwegian minimum for every stock, as before. The fee and the FX cost are each taken on the full position; their effect on each other (about 0.005 points) is ignored. The gap basket includes 11 Indian stocks, charged as foreign like the rest. |
+
+**Hold study** (95 stocks, 44,807 entries per row, 60% of them in EUR or USD). Mean per trade, %:
+
+| FX cost per conversion | 0 bps | 10 bps | 25 bps | 50 bps |
+|---|---|---|---|---|
+| FX cost, all trades | 0.00 | 0.12 | 0.30 | 0.61 |
+| 20 sessions, time: gross 1.50, after fees 0.51, after fees and FX | +0.51 | +0.39 | +0.21 | -0.09 |
+| 20 sessions, wide (3xATR): gross 1.30, after fees 0.31, after fees and FX | +0.31 | +0.19 | +0.01 | -0.29 |
+| 5 sessions, time, per 20 sessions | -2.70 | -3.18 | -3.90 | -5.10 |
+| 20 sessions, time, NOK stocks | +0.61 | +0.61 | +0.61 | +0.61 |
+| 20 sessions, time, EUR stocks | +0.33 | +0.12 | -0.18 | -0.68 |
+| 20 sessions, time, USD stocks | +0.97 | +0.77 | +0.46 | -0.04 |
+| Total FX cost, 20 sessions, time, 12,000 NOK a trade (NOK) | 0 | 652,850 | 1,630,901 | 3,257,720 |
+
+What changes: the order of the rules and of the hold lengths does not. "Time" is the best rule at every hold in every scenario, and 20 sessions beats 10 beats 5. Short holds get worse faster, since four 5-session trades pay the conversions four times. The levels do change: a foreign stock pays about twice the per-conversion cost on each round trip, on top of the 1% fee. The average EUR trade is below zero from 25 bps, and the average of all trades from 50 bps. Oslo stocks are not affected, so they keep an edge of 0.2 to 1.0 points per trade over foreign ones in this model.
+
+**Gap study** (44 stocks; 3xATR: 26,438 entries, 21,826 charged). Mean per entry, % of the NOK put in:
+
+| FX cost per conversion | 0 bps | 10 bps | 25 bps | 50 bps |
+|---|---|---|---|---|
+| 3xATR: FX cost, all entries | 0.000 | 0.166 | 0.416 | 0.831 |
+| 3xATR: realised return (gross = after trading costs, 0.78) after FX | 0.78 | 0.61 | 0.36 | -0.05 |
+| 3xATR: mean loss when stopped, all entries | 5.99 | 6.15 | 6.37 | 6.75 |
+| 2xATR: realised return (0.61) after FX | 0.61 | 0.44 | 0.19 | -0.22 |
+| 2xATR: mean loss when stopped, all entries | 4.15 | 4.30 | 4.53 | 4.92 |
+
+What changes: nothing in the gap result. How often a stop is hit or gapped, and how far below the stop the sale was, are price ratios in the stock's own currency, and the `GapStudy(...)` rows the bot uses are the same. What a stop loses in NOK is larger by the FX cost: 0.16 to 0.76 points on average at 3xATR, about 1 point for a foreign stock at 50 bps.
 
 ## P3: features (only after P0/P1)
 

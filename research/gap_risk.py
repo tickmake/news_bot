@@ -28,14 +28,24 @@ buy price, it does not depend on what anyone paid, so the bot can apply it
 before a buy (`risk.trade_risk`). The old measure, points of the buy price
 beyond the stop, is still printed for comparison with section 7.
 
-The last line printed is the row for `risk.GAP_STUDIES`. Keep the full output in
+The `GapStudy(...)` line is the row for `risk.GAP_STUDIES`. Keep the full output in
 docs/research/data/ (tests/test_risk_reporting.py checks the two agree).
+
+Costs (P2-5). This script has no commission, fee, spread or slippage: its
+returns are price ratios in the stock's own currency. After the `GapStudy(...)`
+line it prints what the two currency conversions of a NOK investor would add,
+for the four illustrative scenarios of `fx_costs.py`. Everything above that
+section is unchanged by it, and the 0 bps row is the result without it.
 """
+import os
 import pickle
 import sys
 
 import numpy as np
 import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # also when loaded by path, as the tests do
+import fx_costs
 
 HOLD = 20                    # SETTINGS.trade_outcome_lookback_days on the Pi
 GATES = {"week": 1.0, "day": 0.0, "atr": 4.5, "dd": 8.0, "volume": 1.2}
@@ -116,6 +126,48 @@ def simulate(signal_close, atr_pct, multiple, anchor, opens, lows, closes):
     }
 
 
+def fx_sensitivity(trades):
+    """The realised return of every entry under each FX scenario, as printed lines.
+
+    `trades` needs `symbol`, `currency`, `realised_pct`, `stopped` and `gapped`.
+    Gap frequency and the shortfall below the stop are not here: they are
+    price ratios in the stock's own currency, which no conversion cost changes.
+    """
+    trades = fx_costs.add_fx_columns(trades.copy(), "realised_pct", "realised_pct")
+    converted = trades["currency"].map(fx_costs.is_converted)
+    lines = ["FX COST SENSITIVITY (illustrative; not verified broker pricing)"]
+    lines += fx_costs.describe(trades)
+    lines += [
+        "This script models no commission, fee, spread or slippage, so 'gross' and 'after existing",
+        "trading costs' are the same number here. Gap frequency and the sale's shortfall below the stop",
+        "price are price ratios in the stock's own currency: FX cost does not change them.",
+        "",
+        "Mean per entry, in percent of the NOK put in (return from the buy price):",
+        f"{'scenario':<20}{'bps/conv':>9}{'gross':>8}{'after costs':>12}{'FX cost':>9}"
+        f"{'after FX':>10}{'vs 0 bps':>10}{'total FX cost':>15}",
+    ]
+    baseline = trades[fx_costs.column("after_fx", 0.0)].mean()
+    for name, bps in fx_costs.FX_SCENARIOS:
+        cost, after = trades[fx_costs.column("fx_cost", bps)], trades[fx_costs.column("after_fx", bps)]
+        lines.append(f"{name:<20}{bps:>9g}{trades.realised_pct.mean():>8.2f}{trades.realised_pct.mean():>12.2f}"
+                     f"{cost.mean():>9.3f}{after.mean():>10.2f}{after.mean() - baseline:>10.3f}"
+                     f"{cost.sum() / 100:>15.1f}")
+    lines += ["('total FX cost' is the sum over all entries, counted in whole positions.)", "",
+              "The same for the charged (non-NOK) entries only, and what a stop then loses:",
+              f"{'scenario':<20}{'bps/conv':>9}{'entries':>9}{'FX cost':>9}{'after FX':>10}"
+              f"{'stopped: loss':>15}{'gapped: loss':>14}{'all stops, all entries':>24}"]
+    foreign = trades[converted]
+    for name, bps in fx_costs.FX_SCENARIOS:
+        after = fx_costs.column("after_fx", bps)
+        lines.append(f"{name:<20}{bps:>9g}{len(foreign):>9}{foreign[fx_costs.column('fx_cost', bps)].mean():>9.3f}"
+                     f"{foreign[after].mean():>10.2f}{-foreign.loc[foreign.stopped, after].mean():>15.2f}"
+                     f"{-foreign.loc[foreign.gapped, after].mean():>14.2f}"
+                     f"{-trades.loc[trades.stopped, after].mean():>24.2f}")
+    lines.append("('loss' is the mean realised loss from the buy price, positive = money lost; the last column")
+    lines.append(" is the 'realised mean' of the 'all stops' line above, for every entry, NOK ones included.)")
+    return lines
+
+
 def main(basket_path, multiple="3.0", anchor="signal-close", *flags):
     stop_multiple = float(multiple)
     if anchor not in ANCHORS:
@@ -148,7 +200,7 @@ def main(basket_path, multiple="3.0", anchor="signal-close", *flags):
             if trade is None:
                 no_trade += 1
                 continue
-            rows.append({"symbol": symbol, **trade})
+            rows.append({"symbol": symbol, "currency": fx_costs.currency_of(symbol), **trade})
 
     trades = pd.DataFrame(rows)
     stopped = trades[trades.stopped]
@@ -181,6 +233,8 @@ def main(basket_path, multiple="3.0", anchor="signal-close", *flags):
           f" gap_below_stop_mean_pct={below.mean():.2f},"
           f" gap_below_stop_p90_pct={below.quantile(0.90):.2f},"
           f" gap_below_stop_worst_pct={below.max():.2f})")
+    print()
+    print("\n".join(fx_sensitivity(trades)))
 
 
 if __name__ == "__main__":

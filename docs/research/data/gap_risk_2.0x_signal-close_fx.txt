@@ -1,0 +1,45 @@
+$ python research/fetch_basket.py basket.pkl   # the 2026-11-13 basket of gap_risk_2.0x_signal-close.txt (sha256 ebcf052c...8cac8d1), rerun 2026-11-14
+$ python research/gap_risk.py basket.pkl 2.0 signal-close   # P2-5: the same output, then the FX cost sensitivity
+stop 2xATR below the signal-close; volume gate off; EMA20 seeded 63 sessions back; hold 20
+basket: 44 symbols, last session 2026-11-13
+qualifying entries      : 26407 (plus 42 that opened at or below the stop: not traded)
+stopped out             : 12157 (46.0%)
+  of those, gapped through: 1741 (14.3% of stops, 6.6% of entries)
+
+when it gapped, the sale was below the stop price by (percent of the stop price):
+  mean 0.99%  median 0.56%  90th 2.36%  worst 12.04%
+the same in points of the buy price (section 7's measure; depends on the buy price):
+  mean 0.94  median 0.54  90th 2.24  worst 11.22
+
+all stops: loss at the stop from the buy price, mean 4.01% -> realised mean 4.15%
+stop distance from the signal-close: mean 4.13%; from the buy price: mean 4.20% (wider from the buy price in 57% of entries)
+
+GapStudy(multiple=2.0, anchor='signal_close', entries=26407, stopped_pct=46.0, gapped_of_stops_pct=14.3, gap_below_stop_mean_pct=0.99, gap_below_stop_p90_pct=2.36, gap_below_stop_worst_pct=12.04)
+
+FX COST SENSITIVITY (illustrative; not verified broker pricing)
+Assumption, not a broker's price list: each conversion (NOK to the stock's currency to buy,
+and back to NOK after the sale) costs the stated basis points of the amount converted.
+Returns are in the stock's own currency; the exchange rate's own move is not modelled.
+Trades by currency: EUR 8707, USD 6848, INR 6247, NOK 4605.
+Charged: 21802 of 26407 trades. Not charged: 4605 priced in NOK.
+Currency unknown: 0 trades.
+This script models no commission, fee, spread or slippage, so 'gross' and 'after existing
+trading costs' are the same number here. Gap frequency and the sale's shortfall below the stop
+price are price ratios in the stock's own currency: FX cost does not change them.
+
+Mean per entry, in percent of the NOK put in (return from the buy price):
+scenario             bps/conv   gross after costs  FX cost  after FX  vs 0 bps  total FX cost
+zero-cost baseline          0    0.61        0.61    0.000      0.61     0.000            0.0
+low                        10    0.61        0.61    0.166      0.44    -0.166           43.9
+medium                     25    0.61        0.61    0.415      0.19    -0.415          109.6
+high                       50    0.61        0.61    0.829     -0.22    -0.829          219.0
+('total FX cost' is the sum over all entries, counted in whole positions.)
+
+The same for the charged (non-NOK) entries only, and what a stop then loses:
+scenario             bps/conv  entries  FX cost  after FX  stopped: loss  gapped: loss  all stops, all entries
+zero-cost baseline          0    21802    0.000      0.71           4.09          4.88                    4.15
+low                        10    21802    0.201      0.50           4.29          5.07                    4.30
+medium                     25    21802    0.503      0.20           4.57          5.36                    4.53
+high                       50    21802    1.005     -0.30           5.05          5.83                    4.92
+('loss' is the mean realised loss from the buy price, positive = money lost; the last column
+ is the 'realised mean' of the 'all stops' line above, for every entry, NOK ones included.)

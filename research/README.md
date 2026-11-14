@@ -30,6 +30,8 @@ python research/gap_risk.py /tmp/basket.pkl 3.0 signal-close               # the
 # 5. Hold length and sell rule after DNB fees (issue #122)
 python research/fetch_stock_list.py /tmp/stock_list_10y.pkl                # stock_list.csv, ten years
 python research/hold_exit_study.py /tmp/stock_list_10y.pkl                 # 5/10/20 sessions x time/stop/wide/trail
+# Both gap_risk.py and hold_exit_study.py end with an FX cost sensitivity (P2-5): 0/10/25/50 bps per
+# conversion for non-NOK stocks, from research/fx_costs.py. Illustrative levels, not a broker's prices.
 
 # 7. The four company scores on history (Phase 3a, #79). Needs a copy of the bot's database
 #    with 10 years of prices (PR #156): see "Backups off the Pi" in the main README.
