@@ -309,8 +309,8 @@ def _small_chart(df: pd.DataFrame, y, title: str, color=None):
                  labels={"value": "", "year": "", "variable": ""})
     fig.update_yaxes(title=None)
     fig.for_each_trace(lambda t: t.update(name=t.name.replace("total_debt", "debt")))
-    fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10), showlegend=not color,
-                      legend=dict(orientation="h", y=-0.2))
+    fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10}, showlegend=not color,
+                      legend={"orientation": "h", "y": -0.2})
     return fig
 
 
@@ -328,7 +328,8 @@ def one_stock() -> None:
     del recent[6:]
     if len(recent) > 1:
         cols = st.columns(len(recent) - 1 + 4)
-        for col, s in zip(cols, recent[1:]):
+        # More columns than stocks on purpose: the spare ones keep the buttons narrow.
+        for col, s in zip(cols, recent[1:], strict=False):
             # Clicking puts that stock first in the list; the rerun picks it up.
             if col.button(s, key=f"recent_{s}", width="stretch"):
                 recent.remove(s)
@@ -367,10 +368,10 @@ def one_stock() -> None:
             picks = mine[(mine["qualified"] == 1) & (mine["signal_day"] >= p["day"].min())]
             if not picks.empty:
                 fig.add_scatter(x=picks["signal_day"], y=picks["last_close"], mode="markers",
-                                name="Bot picked", marker=dict(symbol="triangle-up", size=11,
-                                                               color="#f2c94c"))
-            fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10),
-                              legend=dict(orientation="h", y=1.05))
+                                name="Bot picked", marker={"symbol": "triangle-up", "size": 11,
+                                                           "color": "#f2c94c"})
+            fig.update_layout(height=380, margin={"l": 10, "r": 10, "t": 10, "b": 10},
+                              legend={"orientation": "h", "y": 1.05})
             st.plotly_chart(fig, width="stretch")
 
     with right:
@@ -429,7 +430,8 @@ def one_stock() -> None:
                 charts.append(("Cash and debt", ["cash", "total_debt"], None))
             for row in range(0, len(charts), 3):
                 cols = st.columns(3)
-                for col, (title, y, color) in zip(cols, charts[row:row + 3]):
+                # The last row can hold fewer than three charts.
+                for col, (title, y, color) in zip(cols, charts[row:row + 3], strict=False):
                     with col, st.container(border=True):
                         st.plotly_chart(_small_chart(wide, y, title, color),
                                         width="stretch")

@@ -147,7 +147,7 @@ Each task can be done on its own. "Archive?" says whether the task changes histo
 | P2-4 | `tests/` | Find and close the leaked SQLite connection that triggers the shutdown `ResourceWarning`. **Done on `fix/sqlite-resourcewarning-leak`, not yet merged; see below.** |
 | P2-5 | `research/gap_risk.py`, `hold_exit_study.py` | Add FX cost to the scripts. Record results per cost scenario. **Done on `feat/research-fx-cost-modelling`, not yet merged; see below.** |
 | P2-6 | `newsbot/indicators.py`, README | Label ATR and RSI as simple-average (Cutler) variants. **Done on `docs/indicator-methodology`, not yet merged.** Docstrings only in `indicators.py` (the code is identical apart from docstrings, compared as parsed code): ATR is the 14-period arithmetic mean of True Range as a percentage of the latest close; RSI is 14-period Cutler's RSI (simple averages of gains and losses); neither uses Wilder smoothing; `_rsi_series` uses the same convention as `_compute_rsi_14`. README has a new "Indicator methodology" section. 1259 tests pass on 3.11, 3.14 and 3.15 (2 skipped); ruff is clean. Found and not fixed: `_compute_atr_percent` drops missing High, Low and Close values separately, so a bar missing only one of them shifts the columns against each other (a missing close in the last 14 bars gave 2.36% where dropping the whole bar gives 2.60%, on a test series; a missing high gives no ATR). Not known to occur in Yahoo's data. |
-| P2-7 | `ruff`, CI | Lint `streamlit/`, `research/` and `scripts/`. |
+| P2-7 | `ruff`, CI | Lint `streamlit/`, `research/` and `scripts/`. **Done on `chore/expand-ruff-lint-coverage`, not yet merged; see below.** |
 
 ### P2-4: A test left the bot's database open
 
@@ -201,6 +201,16 @@ What changes: the order of the rules and of the hold lengths does not. "Time" is
 | 2xATR: mean loss when stopped, all entries | 4.15 | 4.30 | 4.53 | 4.92 |
 
 What changes: nothing in the gap result. How often a stop is hit or gapped, and how far below the stop the sale was, are price ratios in the stock's own currency, and the `GapStudy(...)` rows the bot uses are the same. What a stop loses in NOK is larger by the FX cost: 0.16 to 0.76 points on average at 3xATR, about 1 point for a foreign stock at 50 bps.
+
+### P2-7: Ruff covers the dashboard, research and scripts
+
+| | |
+|---|---|
+| **Files** | `.github/workflows/ci.yml` (the lint step), `streamlit/app.py`, `research/earnings_drift.py`, `factor_study.py`, `fetch_basket.py`, `fetch_sp500.py`, `momentum_sp500.py`, `docs/audit/proposed-CLAUDE.md` (the lint command). `ruff.toml` is not changed. |
+| **Before** | CI ran `ruff check news_bot.py newsbot tests`. `ruff.toml` has no exclusions and one per-file entry, for `tests/*.py`, so the three new folders get the full rule set. Run on them, Ruff 0.17.5 found 68 problems: 61 in five research scripts written as one-liners, 7 in `streamlit/app.py`, none in `scripts/` or the other research files. |
+| **Fix** | CI now runs `ruff check news_bot.py newsbot tests streamlit research scripts`. The 68 problems were fixed in the code: statements and imports put on their own lines (49), `dict(...)` calls written as literals (7), `zip` given `strict=False` where the lengths differ on purpose (2), an unused import and an unused name removed (2), a variable called `O` renamed `Op` (3). Seven line-level exceptions, each with its reason beside it: three `pickle.load` of the scripts' own files (S301, as the other research scripts already have), two imports that must follow a warnings filter (E402), and two places where a symbol with no data is skipped on purpose (S112, S110), since printing there would change the output. No rule was removed, and no file or folder is ignored. |
+| **Verified** | `ruff check` on all six targets: all checks passed, also with a fresh `pip install ruff` (0.17.5) on Python 3.11, as CI installs it. The workflow file parses and the lint step holds the new command. `python -W error::ResourceWarning -m unittest`: 1259 tests, OK, 2 skipped, on 3.11.11, 3.14.10 and 3.15.2; the 2 skipped (the live dashboard tests) pass in the dashboard image built from this branch. Nothing under `newsbot/` or `news_bot.py` is touched. `streamlit/app.py` is the same code once dict literals and `strict=False` are set aside (compared as parsed code). Each of the five research scripts was run before and after on the same input and printed the same output and wrote the same files: `factor_study.py` on the saved basket; the others with a fixed stand-in for Yahoo, and `momentum_sp500.py` on made-up prices, since its real input was not kept. |
+| **Limits** | CI installs the newest Ruff each run, so a later Ruff version can flag something new. The before/after runs of four research scripts use stand-in data, not the original downloads. `research/fetch_basket.py` still reads the universe file from a fixed path on the owner's Mac; that is not a lint finding and was left alone. |
 
 ## P3: features (only after P0/P1)
 

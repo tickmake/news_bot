@@ -18,7 +18,7 @@ This is a personal swing-trading **research assistant** for US, Norway and EU eq
 
 ## Engineering
 
-- Run the tests from a venv in the scratchpad: `python -W error::ResourceWarning -m coverage run -m unittest`. Lint with `ruff check news_bot.py newsbot tests`.
+- Run the tests from a venv in the scratchpad: `python -W error::ResourceWarning -m coverage run -m unittest`. Lint with `ruff check news_bot.py newsbot tests streamlit research scripts`.
 - Schema changes must be additive (`ADD COLUMN`) or versioned migrations, with a backup first.
 - Change signal definitions only together with a new `rule_id`.
 - Deploy with `scripts/deploy.sh`. Ask before reconfiguring the Pi.

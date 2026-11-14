@@ -1,14 +1,21 @@
-import pickle, sys, math
-import numpy as np, pandas as pd
-data, meta = pickle.load(open(sys.argv[1], "rb"))
+import math
+import pickle
+import sys
+
+import numpy as np
+import pandas as pd
+
+data, meta = pickle.load(open(sys.argv[1], "rb"))  # noqa: S301 - written by fetch_basket.py
 syms = [s for s in data if s != "SPY"]
 def norm(h):
-    h = h.copy(); h.index = pd.to_datetime(h.index.strftime("%Y-%m-%d")); return h[~h.index.duplicated()]
+    h = h.copy()
+    h.index = pd.to_datetime(h.index.strftime("%Y-%m-%d"))
+    return h[~h.index.duplicated()]
 H = {s: norm(data[s]) for s in syms}
 dates = sorted(set().union(*[set(h.index) for h in H.values()]))
 idx = pd.DatetimeIndex(dates)
 C = pd.DataFrame({s: H[s]["Close"] for s in syms}).reindex(idx)
-O = pd.DataFrame({s: H[s]["Open"] for s in syms}).reindex(idx)
+Op = pd.DataFrame({s: H[s]["Open"] for s in syms}).reindex(idx)
 Hh = pd.DataFrame({s: H[s]["High"] for s in syms}).reindex(idx)
 Lo = pd.DataFrame({s: H[s]["Low"] for s in syms}).reindex(idx)
 COST = 2 * 10 / 1e4
@@ -39,13 +46,17 @@ def fwd(h):
     # enter next bar open, exit close h bars after entry (per-symbol bars), net of costs
     out = pd.DataFrame(index=idx, columns=syms, dtype=float)
     for s in syms:
-        bars = H[s]; pos = {d: i for i, d in enumerate(bars.index)}
+        bars = H[s]
+        pos = {d: i for i, d in enumerate(bars.index)}
         o, c = bars["Open"].values, bars["Close"].values
         vals = []
         for d in idx:
             i = pos.get(d)
-            if i is None or i + h >= len(bars): vals.append(np.nan); continue
-            e = i + 1; x = e + h - 1
+            if i is None or i + h >= len(bars):
+                vals.append(np.nan)
+                continue
+            e = i + 1
+            x = e + h - 1
             vals.append(c[x] / o[e] - 1 - COST)
         out[s] = vals
     return out
@@ -56,25 +67,33 @@ def evaluate(sel_fn, F, h, lo, hi):
     rows = []
     for d in idx[(idx >= lo) & (idx <= hi)]:
         f = F.loc[d].dropna()
-        if len(f) < 20: continue
+        if len(f) < 20:
+            continue
         chosen = sel_fn(d, f.index)
-        if chosen is None or len(chosen) < 3: continue
+        if chosen is None or len(chosen) < 3:
+            continue
         rows.append((d, f.loc[chosen].mean() - f.mean(), f.loc[chosen].mean(), f.mean()))
-    if not rows: return None
+    if not rows:
+        return None
     df = pd.DataFrame(rows, columns=["d", "delta", "sel", "base"]).set_index("d")
     nonov = df.iloc[::h]["delta"]  # non-overlapping sample for the standard error
     se = nonov.std(ddof=1) / math.sqrt(len(nonov)) if len(nonov) > 2 else float("nan")
-    return dict(n=len(df), delta=df["delta"].mean() * 100, t=(nonov.mean() / se) if se and se == se and se > 0 else float("nan"), base=df["base"].mean() * 100, sel=df["sel"].mean() * 100, better=(df["delta"] > 0).mean() * 100)
+    return {"n": len(df), "delta": df["delta"].mean() * 100,
+            "t": (nonov.mean() / se) if se and se == se and se > 0 else float("nan"),
+            "base": df["base"].mean() * 100, "sel": df["sel"].mean() * 100,
+            "better": (df["delta"] > 0).mean() * 100}
 
 def top_quintile(name):
     s = sig[name]
     def fn(d, cols):
         v = s.loc[d, cols].dropna()
-        if len(v) < 20: return None
+        if len(v) < 20:
+            return None
         return v.nlargest(max(3, len(v) // 5)).index
     return fn
 def gate_sel(d, cols):
-    g = gate.loc[d, cols]; return g[g].index
+    g = gate.loc[d, cols]
+    return g[g].index
 
 results = []
 for h in (5, 10, 20):
@@ -83,9 +102,11 @@ for h in (5, 10, 20):
     for name, fn in strategies.items():
         for pname, (lo, hi) in periods.items():
             r = evaluate(fn, F, h, lo, hi)
-            if r: results.append(dict(strategy=name, hold=h, period=pname, **r))
+            if r:
+                results.append(dict(strategy=name, hold=h, period=pname, **r))
 res = pd.DataFrame(results)
-pd.set_option("display.width", 200); pd.set_option("display.max_rows", 500)
+pd.set_option("display.width", 200)
+pd.set_option("display.max_rows", 500)
 for h in (5, 10, 20):
     dev = res[(res.hold == h) & (res.period == "development")].set_index("strategy")
     ho = res[(res.hold == h) & (res.period == "holdout")].set_index("strategy")
